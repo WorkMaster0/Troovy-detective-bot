@@ -1,7 +1,7 @@
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = "ТВІЙ_ТЕЛЕГРАМ_ТОКЕН"  # Заміни на реальний токен
+TOKEN = "8255365352:AAHqFjtxNo02_b6bQwj2ieoFyDAkXmOW4oQ"  # Заміни на реальний токен
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Привіт! Я Troovy Detective Bot. Напиши /scan_new_tokens для аналізу.")
@@ -16,4 +16,5 @@ def main():
     application.run_polling()
 
 if __name__ == "__main__":
+
     main()
