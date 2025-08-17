@@ -1,4 +1,4 @@
-напimport sqlite3
+import sqlite3
 import requests
 import time
 import json
@@ -173,4 +173,5 @@ def run_flask():
 # ===== ЗАПУСК =====
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
+
     main_bot()
