@@ -233,6 +233,42 @@ def handle_mysubs(chat_id,args):
     if not subs: send_message(chat_id,"ℹ️ Немає підписок"); return
     send_message(chat_id,"📌 Ваші підписки: "+", ".join([s.upper() for s in subs]))
 
+def handle_portfolio(chat_id):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        # Отримуємо підписки користувача
+        cursor.execute("SELECT coin FROM subscriptions WHERE chat_id = ?", (chat_id,))
+        coins = cursor.fetchall()
+        
+        if not coins:
+            send_message(chat_id, "🔹 Ваш портфель порожній. Додайте монети через /subscribe.")
+            return
+
+        # Формуємо список монет і їх цін
+        portfolio_msg = "💼 **Ваш портфель:**\n"
+        total_value = 0.0
+
+        for coin_data in coins:
+            coin = coin_data[0]
+            try:
+                price = get_price(coin)
+                portfolio_msg += f"{coin_icon(coin)} {coin.upper()}: ${price:.4f}\n"
+            except Exception as e:
+                portfolio_msg += f"{coin.upper()}: Помилка ({str(e)})\n"
+
+        send_message(chat_id, portfolio_msg)
+        
+    except sqlite3.Error as e:
+        logging.error(f"Помилка БД у /portfolio: {e}")
+        send_message(chat_id, "❌ Помилка бази даних. Спробуйте пізніше.")
+    except Exception as e:
+        logging.error(f"Помилка /portfolio: {e}")
+        send_message(chat_id, "❌ Не вдалося завантажити портфель.")
+    finally:
+        if conn:
+            conn.close()
+
 def handle_alert(chat_id,args):
     if not args: send_message(chat_id,"ℹ️ Приклад: /alert btc>50000"); return
     m=re.match(r"([a-zA-Z0-9]+)([<>])([0-9.]+)",args[0])
@@ -324,3 +360,4 @@ if __name__ == "__main__":
     print(f"🟢 Бот запущено на порту {port}")
 
     app.run(host="0.0.0.0", port=port)
+
