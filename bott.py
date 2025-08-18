@@ -292,9 +292,17 @@ def home():
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    if not data:
-        return "no data", 400
+    logging.info("Отримано запит від Telegram!")  # Додано для відладки
+    try:
+        data = request.get_json()
+        if not data:
+            logging.error("Немає даних у запиті")
+            return "no data", 400
+        process_updates({"result": [data]}, 0)
+        return "ok", 200
+    except Exception as e:
+        logging.error(f"Помилка в webhook: {str(e)}", exc_info=True)
+        return "error", 500
 
     try:
         # ⚡️ Використовуємо готову логіку
@@ -314,4 +322,5 @@ if __name__ == "__main__":
     
     port = int(os.environ.get("PORT", 10000))
     print(f"🟢 Бот запущено на порту {port}")
+
     app.run(host="0.0.0.0", port=port)
