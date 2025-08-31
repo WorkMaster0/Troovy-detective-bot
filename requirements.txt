@@ -1,9 +1,7 @@
 pyTelegramBotAPI==4.12.0
 requests==2.31.0
-numpy==2.0.0  # Оновлена версія для Python 3.12+
+numpy==2.0.0
 python-dotenv==1.0.0
-transformers==4.40.0  # Оновлена версія
-torch==2.3.0  # Версія що підтримує Python 3.12+
-sentence-transformers==3.0.1  # Оновлена версія
-huggingface_hub==0.23.0  # Оновлена версія
-accelerate==0.30.0  # Додатково для transformers
+
+# Спрощений AI без великих бібліотек
+# transformers та torch занадто великі для Render
