@@ -1,111 +1,52 @@
 # ai_brain.py
-import random
-import openai
 import os
+import openai
 from datetime import datetime
 
 class AIBrain:
     def __init__(self):
         self.market_mood = "neutral"
         self.conversations = {}
-        # Ініціалізація OpenAI
-        openai.api_key = os.getenv('OPENAI_API_KEY')
-        
-    def get_ai_response(self, prompt, context=""):
-        """Отримання відповіді від GPT-4"""
+        openai.api_key = os.getenv("OPENAI_API_KEY")  # ключ з Render secrets
+
+    def ai_answer(self, user_id, prompt):
+        """Відповідь від OpenAI"""
         try:
+            # Дістаємо історію діалогу
+            history = self.conversations.get(user_id, {}).get("history", [])
+            history.append({"role": "user", "content": prompt})
+
             response = openai.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": f"""Ти CortexTrader - AI трейдінговий помічник. 
-                        Ти експерт з криптовалют, технічного аналізу та ринкових тенденцій.
-                        Будь професійним, але дружнім. Давай корисні поради.
-                        Контекст: {context}"""
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
+                model="gpt-3.5-turbo",  # можеш замінити на "gpt-4o-mini"
+                messages=history,
                 max_tokens=500,
                 temperature=0.7
             )
-            return response.choices[0].message.content
+
+            answer = response.choices[0].message.content
+
+            # Зберігаємо у контекст
+            if user_id not in self.conversations:
+                self.conversations[user_id] = {"history": []}
+            self.conversations[user_id]["history"].append({"role": "assistant", "content": answer})
+
+            return answer
         except Exception as e:
-            return f"🤖 Помилка AI: {str(e)}"
-    
+            return f"⚠️ Помилка AI: {e}"
+
     def analyze_market(self):
-        """AI аналіз ринку з реальними даними"""
-        prompt = """
-        Проаналізуй поточний стан криптовалютного ринку. 
-        Оціни настрій (бичий/ведмежий/нейтральний), ключові рівні, 
-        потенційні можливості та ризики. Будь конкретним.
-        """
-        
-        return self.get_ai_response(prompt, "market_analysis")
-    
+        """Тепер теж можна через AI"""
+        return self.ai_answer("system", "Дай короткий аналіз ринку криптовалют у 2-3 реченнях.")
+
     def start_discussion(self, user_id):
-        """Початок діалогу з AI"""
-        prompt = """
-        Ти - AI трейдінговий помічник CortexTrader. 
-        Почати діалог з трейдером про торгові стратегії.
-        Запитай про активи які цікавлять, стратегії чи питання.
-        Будь професійним та заохочуй до діалогу.
-        """
-        
-        self.conversations[user_id] = {
-            'stage': 'awaiting_topic',
-            'context': {},
-            'history': []
-        }
-        
-        response = self.get_ai_response(prompt)
-        return response
-    
+        """Початок діалогу"""
+        self.conversations[user_id] = {"history": [{"role": "system", "content": "Ти виступаєш як трейдінговий асистент."}]}
+        return "🧠 Починаємо дискусію! Який актив вас цікавить?"
+
     def continue_discussion(self, user_id, message):
         """Продовження діалогу з AI"""
-        if user_id not in self.conversations:
-            return self.start_discussion(user_id)
-        
-        session = self.conversations[user_id]
-        session['history'].append(f"User: {message}")
-        
-        # Формуємо контекст для AI
-        context = f"""
-        Історія діалогу: {' | '.join(session['history'][-5:])}
-        Поточний етап: {session['stage']}
-        Контекст: {session['context']}
-        """
-        
-        prompt = f"""
-        Продовж діалог з трейдером. Його останнє повідомлення: "{message}"
-        Будь корисним трейдінговим помічником. Аналізуй, ради, обговорюй.
-        """
-        
-        response = self.get_ai_response(prompt, context)
-        session['history'].append(f"AI: {response}")
-        
-        return response
-    
-    def process_message(self, message):
-        """Обробка звичайних повідомлень з AI"""
-        prompt = f"""
-        Користувач написав: "{message}"
-        Ти - CortexTrader, AI трейдінговий помічник. 
-        Відповідь корисно та по ділу. Запропонуй свої послуги.
-        """
-        
-        return self.get_ai_response(prompt)
+        return self.ai_answer(user_id, message)
 
-    def get_market_insight(self, asset):
-        """Отримання інсайтів по конкретному активу"""
-        prompt = f"""
-        Проаналізуй криптовалюту {asset}. 
-        Технічний аналіз, фундаментальні фактори, 
-        потенційні точки входу/виходу, ризики.
-        Будь конкретним та професійним.
-        """
-        
-        return self.get_ai_response(prompt, f"analysis_{asset}")
+    def process_message(self, message):
+        """Відповідь на звичайні повідомлення"""
+        return self.ai_answer("general", message)
