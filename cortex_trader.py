@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 import json
 import os
+import time
 from ai_brain import AIBrain  # Наш AI модуль
 
 class CortexTrader:
@@ -60,22 +61,30 @@ class CortexTrader:
             """Обробка всіх повідомлень"""
             user_id = message.from_user.id
             
-            if user_id in self.user_sessions and self.user_sessions[user_id]['in_discussion']:
+            if user_id in self.user_sessions and self.user_sessions[user_id].get('in_discussion'):
                 # Продовжуємо діалог
                 response = self.brain.continue_discussion(user_id, message.text)
                 self.bot.reply_to(message, response)
             else:
                 # Звичайна відповідь
-                response = self.brain.process_message(message.text)
+                response = self.brain.get_ai_response(message.text)
                 self.bot.reply_to(message, response)
 
     def run(self):
-        """Запуск бота"""
+        """Запуск бота з обробкою помилок"""
         print("🧠 CortexTrader запускається...")
-        self.bot.infinity_polling()
+        while True:
+            try:
+                self.bot.infinity_polling()
+            except Exception as e:
+                print(f"Помилка: {e}. Перезапуск через 5 секунд...")
+                time.sleep(5)
 
 # Запуск бота
 if __name__ == "__main__":
     TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_TOKEN_HERE')
-    trader_bot = CortexTrader(TOKEN)
-    trader_bot.run()
+    if TOKEN == 'YOUR_TOKEN_HERE':
+        print("Помилка: Встановіть TELEGRAM_TOKEN у змінні оточення")
+    else:
+        trader_bot = CortexTrader(TOKEN)
+        trader_bot.run()
