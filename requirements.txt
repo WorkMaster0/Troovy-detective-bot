@@ -2,6 +2,3 @@ pyTelegramBotAPI==4.12.0
 requests==2.31.0
 numpy==2.0.0
 python-dotenv==1.0.0
-
-# Спрощений AI без великих бібліотек
-# transformers та torch занадто великі для Render
