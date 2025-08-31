@@ -1,59 +1,81 @@
-# ai_trader_bot.py
+# cortex_trader.py
 import telebot
-from datetime import datetime
-import numpy as np
 import requests
-from enum import Enum
+import numpy as np
+from datetime import datetime
+import json
+import os
+from ai_brain import AIBrain  # Наш AI модуль
 
-class Mood(Enum):
-    BULLISH = "🟢 Бичий"
-    BEARISH = "🔴 Ведмежий" 
-    NEUTRAL = "⚪️ Нейтральний"
-
-class AITraderBot:
+class CortexTrader:
     def __init__(self, token):
-        self.bot = telebot.TeleBot(token)
-        self.mood = Mood.NEUTRAL
-        self.conversation_history = []
+        self.bot = telebot.TeleBot(token, parse_mode="HTML")
+        self.brain = AIBrain()
+        self.user_sessions = {}
         
-    def analyze_market(self):
-        """AI аналіз ринку"""
-        # Тут буде ваша AI логіка
-        return "📊 Аналізую ринок..."
+        # Реєструємо обробники
+        self.register_handlers()
     
-    def discuss_strategy(self, message):
-        """Обговорення стратегії з користувачем"""
-        user_id = message.from_user.id
-        analysis = self.analyze_market()
+    def register_handlers(self):
+        """Реєстрація команд бота"""
         
-        # Додаємо до історії
-        self.conversation_history.append({
-            'user': user_id,
-            'message': message.text,
-            'time': datetime.now(),
-            'analysis': analysis
-        })
+        @self.bot.message_handler(commands=['start', 'cortex'])
+        def welcome(message):
+            welcome_text = """
+            🧠 <b>CortexTrader</b> - ваш AI трейдінговий помічник!
+            
+            <b>Доступні команди:</b>
+            /analyze - Аналіз ринку
+            /discuss - Обговорення стратегії
+            /mood - Настрій ринку
+            /help - Допомога
+            
+            <i>Я готовий до роботи! 🚀</i>
+            """
+            self.bot.reply_to(message, welcome_text)
         
-        # Відповідь AI
-        response = self.generate_response(message.text, analysis)
-        self.bot.reply_to(message, response)
-    
-    def generate_response(self, user_message, analysis):
-        """Генерація відповіді з AI"""
-        # Тут буде GPT-4 або власна AI модель
-        responses = [
-            f"🧠 На основі аналізу: {analysis}\n💬 Ваша думка?",
-            f"📈 Ось що я бачу: {analysis}\n🎯 Як би ви вчинили?",
-            f"🤖 Мій аналіз: {analysis}\n💡 Радий обговорити це!"
-        ]
-        return np.random.choice(responses)
+        @self.bot.message_handler(commands=['analyze'])
+        def analyze_market(message):
+            """Аналіз поточного ринку"""
+            analysis = self.brain.analyze_market()
+            self.bot.reply_to(message, analysis)
+        
+        @self.bot.message_handler(commands=['discuss'])
+        def discuss_strategy(message):
+            """Обговорення торгової стратегії"""
+            user_id = message.from_user.id
+            
+            # Початок діалогу
+            response = self.brain.start_discussion(user_id)
+            self.bot.reply_to(message, response)
+            
+            # Зберігаємо сесію
+            self.user_sessions[user_id] = {
+                'in_discussion': True,
+                'last_message': datetime.now()
+            }
+        
+        @self.bot.message_handler(func=lambda message: True)
+        def handle_all_messages(message):
+            """Обробка всіх повідомлень"""
+            user_id = message.from_user.id
+            
+            if user_id in self.user_sessions and self.user_sessions[user_id]['in_discussion']:
+                # Продовжуємо діалог
+                response = self.brain.continue_discussion(user_id, message.text)
+                self.bot.reply_to(message, response)
+            else:
+                # Звичайна відповідь
+                response = self.brain.process_message(message.text)
+                self.bot.reply_to(message, response)
 
-# Ініціалізація бота
-ai_bot = AITraderBot("YOUR_TOKEN")
+    def run(self):
+        """Запуск бота"""
+        print("🧠 CortexTrader запускається...")
+        self.bot.infinity_polling()
 
-@ai_bot.bot.message_handler(commands=['start', 'discuss'])
-def handle_discussion(message):
-    ai_bot.discuss_strategy(message)
-
+# Запуск бота
 if __name__ == "__main__":
-    ai_bot.bot.infinity_polling()
+    TOKEN = os.getenv('TELEGRAM_TOKEN', 'YOUR_TOKEN_HERE')
+    trader_bot = CortexTrader(TOKEN)
+    trader_bot.run()
