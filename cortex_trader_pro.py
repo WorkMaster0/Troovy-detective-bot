@@ -1,89 +1,76 @@
 # cortex_trader_pro.py
 import telebot
-from telebot import types
 import os
-from cortex_core import CortexCore
-from staking_system import SmartStaking
-from ai_signals import AISignalGenerator
+import sqlite3
+from datetime import datetime
 
-class CortexTraderPro:
-    def __init__(self, token):
-        self.bot = telebot.TeleBot(token, parse_mode="HTML")
-        self.core = CortexCore()
-        self.staking = SmartStaking()
-        self.ai = AISignalGenerator()
-        
-        self.register_handlers()
-    
-    def register_handlers(self):
-        @self.bot.message_handler(commands=['start'])
-        def start(message):
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            btn1 = types.KeyboardButton('💰 Заробити')
-            btn2 = types.KeyboardButton('📊 Мої інвестиції')
-            btn3 = types.KeyboardButton('🚀 Топ стратегії')
-            markup.add(btn1, btn2, btn3)
-            
-            text = """
+# Ініціалізація бота
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
+
+# Проста база даних
+def init_db():
+    conn = sqlite3.connect('cortex.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            telegram_id INTEGER UNIQUE,
+            balance REAL DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    return conn
+
+# Обробники команд
+@bot.message_handler(commands=['start'])
+def start(message):
+    text = """
 🎯 <b>Cortex Trading Ecosystem</b>
 
-💡 <i>Перша у світі децентралізована платформа, де кожен може заробляти на крипторынку без досвіду!</i>
+💡 <i>Децентралізована платформа для заробітку</i>
 
-🌟 <b>Як це працює:</b>
-1. Обираєте перевірену стратегію
-2. Стейкуєте суму (від $10)
-3. Отримуєте щоденні винагороди
-4. Можете вивести в будь-який момент
+💰 <b>Доступні стратегії:</b>
+🔸 Blue Chip Hodl - 23.4% місячно
+🔸 DeFi Yield Farming - 31.2% місячно
+🔸 AI Swing Trading - 28.7% місячно
 
-📈 <b>Середня дохідність:</b> 15-30% monthly
-🔒 <b>Гарантії:</b> Smart-контракти, страхування
-            """
-            self.bot.send_message(message.chat.id, text, reply_markup=markup)
-        
-        @self.bot.message_handler(func=lambda message: message.text == '💰 Заробити')
-        def earn(message):
-            markup = types.InlineKeyboardMarkup()
-            strategies = self.get_top_strategies()
-            
-            for strat in strategies[:3]:
-                btn = types.InlineKeyboardButton(
-                    f"{strat['name']} - {strat['performance']}%", 
-                    callback_data=f"strat_{strat['id']}"
-                )
-                markup.add(btn)
-            
-            text = """
-🎯 <b>ОБЕРІТЬ СТРАТЕГІЮ ДЛЯ ЗАРОБІТКУ</b>
+💸 <b>Мінімальна інвестиція:</b> $10
+🕒 <b>Виплати:</b> Щоденно
+🔒 <b>Страховий фонд:</b> $50,000
 
-Топ-3 перевірені стратегії з найвищою дохідністю:
+Натисніть /invest для початку!
+    """
+    bot.send_message(message.chat.id, text)
 
-🔹 <b>Blue Chip Hodl</b> - 23.4% місячно
-🔹 <b>DeFi Yield Farming</b> - 31.2% місячно  
-🔹 <b>AI Swing Trading</b> - 28.7% місячно
+@bot.message_handler(commands=['invest'])
+def invest(message):
+    text = """
+🎯 <b>ОБЕРІТЬ СТРАТЕГІЮ:</b>
 
-💡 <i>Кожна стратегія має страховий фонд та аудит</i>
-            """
-            self.bot.send_message(message.chat.id, text, reply_markup=markup)
-        
-        @self.bot.callback_query_handler(func=lambda call: call.data.startswith('strat_'))
-        def show_strategy(call):
-            strategy_id = int(call.data.split('_')[1])
-            strategy = self.get_strategy_info(strategy_id)
-            
-            text = f"""
-📊 <b>{strategy['name']}</b>
+1. 🔸 Blue Chip Hodl - 23.4% місячно
+2. 🔸 DeFi Yield Farming - 31.2% місячно  
+3. 🔸 AI Swing Trading - 28.7% місячно
 
-💰 Дохідність: <b>{strategy['performance']}%</b> місячно
-⚡ Ризик: {strategy['risk_level']}/5
-🏆 Творець: {strategy['creator']}
-📈 Вік стратегії: {strategy['age']} днів
+Введіть номер стратегії (1, 2 або 3):
+    """
+    bot.send_message(message.chat.id, text)
 
-💡 <i>Мінімальний стейк: $10</i>
-🎯 <i>Щоденні виплати</i>
-🔒 <i>Страховий фонд: $15,000</i>
+@bot.message_handler(func=lambda message: True)
+def handle_message(message):
+    if message.text in ['1', '2', '3']:
+        bot.send_message(message.chat.id, "Введіть суму інвестиції ($):")
+    elif message.text.replace('.', '').isdigit():
+        amount = float(message.text)
+        if amount >= 10:
+            bot.send_message(message.chat.id, f"✅ Інвестиція ${amount} прийнята! Очікуйте виплати щодня.")
+        else:
+            bot.send_message(message.chat.id, "❌ Мінімальна сума - $10")
+    else:
+        bot.send_message(message.chat.id, "Натисніть /start для початку")
 
-Введіть суму для інвестування:
-            """
-            self.bot.send_message(call.message.chat.id, text)
-            
-            # Тут буде логіка інвестування
+if __name__ == "__main__":
+    init_db()
+    print("🧠 Cortex Trader запущено...")
+    bot.infinity_polling()
