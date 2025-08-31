@@ -90,18 +90,6 @@ class AIBrain:
         except:
             # Резервне значення
             return random.uniform(40000, 45000) if symbol == "BTCUSDT" else random.uniform(2200, 2500)
-
-# Решта коду залишається без змін...
-    
-    def get_crypto_price(self, symbol):
-        """Отримання ціни криптовалюти (спрощено)"""
-        # Тут буде реальний API вызов, поки імітуємо
-        prices = {
-            "BTCUSDT": random.uniform(40000, 45000),
-            "ETHUSDT": random.uniform(2200, 2500),
-            "SOLUSDT": random.uniform(90, 120)
-        }
-        return prices.get(symbol, 0)
     
     def start_discussion(self, user_id):
         """Початок діалогу"""
@@ -131,4 +119,6 @@ class AIBrain:
         
         return response
 
-# Додайте ці функції в cortex_trader.py
+    def process_message(self, message):
+        """Обробка повідомлень (додано для сумісності з cortex_trader.py)"""
+        return self.get_ai_response(message)
