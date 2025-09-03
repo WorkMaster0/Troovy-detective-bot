@@ -11,6 +11,16 @@ class QuantumSecuritySystem:
         timestamp = int(datetime.now().timestamp() * 1000)
         data_str = str(data) + str(timestamp) + self.encryption_key
         return hashlib.sha3_256(data_str.encode()).hexdigest()
+
+    async def validate_request(self, request_ip: str) -> bool:
+    """Перевірка IP адреси"""
+    allowed_ips = [
+        '127.0.0.1',
+        '::1',
+        'localhost',
+        # Додайте ваші IP якщо потрібно
+    ]
+    return request_ip in allowed_ips
     
     async def get_system_status(self):
         """Статус системи"""
