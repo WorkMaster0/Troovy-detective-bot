@@ -207,7 +207,7 @@ async def shadow_status_command(update: Update, context: ContextTypes.DEFAULT_TY
 async def verify_shadow_access(user_id: int) -> bool:
     """Перевірка доступу до тіньового протоколу"""
     shadow_clearance = {
-        123456789: 9,  # Ваш ID - максимальний рівень
+        6053907025: 9,  # Ваш ID - максимальний рівень
         987654321: 7,
         555555555: 3
     }
