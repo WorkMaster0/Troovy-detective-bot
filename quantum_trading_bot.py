@@ -4,7 +4,6 @@ import aiohttp
 import hashlib
 import json
 import random
-import numpy as np
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from telegram import Update
