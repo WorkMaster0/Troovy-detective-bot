@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: quantum-trading-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: KRAKEN_API_KEY
+        sync: false
+      - key: KRAKEN_API_SECRET
+        sync: false
+      - key: COINBASE_API_KEY
+        sync: false
+      - key: COINBASE_API_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: QUANTUM_LEVEL
+        value: "9"
+      - key: ENCRYPTION_KEY
+        sync: false
