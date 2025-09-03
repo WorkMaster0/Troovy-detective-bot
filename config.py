@@ -1,22 +1,19 @@
-# Конфігурація бота
+# config.py
 WHITELIST_USERS = [
     123456789,  # Ваш Telegram ID
-    987654321   # Додаткові користувачі
 ]
 
 EXCHANGE_CONFIG = {
-    'binance': {
-        'api_key': None,
-        'api_secret': None,
-        'testnet': False
-    },
     'kraken': {
-        'api_key': None,
-        'api_secret': None
+        'api_key': os.getenv('KRAKEN_API_KEY'),
+        'api_secret': os.getenv('KRAKEN_API_SECRET'),
+        'enabled': True
+    },
+    'binance': {
+        'enabled': False  # Вимикаємо Binance
     },
     'coinbase': {
-        'api_key': None,
-        'api_secret': None
+        'enabled': False  # Вимикаємо Coinbase
     }
 }
 
