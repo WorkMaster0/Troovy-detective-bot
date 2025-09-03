@@ -1,3 +1,5 @@
+import requests
+from flask import request
 import os
 import logging
 import asyncio
@@ -32,6 +34,17 @@ class QuantumTradingBot:
         self.application.add_handler(CommandHandler("quantum_arbitrage", quantum_arbitrage_command))
         self.application.add_handler(CommandHandler("dark_pool", dark_pool_command))
         self.application.add_handler(CommandHandler("status", self.status))
+
+    def verify_kraken_ip():
+    """Перевірка, що запит від Kraken"""
+    kraken_ips = [
+        '52.89.214.238',
+        '34.212.75.30',
+        '54.218.53.128',
+        '52.32.178.7'
+    ]
+    client_ip = request.remote_addr
+    return client_ip in kraken_ips
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда старту"""
