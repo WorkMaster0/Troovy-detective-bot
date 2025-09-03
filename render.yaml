@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: quantum-trading-bot
+    env: python
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install python-telegram-bot==20.7 aiohttp==3.9.3 python-dotenv==1.0.0 requests==2.31.0 cryptography==41.0.0 schedule==1.2.0
+    startCommand: python main.py
