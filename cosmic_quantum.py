@@ -79,7 +79,7 @@ class CosmicQuantumProtocol:
         return {
             'scan_id': f"CQP_{int(datetime.now().timestamp())}_{random.randint(1000, 9999)}",
             'quantum_core_status': quantum_core,
-            'cosmic_sync_level': cosmic_sync['sync_quality'],
+            'cosmic_sync_level': cosmic_sync['average_sync_quality'],
             'dimensional_analysis': dimensional_analysis,
             'quantum_predictions': quantum_predictions,
             'reality_report': reality_report,
