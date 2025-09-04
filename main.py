@@ -6,6 +6,8 @@ from telegram import Bot
 import asyncio
 from datetime import datetime
 import time
+from telegram import Update, BotCommand
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------- Налаштування ----------
 BINANCE_API_KEY = "1tgsJl1kRePaygrLuQnp1VMk2Ot0pKvm8Ba348jY4IDgU26jHvqCgD0DeNFYT5qe"
@@ -111,5 +113,48 @@ async def main_loop():
             print(f"Error: {e}")
         await asyncio.sleep(3600)  # чекати 1 годину
 
+# ---------- Асинхронні команди ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Привіт! Я бот Smart Money. Використовуй /smc щоб отримати сигнали.")
+
+async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Генерую сигнали, зачекай...")
+    try:
+        chart_file = plot_chart(analyze_smc(get_klines("BTCUSDT")), "BTCUSDT")
+        latest_signals = analyze_smc(get_klines("BTCUSDT")).dropna(subset=['Signal']).tail(5)
+        text_signals = ""
+        for idx, row in latest_signals.iterrows():
+            time_str = row['open_time'].strftime('%Y-%m-%d %H:%M')
+            text_signals += f"{time_str} | {row['Signal']} | Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}\n"
+        caption = f"Smart Money Signals:\n\n{text_signals}"
+        await send_telegram_image(chart_file, caption=caption)
+    except Exception as e:
+        await update.message.reply_text(f"Помилка: {e}")
+
+# ---------- Запуск бота з вебхуком ----------
+async def start_webhook():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Додаємо команди
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("smc", smc_command))
+
+    # Встановлюємо команди для Telegram (нижня панель)
+    await app.bot.set_my_commands([
+        BotCommand("start", "Запустити бота"),
+        BotCommand("smc", "Отримати сигнали Smart Money")
+    ])
+
+    # Вебхук для Render
+    WEBHOOK_URL = "https://quantum-trading-bot-wg5k.onrender.com/"  # твій Render URL
+    await app.bot.set_webhook(WEBHOOK_URL)
+
+    # Запуск бота
+    await app.start()
+    await app.updater.start_polling()  # можна залишити для резервного варіанту
+    print("Bot запущений з вебхуком!")
+    await asyncio.Event().wait()  # тримаємо процес активним
+
+# ---------- Власне запуск ----------
 if __name__ == "__main__":
-    asyncio.run(main_loop())
+    asyncio.run(start_webhook())
