@@ -46,7 +46,7 @@ def analyze_smc(df):
                          np.where(df['BOS_down'], df['high'] - (df['close'] - df['low'])/2, np.nan))
     
     df['Signal'] = np.where(df['BOS_up'] & (~df['OB'].isna()), 'BUY',
-                            np.where(df['BOS_down'] & (~df['OB'].isna()), 'SELL', np.nan))
+                         np.where(df['BOS_down'] & (~df['OB'].isna()), 'SELL', None)).astype(object)
     
     df['SL'] = np.where(df['Signal']=='BUY', df['OB']*0.995, np.where(df['Signal']=='SELL', df['OB']*1.005, np.nan))
     df['TP'] = np.where(df['Signal']=='BUY', df['close']*1.01, np.where(df['Signal']=='SELL', df['close']*0.99, np.nan))
