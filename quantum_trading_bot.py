@@ -1,3 +1,4 @@
+import random
 import os
 import asyncio
 import aiohttp
@@ -156,7 +157,7 @@ class QuantumTradingGenesis:
             logger.error(f"Помилка у whale_wallet_tracking: {e}")
             return {'error': str(e)}
 
-    # 4. АЛЕРТИ ЛІСТИНГІВ
+    # 4. АЛЕРТИ ЛІСТИНГІв
     async def token_launch_alerts(self, user_id: int) -> Dict[str, Any]:
         """Авто-сповіщення про нові лістинги"""
         try:
@@ -617,14 +618,14 @@ async def handle_quantum_command(update: Update, context: ContextTypes.DEFAULT_T
             
         # Форматування результату
         command_name_readable = command.replace('_', ' ').title()
-        report = f"*🎉 {command_name_readable} УСПІШНО!*\n\n"
+        report = f"🎉 {command_name_readable} УСПІШНО!\n\n"
         report += format_dict_to_readable(result)
         
         # Обрізаємо повідомлення, якщо воно занадто довге
         if len(report) > 4000:
             report = report[:4000] + "\n\n... (повідомлення обрізано)"
         
-        await initiation_msg.edit_text(report, parse_mode='Markdown')
+        await initiation_msg.edit_text(report)
         
     except Exception as e:
         logger.error(f"Error in command {command}: {e}")
@@ -650,15 +651,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"User {user.id} started the bot.")
     
     welcome_text = f"""
-🚀 *Вітаю, {user.first_name}, у Quantum Trading Genesis!* 🌌
+🚀 Вітаю, {user.first_name}, у Quantum Trading Genesis! 🌌
 
-*Реальні API інтеграції:*
-• ✅ CoinGecko API - ціни, обсяги, тренди
-• ✅ Binance API - ордери, ф'ючерси, глибина
-• ✅ Blockchair API - транзакції блокчейну
-• ✅ Публічні API - без потребі в ключах
+Реальні API інтеграції:
+✅ CoinGecko API - ціни, обсяги, тренди
+✅ Binance API - ордери, ф'ючерси, глибина
+✅ Blockchair API - транзакції блокчейну
+✅ Публічні API - без потребі в ключах
 
-*Доступні команди:*
+Доступні команди:
 /new_token_gaps - Спреди нових токенів
 /funding_arbitrage - Арбітраж фандинг-рейтів  
 /whale_wallet_tracking - Трекінг китових гаманців
@@ -675,34 +676,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /quantum_volatility_compression - Стиснення волатильності
 /quantum_entanglement_trading - Квантове заплутування
 
-⚡ *Бот успішно ініціалізовано! Всі команди працюють з реальними даними!*
+⚡ Бот успішно ініціалізовано! Всі команди працюють з реальними даними!
 """
-    await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    await update.message.reply_text(welcome_text)
 
 # Команда допомоги
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
-📖 *Довідка Quantum Trading Genesis*
+📖 Довідка Quantum Trading Genesis
 
-*Реальні дані з:*
+Реальні дані з:
 • CoinGecko - ціни, обсяги, нові токени, тренди
 • Binance - ордери, ф'ючерси, глибина ринку
 • Blockchair - транзакції блокчейну
 • Публічні API - без потребі в API ключах
 
-*Особливості:*
+Особливості:
 • 🚀 Реальний аналіз ринку в реальному часі
 • ⚡ Швидкість відповіді менше 2 секунд
 • 🔒 Без потребі в API ключах
 • 📊 Професійний аналіз даних
 • 🌍 Глобальне покриття ринків
 
-*Використання:*
+Використання:
 Просто відправте команду /start та оберіть потрібну функцію аналізу!
 
-⚡ *Бот готовий до роботи з реальними даними!*
+⚡ Бот готовий до роботи з реальними даними!
 """
-    await update.message.reply_text(help_text, parse_mode='Markdown')
+    await update.message.reply_text(help_text)
 
 # Обробка помилок
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
