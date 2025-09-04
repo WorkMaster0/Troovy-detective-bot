@@ -3,7 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from binance.client import Client
 from telegram import Bot
+import asyncio
 from datetime import datetime
+import time
 
 # ---------- Налаштування ----------
 BINANCE_API_KEY = "1tgsJl1kRePaygrLuQnp1VMk2Ot0pKvm8Ba348jY4IDgU26jHvqCgD0DeNFYT5qe"
@@ -79,13 +81,13 @@ def plot_chart(df, symbol="BTCUSDT"):
     plt.close()
     return filename
 
-# ---------- Відправка в Telegram ----------
-def send_telegram_image(filename, chat_id=CHAT_ID, caption="SMC Analysis"):
+# ---------- Асинхронна відправка в Telegram ----------
+async def send_telegram_image(filename, chat_id=CHAT_ID, caption="SMC Analysis"):
     with open(filename, 'rb') as f:
-        bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+        await bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
 
-# ---------- Головна функція ----------
-def main():
+# ---------- Основна логіка ----------
+async def run_smc():
     symbol = "BTCUSDT"
     df = get_klines(symbol)
     df = analyze_smc(df)
@@ -98,7 +100,16 @@ def main():
         text_signals += f"{time_str} | {row['Signal']} | Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}\n"
     
     caption = f"Smart Money Concept Signals for {symbol}:\n\n{text_signals}"
-    send_telegram_image(chart_file, caption=caption)
+    await send_telegram_image(chart_file, caption=caption)
+
+# ---------- Цикл для Render (щогодини) ----------
+async def main_loop():
+    while True:
+        try:
+            await run_smc()
+        except Exception as e:
+            print(f"Error: {e}")
+        await asyncio.sleep(3600)  # чекати 1 годину
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_loop())
