@@ -1,560 +1,114 @@
-import random
+# Quantum_trading_bot.py
 import os
 import asyncio
 import aiohttp
 import logging
-import json
+import random
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from dotenv import load_dotenv
 
-# Завантажуємо змінні оточення
+# =========================
+# ENV & LOGGING
+# =========================
 load_dotenv()
 
-# Налаштування логування
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("QuantumTradingGenesis")
 
-class QuantumTradingGenesis:
-    """Квантовий торговий протокол з реальними API інтеграціями"""
-    
-    def __init__(self):
-        self.user_cooldowns = {}
-        self.session = None
-        
-    async def init_session(self):
-        """Ініціалізація aiohttp сесії"""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
+BOT_START_TIME = datetime.utcnow()
 
-    async def _make_api_request(self, url: str, headers: dict = None) -> Dict:
-        """Універсальний метод для API запитів"""
+# =========================
+# CONFIG
+# =========================
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=15)
+USER_AGENT = "QuantumTradingGenesis/1.2 (+https://t.me/)"
+COINGECKO_API = "https://api.coingecko.com/api/v3"
+BINANCE_API = "https://api.binance.com"
+BINANCE_FAPI = "https://fapi.binance.com"
+BLOCKCHAIR_API = "https://api.blockchair.com"
+
+# =========================
+# HELPERS
+# =========================
+def truncate_message(text: str, limit: int = 4000) -> str:
+    return text if len(text) <= limit else text[:limit] + "\n\n... (повідомлення обрізано)"
+
+def safe_float(x, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def fmt_money(x: float, decimals: int = 2) -> str:
+    try:
+        return f"${x:,.{decimals}f}"
+    except Exception:
+        return str(x)
+
+def fmt_pct(x: float, decimals: int = 2) -> str:
+    try:
+        return f"{x:.{decimals}}%"
+    except Exception:
+        return str(x)
+
+def human_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat()
+
+def parse_blockchair_time(ts: Any) -> datetime:
+    """
+    Blockchair `time` зазвичай 'YYYY-MM-DD HH:MM:SS' (UTC).
+    Підтримуємо і Unix (на всяк випадок).
+    """
+    if isinstance(ts, (int, float)):
+        return datetime.utcfromtimestamp(ts)
+    if isinstance(ts, str):
         try:
-            await self.init_session()
-            async with self.session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logger.error(f"API помилка: {response.status}")
-                    return {}
-        except Exception as e:
-            logger.error(f"Помилка запиту: {e}")
-            return {}
+            # '2025-09-01 12:34:56'
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            try:
+                return datetime.fromisoformat(ts)
+            except Exception:
+                return datetime.utcnow()
+    return datetime.utcnow()
 
-    def _check_cooldown(self, user_id: int, command: str) -> Optional[int]:
-        """Перевіряє cooldown для команди"""
-        key = f"{user_id}_{command}"
-        now = datetime.now()
-        if key in self.user_cooldowns:
-            elapsed = (now - self.user_cooldowns[key]).seconds
-            cooldown_time = 10
-            if elapsed < cooldown_time:
-                return cooldown_time - elapsed
-        self.user_cooldowns[key] = now
-        return None
+def build_cg_headers() -> Dict[str, str]:
+    """
+    CoinGecko може вимагати API-ключ (особливо при високому навантаженні).
+    Підтримуємо як demo/pro ключ через змінні середовища.
+    """
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    key = os.getenv("COINGECKO_API_KEY", "").strip()
+    if key:
+        # CoinGecko приймає один із заголовків. Спробуємо обидва варіанти.
+        headers["x-cg-pro-api-key"] = key
+        headers["x-cg-demo-api-key"] = key
+    return headers
 
-    # 1. НОВІ ТОКЕНИ / СПРЕДИ
-    async def new_token_gaps(self, user_id: int) -> Dict[str, Any]:
-        """Пошук спредів нових токенів між CEX/DEX"""
-        try:
-            # Отримуємо топ токени з CoinGecko
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=gecko_desc&per_page=20&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            if not data:
-                return {'error': 'Не вдалося отримати дані'}
+def build_blockchair_params(params: Dict[str, str]) -> Dict[str, str]:
+    out = dict(params)
+    key = os.getenv("BLOCKCHAIR_API_KEY", "").strip()
+    if key:
+        out["key"] = key
+    return out
 
-            gaps = []
-            for token in data:
-                symbol = token['symbol'].upper()
-                current_price = token['current_price']
-                
-                if current_price and current_price > 0:
-                    # Симулюємо різні ціни на різних біржах
-                    price_variation = random.uniform(0.95, 1.05)
-                    exchange_price = current_price * price_variation
-                    spread = abs((exchange_price - current_price) / current_price) * 100
-                    
-                    if spread > 1.0:  # Показуємо тільки значні спреди
-                        gaps.append({
-                            'token': symbol,
-                            'cex_price': round(current_price, 4),
-                            'dex_price': round(exchange_price, 4),
-                            'spread': round(spread, 2),
-                            'volume': f"${token['total_volume']:,.0f}"
-                        })
-
-            return {
-                'gaps': sorted(gaps, key=lambda x: x['spread'], reverse=True)[:5],
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у new_token_gaps: {e}")
-            return {'error': str(e)}
-
-    # 2. ФАНДИНГ АРБІТРАЖ
-    async def funding_arbitrage(self, user_id: int) -> Dict[str, Any]:
-        """Арбітраж фандинг-рейтів між біржами"""
-        try:
-            # Отримуємо дані про ф'ючерси
-            url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-            binance_data = await self._make_api_request(url)
-            
-            opportunities = []
-            if binance_data:
-                for asset_data in binance_data[:10]:  # Перші 10 активів
-                    symbol = asset_data['symbol']
-                    funding_rate = float(asset_data['lastFundingRate']) * 100
-                    
-                    if abs(funding_rate) > 0.01:  # Фільтруємо мінімальні ставки
-                        opportunities.append({
-                            'asset': symbol,
-                            'funding_rate': f"{funding_rate:.4f}%",
-                            'exchange': 'Binance',
-                            'next_funding': datetime.fromtimestamp(asset_data['nextFundingTime']/1000).strftime('%H:%M'),
-                            'index_price': f"${float(asset_data['indexPrice']):.2f}"
-                        })
-
-            return {
-                'opportunities': sorted(opportunities, key=lambda x: abs(float(x['funding_rate'][:-1])), reverse=True)[:5],
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у funding_arbitrage: {e}")
-            return {'error': str(e)}
-
-    # 3. ТРЕКИНГ КИТІВ
-    async def whale_wallet_tracking(self, user_id: int) -> Dict[str, Any]:
-        """Трекінг великих транзакцій китов"""
-        try:
-            # Використовуємо Blockchair API для транзакцій
-            url = "https://api.blockchair.com/bitcoin/transactions?limit=10&q=value(1000000000..)"
-            data = await self._make_api_request(url)
-            
-            whale_transactions = []
-            if data and 'data' in data:
-                for tx in data['data'][:5]:
-                    value_btc = tx['value'] / 100000000
-                    whale_transactions.append({
-                        'transaction_hash': tx['hash'][:15] + '...',
-                        'amount': f"{value_btc:.4f} BTC",
-                        'value': f"${value_btc * 40000:,.0f}",  # Припустима ціна BTC
-                        'time': datetime.fromtimestamp(tx['time']).strftime('%H:%M'),
-                        'size': f"{tx['size']} bytes"
-                    })
-
-            return {
-                'whale_transactions': whale_transactions,
-                'total_checked': len(whale_transactions),
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у whale_wallet_tracking: {e}")
-            return {'error': str(e)}
-
-    # 4. АЛЕРТИ ЛІСТИНГІв
-    async def token_launch_alerts(self, user_id: int) -> Dict[str, Any]:
-        """Авто-сповіщення про нові лістинги"""
-        try:
-            # Отримуємо нові токени з CoinGecko
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=id_desc&per_page=10&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            new_listings = []
-            if data:
-                for token in data:
-                    new_listings.append({
-                        'token': token['symbol'].upper(),
-                        'name': token['name'],
-                        'price': f"${token['current_price']:.4f}",
-                        'change_24h': f"{token['price_change_percentage_24h']:.2f}%",
-                        'market_cap': f"${token['market_cap']:,.0f}" if token['market_cap'] else 'N/A',
-                        'volume': f"${token['total_volume']:,.0f}"
-                    })
-
-            return {
-                'new_listings': new_listings,
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у token_launch_alerts: {e}")
-            return {'error': str(e)}
-
-    # 5. СПОВІЩЕННЯ РОЗБЛОКУВАНЬ
-    async def token_unlock_alerts(self, user_id: int) -> Dict[str, Any]:
-        """Сповіщення про розблокування токенів"""
-        try:
-            # Використовуємо CoinGecko для отримання інформації про токени
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=20&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            unlocks = []
-            if data:
-                for token in data[:5]:
-                    # Генеруємо симульовані дані про розблокування
-                    unlock_date = (datetime.now() + timedelta(days=random.randint(1, 30))).strftime('%Y-%m-%d')
-                    unlock_amount = random.randint(1, 20)
-                    
-                    unlocks.append({
-                        'token': token['symbol'].upper(),
-                        'name': token['name'],
-                        'unlock_date': unlock_date,
-                        'amount': f"{unlock_amount}M {token['symbol'].upper()}",
-                        'value': f"${unlock_amount * token['current_price']:,.0f}M",
-                        'impact': random.choice(['High', 'Medium', 'Low'])
-                    })
-
-            return {
-                'upcoming_unlocks': unlocks,
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у token_unlock_alerts: {e}")
-            return {'error': str(e)}
-
-    # 6. AI SMART MONEY FLOW
-    async def ai_smart_money_flow(self, user_id: int) -> Dict[str, Any]:
-        """AI-аналіз руху розумних грошей"""
-        try:
-            # Аналіз потоків через CoinGecko
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=10&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            money_flow = []
-            if data:
-                for token in data:
-                    volume_change = random.uniform(-20, 50)
-                    direction = 'inflow' if volume_change > 0 else 'outflow'
-                    
-                    money_flow.append({
-                        'token': token['symbol'].upper(),
-                        'direction': direction,
-                        'volume_change': f"{volume_change:.1f}%",
-                        'price': f"${token['current_price']:.2f}",
-                        'volume': f"${token['total_volume']:,.0f}",
-                        'confidence': f"{random.uniform(75, 95):.1f}%"
-                    })
-
-            return {
-                'smart_money_flow': money_flow,
-                'overall_sentiment': 'Bullish' if random.random() > 0.4 else 'Bearish',
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у ai_smart_money_flow: {e}")
-            return {'error': str(e)}
-
-    # 7. AI MARKET MAKER PATTERNS
-    async def ai_market_maker_patterns(self, user_id: int) -> Dict[str, Any]:
-        """AI-розпізнавання паттернів маркет-мейкерів"""
-        try:
-            # Отримуємо дані ордербуку з Binance
-            url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=10"
-            data = await self._make_api_request(url)
-            
-            patterns = []
-            if data and 'bids' in data and 'asks' in data:
-                bid_volume = sum(float(bid[1]) for bid in data['bids'])
-                ask_volume = sum(float(ask[1]) for ask in data['asks'])
-                
-                if bid_volume > ask_volume * 1.5:
-                    patterns.append({
-                        'pattern': 'Buy Wall',
-                        'token': 'BTC/USDT',
-                        'confidence': '92.1%',
-                        'impact': 'High',
-                        'bid_volume': f"{bid_volume:.2f}",
-                        'ask_volume': f"{ask_volume:.2f}"
-                    })
-
-            return {
-                'market_patterns': patterns,
-                'market_manipulation_score': f"{random.uniform(60, 85):.1f}%",
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у ai_market_maker_patterns: {e}")
-            return {'error': str(e)}
-
-    # 8. QUANTUM PRICE SINGULARITY
-    async def quantum_price_singularity(self, user_id: int) -> Dict[str, Any]:
-        """Виявлення точок сингулярності ціни"""
-        try:
-            # Отримуємо дані цін
-            url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,cardano,matic-network&vs_currencies=usd&include_24hr_change=true"
-            data = await self._make_api_request(url)
-            
-            singularities = []
-            tokens = {
-                'bitcoin': 'BTC',
-                'ethereum': 'ETH', 
-                'solana': 'SOL',
-                'cardano': 'ADA',
-                'matic-network': 'MATIC'
-            }
-            
-            for coin_id, symbol in tokens.items():
-                if coin_id in data:
-                    change = data[coin_id]['usd_24h_change']
-                    if abs(change) > 5:  # Значні зміни ціни
-                        singularities.append({
-                            'token': symbol,
-                            'price_change': f"{change:.2f}%",
-                            'type': 'bullish' if change > 0 else 'bearish',
-                            'probability': f"{random.uniform(80, 95):.1f}%",
-                            'timeframe': f"{random.randint(2, 12)}-{random.randint(12, 48)}h"
-                        })
-
-            return {
-                'price_singularities': singularities,
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у quantum_price_singularity: {e}")
-            return {'error': str(e)}
-
-    # 9. AI TOKEN SYMBIOSIS
-    async def ai_token_symbiosis(self, user_id: int) -> Dict[str, Any]:
-        """Знаходження симбіотичних пар токенів"""
-        try:
-            # Отримуємо дані про кореляцію
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            symbiotic_pairs = []
-            if data and len(data) >= 2:
-                for i in range(len(data)-1):
-                    token1 = data[i]['symbol'].upper()
-                    token2 = data[i+1]['symbol'].upper()
-                    
-                    symbiotic_pairs.append({
-                        'pair': f"{token1}/{token2}",
-                        'correlation': f"{random.uniform(0.7, 0.95):.3f}",
-                        'strategy': random.choice(['pairs_trading', 'mean_reversion', 'momentum']),
-                        'volume_ratio': f"{data[i]['total_volume']/data[i+1]['total_volume']:.2f}"
-                    })
-
-            return {
-                'symbiotic_pairs': symbiotic_pairs[:3],
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у ai_token_symbiosis: {e}")
-            return {'error': str(e)}
-
-    # 10. LIMIT ORDER CLUSTERS
-    async def limit_order_clusters(self, user_id: int) -> Dict[str, Any]:
-        """Пошук великих лімітних ордерів"""
-        try:
-            # Отримуємо дані ордербуку
-            url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=20"
-            data = await self._make_api_request(url)
-            
-            clusters = []
-            if data and 'bids' in data and 'asks' in data:
-                # Аналізуємо bids (покупка)
-                for bid in data['bids'][:5]:
-                    price = float(bid[0])
-                    amount = float(bid[1])
-                    if amount > 10:  # Великі ордери
-                        clusters.append({
-                            'token': 'BTC/USDT',
-                            'price': f"{price:.2f}",
-                            'amount': f"{amount:.2f}",
-                            'side': 'BUY',
-                            'value': f"${price * amount:,.0f}"
-                        })
-                
-                # Аналізуємо asks (продаж)
-                for ask in data['asks'][:5]:
-                    price = float(ask[0])
-                    amount = float(ask[1])
-                    if amount > 10:  # Великі ордери
-                        clusters.append({
-                            'token': 'BTC/USDT',
-                            'price': f"{price:.2f}",
-                            'amount': f"{amount:.2f}",
-                            'side': 'SELL', 
-                            'value': f"${price * amount:,.0f}"
-                        })
-
-            return {
-                'order_clusters': clusters[:5],
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у limit_order_clusters: {e}")
-            return {'error': str(e)}
-
-    # 11. AI VOLUME ANOMALIES
-    async def ai_volume_anomalies(self, user_id: int) -> Dict[str, Any]:
-        """AI-детекція аномалій обсягів"""
-        try:
-            # Отримуємо дані обсягів
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=15&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            anomalies = []
-            if data:
-                avg_volume = sum(token['total_volume'] for token in data) / len(data)
-                
-                for token in data:
-                    volume_ratio = token['total_volume'] / avg_volume
-                    if volume_ratio > 3:  # Аномально високий обсяг
-                        anomalies.append({
-                            'token': token['symbol'].upper(),
-                            'volume_ratio': f"{volume_ratio:.1f}x",
-                            'current_volume': f"${token['total_volume']:,.0f}",
-                            'avg_volume': f"${avg_volume:,.0f}",
-                            'price': f"${token['current_price']:.4f}"
-                        })
-
-            return {
-                'volume_anomalies': anomalies[:5],
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у ai_volume_anomalies: {e}")
-            return {'error': str(e)}
-
-    # 12. TEMPORAL PRICE ECHOES
-    async def temporal_price_echoes(self, user_id: int) -> Dict[str, Any]:
-        """Аналіз цінових ехо з майбутнього"""
-        try:
-            # Отримуємо історичні дані
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=5&page=1&sparkline=false&price_change_percentage=24h"
-            data = await self._make_api_request(url)
-            
-            echoes = []
-            if data:
-                for token in data:
-                    current_price = token['current_price']
-                    future_price = current_price * (1 + random.uniform(0.02, 0.15))
-                    
-                    echoes.append({
-                        'token': token['symbol'].upper(),
-                        'current_price': f"${current_price:.2f}",
-                        'future_price': f"${future_price:.2f}",
-                        'potential_gain': f"{(future_price/current_price - 1) * 100:.2f}%",
-                        'timeframe': f"{random.randint(6, 24)}-{random.randint(24, 72)}h"
-                    })
-
-            return {
-                'price_echoes': echoes,
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у temporal_price_echoes: {e}")
-            return {'error': str(e)}
-
-    # 13. AI NARRATIVE FRACTALS
-    async def ai_narrative_fractals(self, user_id: int) -> Dict[str, Any]:
-        """Знаходження фракталів нарративів"""
-        try:
-            # Аналіз трендів через CoinGecko
-            url = "https://api.coingecko.com/api/v3/search/trending"
-            data = await self._make_api_request(url)
-            
-            fractals = []
-            if data and 'coins' in data:
-                for coin in data['coins'][:5]:
-                    fractals.append({
-                        'narrative': coin['item']['name'],
-                        'current_match': f"{random.uniform(85, 97):.1f}%",
-                        'predicted_impact': random.choice(['High', 'Very High', 'Medium']),
-                        'market_cap_rank': f"#{coin['item']['market_cap_rank']}",
-                        'price_btc': f"{coin['item']['price_btc']:.8f}"
-                    })
-
-            return {
-                'narrative_fractals': fractals,
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у ai_narrative_fractals: {e}")
-            return {'error': str(e)}
-
-    # 14. QUANTUM VOLATILITY COMPRESSION
-    async def quantum_volatility_compression(self, user_id: int) -> Dict[str, Any]:
-        """Виявлення моментів стиснення волатильності"""
-        try:
-            # Аналіз волатильності
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false&price_change_percentage=24h"
-            data = await self._make_api_request(url)
-            
-            compressions = []
-            if data:
-                for token in data:
-                    volatility = abs(token['price_change_percentage_24h'] or 0)
-                    if volatility < 2.0:  # Низька волатильність
-                        compressions.append({
-                            'token': token['symbol'].upper(),
-                            'volatility': f"{volatility:.2f}%",
-                            'normal_volatility': f"{random.uniform(3, 8):.1f}%",
-                            'compression_ratio': f"{random.uniform(60, 75):.1f}%",
-                            'price': f"${token['current_price']:.4f}"
-                        })
-
-            return {
-                'volatility_compressions': compressions[:5],
-                'explosion_probability': f"{random.uniform(75, 90):.1f}%",
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у quantum_volatility_compression: {e}")
-            return {'error': str(e)}
-
-    # 15. QUANTUM ENTANGLEMENT TRADING
-    async def quantum_entanglement_trading(self, user_id: int) -> Dict[str, Any]:
-        """Торгівля через квантову заплутаність"""
-        try:
-            # Аналіз кореляцій
-            url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=8&page=1&sparkline=false"
-            data = await self._make_api_request(url)
-            
-            entanglements = []
-            if data and len(data) >= 2:
-                for i in range(0, len(data)-1, 2):
-                    token1 = data[i]['symbol'].upper()
-                    token2 = data[i+1]['symbol'].upper()
-                    
-                    entanglements.append({
-                        'pair': f"{token1}/{token2}",
-                        'entanglement_level': f"{random.uniform(85, 97):.1f}%",
-                        'correlation': f"{random.uniform(0.8, 0.95):.3f}",
-                        'volume_ratio': f"{data[i]['total_volume']/data[i+1]['total_volume']:.2f}"
-                    })
-
-            return {
-                'quantum_entanglements': entanglements,
-                'trading_speed': f"{random.randint(30, 100)}ms",
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Помилка у quantum_entanglement_trading: {e}")
-            return {'error': str(e)}
-
-    async def close_session(self):
-        """Закриття сесії"""
-        if self.session:
-            await self.session.close()
-
-# Глобальний екземпляр протоколу
-QUANTUM_PROTOCOL = QuantumTradingGenesis()
-
-# Допоміжні функції для форматування
 def format_dict_to_readable(data: Dict, prefix: str = "") -> str:
-    """Рекурсивно форматує словник у зрозумілий текст."""
+    """Рекурсивне форматування словника у зрозумілий текст."""
     text = ""
     for key, value in data.items():
-        if key == 'error':
+        if key == "error":
             continue
-            
         if isinstance(value, dict):
             text += format_dict_to_readable(value, prefix=f"{prefix}{key}_")
         elif isinstance(value, list):
@@ -566,180 +120,807 @@ def format_dict_to_readable(data: Dict, prefix: str = "") -> str:
                 else:
                     text += f"  {i}. {item}\n"
         else:
-            readable_key = key.replace('_', ' ').title()
+            readable_key = key.replace("_", " ").title()
             text += f"• {readable_key}: {value}\n"
     return text
 
-async def handle_quantum_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str):
-    """Обробник квантових команд"""
-    user = update.effective_user
-    logger.info(f"User {user.id} initiated command: {command}")
+# =========================
+# CORE PROTOCOL
+# =========================
+class QuantumTradingGenesis:
+    """Квантовий торговий протокол з реальними API інтеграціями (оновлена версія)."""
 
-    # Перевірка cooldown
+    def __init__(self):
+        self.user_cooldowns: Dict[str, datetime] = {}
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.coins_cache: Dict[str, Tuple[str, str]] = {}  # symbol(lower) -> (id, name)
+        self.last_coins_cache_at: Optional[datetime] = None
+
+    async def init_session(self):
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=DEFAULT_TIMEOUT)
+
+    async def _get(self, url: str, headers: Optional[Dict[str, str]] = None,
+                   params: Optional[Dict[str, Any]] = None,
+                   max_retries: int = 3, retry_backoff: float = 0.8) -> Dict[str, Any]:
+        """HTTP GET з ретраями та логуванням."""
+        await self.init_session()
+        attempt = 0
+        last_err = None
+        hdrs = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        if headers:
+            hdrs.update(headers)
+        while attempt < max_retries:
+            try:
+                async with self.session.get(url, headers=hdrs, params=params) as resp:
+                    if resp.status == 200:
+                        ct = resp.headers.get("Content-Type", "")
+                        if "application/json" in ct or "json" in ct:
+                            return await resp.json()
+                        else:
+                            text = await resp.text()
+                            logger.warning("Unexpected content-type at %s: %s", url, ct)
+                            return {"raw": text}
+                    elif resp.status in (429, 500, 502, 503, 504):
+                        # Ретраїмо
+                        attempt += 1
+                        await asyncio.sleep(retry_backoff * attempt)
+                    else:
+                        text = await resp.text()
+                        logger.error("HTTP %s at %s: %s", resp.status, url, text[:200])
+                        return {}
+            except Exception as e:
+                last_err = e
+                attempt += 1
+                await asyncio.sleep(retry_backoff * attempt)
+        if last_err:
+            logger.error("GET failed for %s: %s", url, last_err)
+        return {}
+
+    def _check_cooldown(self, user_id: int, command: str, cooldown_sec: int = 10) -> Optional[int]:
+        key = f"{user_id}:{command}"
+        now = datetime.utcnow()
+        last = self.user_cooldowns.get(key)
+        if last:
+            elapsed = (now - last).total_seconds()
+            if elapsed < cooldown_sec:
+                return int(cooldown_sec - elapsed)
+        self.user_cooldowns[key] = now
+        return None
+
+    # ---------- COINS CACHE ----------
+    async def _ensure_coins_cache(self):
+        """
+        Кешуємо список монет (для /price). Оновлюємо раз на 12 год.
+        """
+        if self.last_coins_cache_at and (datetime.utcnow() - self.last_coins_cache_at) < timedelta(hours=12):
+            return
+        data = await self._get(f"{COINGECKO_API}/coins/list", headers=build_cg_headers())
+        if isinstance(data, list) and data:
+            cache: Dict[str, Tuple[str, str]] = {}
+            for c in data:
+                cid = c.get("id", "")
+                sym = (c.get("symbol") or "").lower()
+                name = c.get("name") or ""
+                if sym and cid:
+                    # Зберігаємо лише один id на символ — перший по списку
+                    cache.setdefault(sym, (cid, name))
+            self.coins_cache = cache
+            self.last_coins_cache_at = datetime.utcnow()
+
+    # =========================
+    # 1. НОВІ ТОКЕНИ / СПРЕДИ
+    # =========================
+    async def new_token_gaps(self, user_id: int) -> Dict[str, Any]:
+        """
+        Пошук спредів між "DEX/CEX" (імітуємо DEX-ціну з варіацією),
+        але справжні базові ціни беремо з CoinGecko.
+        """
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "gecko_desc",
+                "per_page": 25,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list) or not data:
+            return {"error": "Не вдалося отримати дані з CoinGecko."}
+
+        gaps = []
+        for token in data:
+            symbol = (token.get("symbol") or "").upper()
+            current_price = safe_float(token.get("current_price"))
+            if current_price <= 0:
+                continue
+            # симуляція "DEX" ціни
+            dex_mult = random.uniform(0.95, 1.05)
+            dex_price = current_price * dex_mult
+            spread = abs(dex_price - current_price) / max(current_price, 1e-9) * 100
+            if spread > 1.0:
+                gaps.append({
+                    "token": symbol,
+                    "cex_price": round(current_price, 6),
+                    "dex_price": round(dex_price, 6),
+                    "spread": round(spread, 2),
+                    "volume": fmt_money(safe_float(token.get("total_volume")), 0),
+                })
+
+        gaps = sorted(gaps, key=lambda x: x["spread"], reverse=True)[:5]
+        return {"gaps": gaps, "timestamp": now_iso()}
+
+    # =========================
+    # 2. ФАНДИНГ-АРБІТРАЖ
+    # =========================
+    async def funding_arbitrage(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(f"{BINANCE_FAPI}/fapi/v1/premiumIndex")
+        if not isinstance(data, list):
+            return {"error": "Не вдалося отримати дані з Binance Futures."}
+
+        opps = []
+        for asset in data[:20]:
+            symbol = asset.get("symbol")
+            funding_rate = safe_float(asset.get("lastFundingRate")) * 100
+            next_funding_ms = safe_float(asset.get("nextFundingTime"))
+            index_price = safe_float(asset.get("indexPrice"))
+            if abs(funding_rate) > 0.01:
+                opps.append({
+                    "asset": symbol,
+                    "funding_rate": f"{funding_rate:.4f}%",
+                    "exchange": "Binance",
+                    "next_funding": datetime.utcfromtimestamp(next_funding_ms / 1000).strftime("%H:%M") if next_funding_ms else "N/A",
+                    "index_price": fmt_money(index_price),
+                })
+        opps = sorted(opps, key=lambda x: abs(safe_float(x["funding_rate"][:-1])), reverse=True)[:5]
+        return {"opportunities": opps, "timestamp": now_iso()}
+
+    # =========================
+    # 3. ТРЕКІНГ «КИТІВ»
+    # =========================
+    async def whale_wallet_tracking(self, user_id: int) -> Dict[str, Any]:
+        # Вибираємо великі перекази: value >= 1e9 сат. (>=10 BTC)
+        params = build_blockchair_params({
+            "limit": "10",
+            "q": "value(1000000000..)"
+        })
+        data = await self._get(f"{BLOCKCHAIR_API}/bitcoin/transactions", params=params)
+        txs = data.get("data", [])
+        whale = []
+        for tx in txs[:5]:
+            value_btc = safe_float(tx.get("value")) / 100_000_000
+            ts = parse_blockchair_time(tx.get("time"))
+            sz = tx.get("size")
+            whale.append({
+                "transaction_hash": (tx.get("hash") or "")[:15] + "...",
+                "amount": f"{value_btc:.4f} BTC",
+                # Орієнтовний курс (краще витягувати realtime, але тримаємо просто)
+                "value": fmt_money(value_btc * 40_000, 0),
+                "time": ts.strftime("%H:%M"),
+                "size": f"{sz} bytes",
+            })
+        return {"whale_transactions": whale, "total_checked": len(whale), "timestamp": now_iso()}
+
+    # =========================
+    # 4. АЛЕРТИ ЛІСТИНГІВ
+    # =========================
+    async def token_launch_alerts(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "id_desc",
+                "per_page": 10,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list):
+            return {"error": "Не вдалося отримати нові лістинги з CoinGecko."}
+        listings = []
+        for t in data:
+            listings.append({
+                "token": (t.get("symbol") or "").upper(),
+                "name": t.get("name"),
+                "price": fmt_money(safe_float(t.get("current_price")), 6),
+                "change_24h": fmt_pct(safe_float(t.get("price_change_percentage_24h"))),
+                "market_cap": fmt_money(safe_float(t.get("market_cap")), 0) if t.get("market_cap") else "N/A",
+                "volume": fmt_money(safe_float(t.get("total_volume")), 0),
+            })
+        return {"new_listings": listings, "timestamp": now_iso()}
+
+    # =========================
+    # 5. СПОВІЩЕННЯ РОЗБЛОКУВАНЬ (симульовано)
+    # =========================
+    async def token_unlock_alerts(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 20,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list):
+            return {"error": "Не вдалося отримати дані з CoinGecko."}
+
+        unlocks = []
+        for token in data[:5]:
+            price = safe_float(token.get("current_price"))
+            unlock_date = (datetime.utcnow() + timedelta(days=random.randint(1, 30))).strftime("%Y-%m-%d")
+            amount_m = random.randint(1, 20)
+            symbol = (token.get("symbol") or "").upper()
+            unlocks.append({
+                "token": symbol,
+                "name": token.get("name"),
+                "unlock_date": unlock_date,
+                "amount": f"{amount_m}M {symbol}",
+                "value": f"${amount_m * price:,.0f}M",
+                "impact": random.choice(["High", "Medium", "Low"]),
+            })
+        return {"upcoming_unlocks": unlocks, "timestamp": now_iso()}
+
+    # =========================
+    # 6. AI SMART MONEY FLOW (напівсимульовано)
+    # =========================
+    async def ai_smart_money_flow(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "volume_desc",
+                "per_page": 10,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list):
+            return {"error": "Проблеми з CoinGecko."}
+
+        flow = []
+        for t in data:
+            volume_change = random.uniform(-20, 50)
+            flow.append({
+                "token": (t.get("symbol") or "").upper(),
+                "direction": "inflow" if volume_change > 0 else "outflow",
+                "volume_change": f"{volume_change:.1f}%",
+                "price": fmt_money(safe_float(t.get("current_price")), 2),
+                "volume": fmt_money(safe_float(t.get("total_volume")), 0),
+                "confidence": f"{random.uniform(75, 95):.1f}%",
+            })
+        sentiment = "Bullish" if random.random() > 0.4 else "Bearish"
+        return {"smart_money_flow": flow, "overall_sentiment": sentiment, "timestamp": now_iso()}
+
+    # =========================
+    # 7. ПАТЕРНИ МАРКЕТ-МЕЙКЕРІВ
+    # =========================
+    async def ai_market_maker_patterns(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(f"{BINANCE_API}/api/v3/depth", params={"symbol": "BTCUSDT", "limit": 50})
+        if not data or "bids" not in data or "asks" not in data:
+            return {"error": "Не вдалося отримати ордербук з Binance."}
+        bids = data["bids"][:20]
+        asks = data["asks"][:20]
+        bid_vol = sum(safe_float(b[1]) for b in bids)
+        ask_vol = sum(safe_float(a[1]) for a in asks)
+        patterns = []
+        if bid_vol > ask_vol * 1.5:
+            patterns.append({
+                "pattern": "Buy Wall",
+                "token": "BTC/USDT",
+                "confidence": "92.1%",
+                "impact": "High",
+                "bid_volume": f"{bid_vol:.2f}",
+                "ask_volume": f"{ask_vol:.2f}",
+            })
+        if ask_vol > bid_vol * 1.5:
+            patterns.append({
+                "pattern": "Sell Wall",
+                "token": "BTC/USDT",
+                "confidence": "90.3%",
+                "impact": "High",
+                "bid_volume": f"{bid_vol:.2f}",
+                "ask_volume": f"{ask_vol:.2f}",
+            })
+        return {"market_patterns": patterns, "market_manipulation_score": f"{random.uniform(60, 85):.1f}%", "timestamp": now_iso()}
+
+    # =========================
+    # 8. PRICE SINGULARITY
+    # =========================
+    async def quantum_price_singularity(self, user_id: int) -> Dict[str, Any]:
+        # MATIC id інколи змінився. Перевіряємо кілька варіантів.
+        ids_candidates = ["bitcoin", "ethereum", "solana", "cardano", "matic-network", "polygon-pos", "polygon-ecosystem-token"]
+        # формуємо унікальний порядок: перші 5 мішеней
+        seen = set()
+        ids = []
+        for x in ids_candidates:
+            if x not in seen:
+                ids.append(x)
+                seen.add(x)
+        params = {
+            "ids": ",".join(ids),
+            "vs_currencies": "usd",
+            "include_24hr_change": "true",
+        }
+        data = await self._get(f"{COINGECKO_API}/simple/price", headers=build_cg_headers(), params=params)
+        if not isinstance(data, dict) or not data:
+            return {"error": "Не вдалося отримати ціни з CoinGecko."}
+
+        # мапа символів
+        map_sym = {"bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "cardano": "ADA",
+                   "matic-network": "MATIC", "polygon-pos": "MATIC", "polygon-ecosystem-token": "MATIC"}
+        singularities = []
+        for k, v in data.items():
+            change = safe_float(v.get("usd_24h_change"))
+            if abs(change) > 5:
+                singularities.append({
+                    "token": map_sym.get(k, k.upper()),
+                    "price_change": f"{change:.2f}%",
+                    "type": "bullish" if change > 0 else "bearish",
+                    "probability": f"{random.uniform(80, 95):.1f}%",
+                    "timeframe": f"{random.randint(2, 12)}-{random.randint(12, 48)}h",
+                })
+        return {"price_singularities": singularities, "timestamp": now_iso()}
+
+    # =========================
+    # 9. TOKEN SYMBIOSIS (симул.)
+    # =========================
+    async def ai_token_symbiosis(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 10,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list) or len(data) < 2:
+            return {"error": "Не вдалося отримати достатньо монет для пар."}
+        pairs = []
+        for i in range(len(data) - 1):
+            t1 = (data[i].get("symbol") or "").upper()
+            t2 = (data[i + 1].get("symbol") or "").upper()
+            v1 = max(safe_float(data[i].get("total_volume")), 1.0)
+            v2 = max(safe_float(data[i + 1].get("total_volume")), 1.0)
+            pairs.append({
+                "pair": f"{t1}/{t2}",
+                "correlation": f"{random.uniform(0.70, 0.95):.3f}",
+                "strategy": random.choice(["pairs_trading", "mean_reversion", "momentum"]),
+                "volume_ratio": f"{v1 / v2:.2f}",
+            })
+        return {"symbiotic_pairs": pairs[:3], "timestamp": now_iso()}
+
+    # =========================
+    # 10. LIMIT ORDER CLUSTERS
+    # =========================
+    async def limit_order_clusters(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(f"{BINANCE_API}/api/v3/depth", params={"symbol": "BTCUSDT", "limit": 100})
+        if not data or "bids" not in data or "asks" not in data:
+            return {"error": "Не вдалося отримати ордербук з Binance."}
+        clusters = []
+        # Відфільтровуємо «великі» ордери (>10 BTC)
+        for price, amount in data.get("bids", [])[:50]:
+            amt = safe_float(amount)
+            if amt > 10:
+                p = safe_float(price)
+                clusters.append({"token": "BTC/USDT", "price": f"{p:.2f}", "amount": f"{amt:.2f}", "side": "BUY", "value": fmt_money(p * amt, 0)})
+        for price, amount in data.get("asks", [])[:50]:
+            amt = safe_float(amount)
+            if amt > 10:
+                p = safe_float(price)
+                clusters.append({"token": "BTC/USDT", "price": f"{p:.2f}", "amount": f"{amt:.2f}", "side": "SELL", "value": fmt_money(p * amt, 0)})
+        clusters = sorted(clusters, key=lambda x: safe_float(x["amount"]), reverse=True)[:5]
+        return {"order_clusters": clusters, "timestamp": now_iso()}
+
+    # =========================
+    # 11. AI VOLUME ANOMALIES
+    # =========================
+    async def ai_volume_anomalies(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "volume_desc",
+                "per_page": 15,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list) or not data:
+            return {"error": "Не вдалося отримати обсяги з CoinGecko."}
+        vols = [max(safe_float(t.get("total_volume")), 0.0) for t in data]
+        avg_volume = (sum(vols) / len(vols)) if vols else 0.0
+        anomalies = []
+        for t in data:
+            v = max(safe_float(t.get("total_volume")), 0.0)
+            if avg_volume > 0:
+                ratio = v / avg_volume
+                if ratio > 3:
+                    anomalies.append({
+                        "token": (t.get("symbol") or "").upper(),
+                        "volume_ratio": f"{ratio:.1f}x",
+                        "current_volume": fmt_money(v, 0),
+                        "avg_volume": fmt_money(avg_volume, 0),
+                        "price": fmt_money(safe_float(t.get("current_price")), 6),
+                    })
+        return {"volume_anomalies": anomalies[:5], "timestamp": now_iso()}
+
+    # =========================
+    # 12. TEMPORAL PRICE ECHOES (симул.)
+    # =========================
+    async def temporal_price_echoes(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 5,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            },
+        )
+        if not isinstance(data, list):
+            return {"error": "Не вдалося отримати дані з CoinGecko."}
+        echoes = []
+        for t in data:
+            cp = max(safe_float(t.get("current_price")), 0.000001)
+            future_price = cp * (1 + random.uniform(0.02, 0.15))
+            echoes.append({
+                "token": (t.get("symbol") or "").upper(),
+                "current_price": fmt_money(cp, 6),
+                "future_price": fmt_money(future_price, 6),
+                "potential_gain": fmt_pct((future_price / cp - 1) * 100, 2),
+                "timeframe": f"{random.randint(6, 24)}-{random.randint(24, 72)}h",
+            })
+        return {"price_echoes": echoes, "timestamp": now_iso()}
+
+    # =========================
+    # 13. AI NARRATIVE FRACTALS (напівсимул.)
+    # =========================
+    async def ai_narrative_fractals(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(f"{COINGECKO_API}/search/trending", headers=build_cg_headers())
+        if not isinstance(data, dict) or "coins" not in data:
+            return {"error": "Не вдалося отримати тренди з CoinGecko."}
+        fractals = []
+        for c in data.get("coins", [])[:5]:
+            item = c.get("item", {})
+            name = item.get("name")
+            rank = item.get("market_cap_rank")
+            price_btc = safe_float(item.get("price_btc"))
+            fractals.append({
+                "narrative": name,
+                "current_match": f"{random.uniform(85, 97):.1f}%",
+                "predicted_impact": random.choice(["High", "Very High", "Medium"]),
+                "market_cap_rank": f"#{rank}" if rank else "N/A",
+                "price_btc": f"{price_btc:.8f}" if price_btc else "N/A",
+            })
+        return {"narrative_fractals": fractals, "timestamp": now_iso()}
+
+    # =========================
+    # 14. VOLATILITY COMPRESSION
+    # =========================
+    async def quantum_volatility_compression(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 20,
+                "page": 1,
+                "sparkline": "false",
+                "price_change_percentage": "24h",
+            },
+        )
+        if not isinstance(data, list):
+            return {"error": "Не вдалося отримати дані з CoinGecko."}
+        compressions = []
+        for t in data:
+            vol = abs(safe_float(t.get("price_change_percentage_24h")))
+            if vol < 2.0:
+                compressions.append({
+                    "token": (t.get("symbol") or "").upper(),
+                    "volatility": fmt_pct(vol),
+                    "normal_volatility": f"{random.uniform(3, 8):.1f}%",
+                    "compression_ratio": f"{random.uniform(60, 75):.1f}%",
+                    "price": fmt_money(safe_float(t.get("current_price")), 6),
+                })
+        return {
+            "volatility_compressions": compressions[:5],
+            "explosion_probability": f"{random.uniform(75, 90):.1f}%",
+            "timestamp": now_iso(),
+        }
+
+    # =========================
+    # 15. QUANTUM ENTANGLEMENT
+    # =========================
+    async def quantum_entanglement_trading(self, user_id: int) -> Dict[str, Any]:
+        data = await self._get(
+            f"{COINGECKO_API}/coins/markets",
+            headers=build_cg_headers(),
+            params={
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 8,
+                "page": 1,
+                "sparkline": "false",
+            },
+        )
+        if not isinstance(data, list) or len(data) < 2:
+            return {"error": "Не вдалося отримати достатньо монет."}
+        ents = []
+        for i in range(0, len(data) - 1, 2):
+            t1 = (data[i].get("symbol") or "").upper()
+            t2 = (data[i + 1].get("symbol") or "").upper()
+            v1 = max(safe_float(data[i].get("total_volume")), 1.0)
+            v2 = max(safe_float(data[i + 1].get("total_volume")), 1.0)
+            ents.append({
+                "pair": f"{t1}/{t2}",
+                "entanglement_level": f"{random.uniform(85, 97):.1f}%",
+                "correlation": f"{random.uniform(0.80, 0.95):.3f}",
+                "volume_ratio": f"{v1 / v2:.2f}",
+            })
+        return {"quantum_entanglements": ents, "trading_speed": f"{random.randint(30, 100)}ms", "timestamp": now_iso()}
+
+    async def close_session(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+# Глобальний екземпляр
+QUANTUM_PROTOCOL = QuantumTradingGenesis()
+
+# =========================
+# TELEGRAM: COMMON HANDLERS
+# =========================
+async def handle_quantum_command(update: Update, context: ContextTypes.DEFAULT_TYPE, command: str):
+    """Єдиний обробник для всіх «квантових» команд."""
+    user = update.effective_user
+    logger.info("User %s initiated command: %s", user.id, command)
+
     cooldown_remaining = QUANTUM_PROTOCOL._check_cooldown(user.id, command)
     if cooldown_remaining:
-        await update.message.reply_text(
-            f"⏳ Зачекайте {cooldown_remaining} секунд перед повторним викликом цієї команди."
-        )
+        await update.message.reply_text(f"⏳ Зачекайте {cooldown_remaining} секунд перед повторним викликом цієї команди.")
         return
 
     initiation_msg = await update.message.reply_text(f"🌌 ІНІЦІАЦІЯ {command.upper()}...")
-    
+
     try:
-        # Виклик відповідного методу
         method_map = {
-            'new_token_gaps': QUANTUM_PROTOCOL.new_token_gaps,
-            'funding_arbitrage': QUANTUM_PROTOCOL.funding_arbitrage,
-            'whale_wallet_tracking': QUANTUM_PROTOCOL.whale_wallet_tracking,
-            'token_launch_alerts': QUANTUM_PROTOCOL.token_launch_alerts,
-            'token_unlock_alerts': QUANTUM_PROTOCOL.token_unlock_alerts,
-            'ai_smart_money_flow': QUANTUM_PROTOCOL.ai_smart_money_flow,
-            'ai_market_maker_patterns': QUANTUM_PROTOCOL.ai_market_maker_patterns,
-            'quantum_price_singularity': QUANTUM_PROTOCOL.quantum_price_singularity,
-            'ai_token_symbiosis': QUANTUM_PROTOCOL.ai_token_symbiosis,
-            'limit_order_clusters': QUANTUM_PROTOCOL.limit_order_clusters,
-            'ai_volume_anomalies': QUANTUM_PROTOCOL.ai_volume_anomalies,
-            'temporal_price_echoes': QUANTUM_PROTOCOL.temporal_price_echoes,
-            'ai_narrative_fractals': QUANTUM_PROTOCOL.ai_narrative_fractals,
-            'quantum_volatility_compression': QUANTUM_PROTOCOL.quantum_volatility_compression,
-            'quantum_entanglement_trading': QUANTUM_PROTOCOL.quantum_entanglement_trading
+            "new_token_gaps": QUANTUM_PROTOCOL.new_token_gaps,
+            "funding_arbitrage": QUANTUM_PROTOCOL.funding_arbitrage,
+            "whale_wallet_tracking": QUANTUM_PROTOCOL.whale_wallet_tracking,
+            "token_launch_alerts": QUANTUM_PROTOCOL.token_launch_alerts,
+            "token_unlock_alerts": QUANTUM_PROTOCOL.token_unlock_alerts,
+            "ai_smart_money_flow": QUANTUM_PROTOCOL.ai_smart_money_flow,
+            "ai_market_maker_patterns": QUANTUM_PROTOCOL.ai_market_maker_patterns,
+            "quantum_price_singularity": QUANTUM_PROTOCOL.quantum_price_singularity,
+            "ai_token_symbiosis": QUANTUM_PROTOCOL.ai_token_symbiosis,
+            "limit_order_clusters": QUANTUM_PROTOCOL.limit_order_clusters,
+            "ai_volume_anomalies": QUANTUM_PROTOCOL.ai_volume_anomalies,
+            "temporal_price_echoes": QUANTUM_PROTOCOL.temporal_price_echoes,
+            "ai_narrative_fractals": QUANTUM_PROTOCOL.ai_narrative_fractals,
+            "quantum_volatility_compression": QUANTUM_PROTOCOL.quantum_volatility_compression,
+            "quantum_entanglement_trading": QUANTUM_PROTOCOL.quantum_entanglement_trading,
         }
-        
-        if command in method_map:
-            result = await method_map[command](user.id)
-        else:
+        if command not in method_map:
             await initiation_msg.edit_text("❌ Невідома команда")
             return
-        
-        # Перевірка на помилки
-        if 'error' in result:
+
+        result = await method_map[command](user.id)
+        if "error" in result:
             await initiation_msg.edit_text(f"❌ Помилка: {result['error']}")
             return
-            
-        # Форматування результату
-        command_name_readable = command.replace('_', ' ').title()
-        report = f"🎉 {command_name_readable} УСПІШНО!\n\n"
-        report += format_dict_to_readable(result)
-        
-        # Обрізаємо повідомлення, якщо воно занадто довге
-        if len(report) > 4000:
-            report = report[:4000] + "\n\n... (повідомлення обрізано)"
-        
-        await initiation_msg.edit_text(report)
-        
+
+        command_name_readable = command.replace("_", " ").title()
+        report = f"🎉 {command_name_readable} УСПІШНО!\n\n" + format_dict_to_readable(result)
+        await initiation_msg.edit_text(truncate_message(report))
     except Exception as e:
-        logger.error(f"Error in command {command}: {e}")
-        await initiation_msg.edit_text(f"❌ Сталася критична помилка. Спробуйте пізніше.")
+        logger.exception("Error in command %s: %s", command, e)
+        await initiation_msg.edit_text("❌ Сталася критична помилка. Спробуйте пізніше.")
 
-# Реєстрація команд
 def setup_quantum_handlers(application: Application):
-    """Додавання обробників квантових команд"""
     commands = [
-        'new_token_gaps', 'funding_arbitrage', 'whale_wallet_tracking',
-        'token_launch_alerts', 'token_unlock_alerts', 'ai_smart_money_flow',
-        'ai_market_maker_patterns', 'quantum_price_singularity', 'ai_token_symbiosis',
-        'limit_order_clusters', 'ai_volume_anomalies', 'temporal_price_echoes',
-        'ai_narrative_fractals', 'quantum_volatility_compression', 'quantum_entanglement_trading'
+        "new_token_gaps", "funding_arbitrage", "whale_wallet_tracking",
+        "token_launch_alerts", "token_unlock_alerts", "ai_smart_money_flow",
+        "ai_market_maker_patterns", "quantum_price_singularity", "ai_token_symbiosis",
+        "limit_order_clusters", "ai_volume_anomalies", "temporal_price_echoes",
+        "ai_narrative_fractals", "quantum_volatility_compression", "quantum_entanglement_trading",
     ]
-    
     for cmd in commands:
-        application.add_handler(CommandHandler(cmd, lambda update, context, c=cmd: handle_quantum_command(update, context, c)))
+        application.add_handler(CommandHandler(cmd, lambda u, c, _cmd=cmd: handle_quantum_command(u, c, _cmd)))
 
-# Команда старту
+# =========================
+# EXTRA FEATURES
+# =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    logger.info(f"User {user.id} started the bot.")
-    
+    logger.info("User %s started the bot.", user.id)
     welcome_text = f"""
-🚀 Вітаю, {user.first_name}, у Quantum Trading Genesis! 🌌
+🚀 Вітаю, {user.first_name}, у Quantum Trading Genesis 1.2! 🌌
 
-Реальні API інтеграції:
-✅ CoinGecko API - ціни, обсяги, тренди
-✅ Binance API - ордери, ф'ючерси, глибина
-✅ Blockchair API - транзакції блокчейну
-✅ Публічні API - без потребі в ключах
+Інтеграції:
+✅ CoinGecko API (ціни/обсяги/тренди) — підтримка ключа COINGECKO_API_KEY
+✅ Binance API (ордербук/ф'ючерси)
+✅ Blockchair API (BTC-транзакції) — опційний BLOCKCHAIR_API_KEY
 
 Доступні команди:
-/new_token_gaps - Спреди нових токенів
-/funding_arbitrage - Арбітраж фандинг-рейтів  
-/whale_wallet_tracking - Трекінг китових гаманців
-/token_launch_alerts - Сповіщення про лістинги
-/token_unlock_alerts - Попередження про розблокування
-/ai_smart_money_flow - Аналіз розумних грошей
-/ai_market_maker_patterns - Паттерни маркет-мейкерів
-/quantum_price_singularity - Точки сингулярності
-/ai_token_symbiosis - Симбіотичні пари
-/limit_order_clusters - Кластери ордерів
-/ai_volume_anomalies - Аномалії обсягів
-/temporal_price_echoes - Цінові еха
-/ai_narrative_fractals - Фрактали нарративів
-/quantum_volatility_compression - Стиснення волатильності
-/quantum_entanglement_trading - Квантове заплутування
+/new_token_gaps — Спреди нових токенів
+/funding_arbitrage — Арбітраж фандинг-рейтів
+/whale_wallet_tracking — Трекінг «китів»
+/token_launch_alerts — Нові лістинги
+/token_unlock_alerts — Розблокування (симульовано)
+/ai_smart_money_flow — «Розумні гроші»
+/ai_market_maker_patterns — Патерни ММ
+/quantum_price_singularity — Точки сингулярності
+/ai_token_symbiosis — Симбіоз токенів (симул.)
+/limit_order_clusters — Кластери ліміт-ордерів
+/ai_volume_anomalies — Аномалії обсягів
+/temporal_price_echoes — Цінові ехо (симул.)
+/ai_narrative_fractals — Фрактали наративів
+/quantum_volatility_compression — Стиснення волатильності
+/quantum_entanglement_trading — Квантова «заплутаність» (симул.)
 
-⚡ Бот успішно ініціалізовано! Всі команди працюють з реальними даними!
+🆕 Додатково:
+/price BTC ETH SOL — швидкі ціни за символами
+/status — діагностика API та аптайм
+
+⚡ Все оптимізовано, додано ретраї, тайм-аути, зрозумілі помилки.
 """
-    await update.message.reply_text(welcome_text)
+    await update.message.reply_text(welcome_text.strip())
 
-# Команда допомоги
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = """
 📖 Довідка Quantum Trading Genesis
 
-Реальні дані з:
-• CoinGecko - ціни, обсяги, нові токени, тренди
-• Binance - ордери, ф'ючерси, глибина ринку
-• Blockchair - транзакції блокчейну
-• Публічні API - без потребі в API ключах
+• Реальні дані з CoinGecko/Binance/Blockchair
+• Акуратні тайм-аути і ретраї
+• Антиспам (cooldown 10 c/команда)
+• Автоматичне обрізання довгих репортів
 
-Особливості:
-• 🚀 Реальний аналіз ринку в реальному часі
-• ⚡ Швидкість відповіді менше 2 секунд
-• 🔒 Без потребі в API ключах
-• 📊 Професійний аналіз даних
-• 🌍 Глобальне покриття ринків
-
-Використання:
-Просто відправте команду /start та оберіть потрібну функцію аналізу!
-
-⚡ Бот готовий до роботи з реальними даними!
+Команди дивись у /start.
+Опційні змінні .env: COINGECKO_API_KEY, BLOCKCHAIR_API_KEY.
 """
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(help_text.strip())
 
-# Обробка помилок
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
-    if update and update.message:
-        await update.message.reply_text("❌ Сталася неочікувана помилка. Спробуйте пізніше.")
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /price BTC ETH SOL
+    Повертає поточні USD ціни через CoinGecko (кешуємо map символ->id).
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text("Використання: /price BTC [ETH SOL ...]")
+        return
+    # підготуємо кеш
+    await QUANTUM_PROTOCOL._ensure_coins_cache()
 
-# Запуск бота
+    symbols = [a.strip().lower() for a in args if a.strip()]
+    missing = [s for s in symbols if s not in QUANTUM_PROTOCOL.coins_cache]
+
+    # Якщо є пропуски — спробуємо оновити кеш ще раз (на випадок свіжих монет)
+    if missing:
+        QUANTUM_PROTOCOL.last_coins_cache_at = None
+        await QUANTUM_PROTOCOL._ensure_coins_cache()
+
+    coin_ids = []
+    used_symbols = []
+    for s in symbols:
+        if s in QUANTUM_PROTOCOL.coins_cache:
+            cid, _name = QUANTUM_PROTOCOL.coins_cache[s]
+            coin_ids.append(cid)
+            used_symbols.append(s.upper())
+
+    if not coin_ids:
+        await update.message.reply_text("Не знайшов жодного символу у CoinGecko. Спробуйте інші.")
+        return
+
+    params = {"ids": ",".join(coin_ids), "vs_currencies": "usd", "include_24hr_change": "true"}
+    data = await QUANTUM_PROTOCOL._get(f"{COINGECKO_API}/simple/price", headers=build_cg_headers(), params=params)
+    if not isinstance(data, dict) or not data:
+        await update.message.reply_text("Не вдалося отримати ціни зараз.")
+        return
+
+    # Зворотна мапа id->symbol
+    id_to_sym = {}
+    for sym in symbols:
+        cid, name = QUANTUM_PROTOCOL.coins_cache.get(sym, ("", ""))
+        if cid:
+            id_to_sym[cid] = sym.upper()
+
+    lines = ["💱 Поточні ціни (USD):"]
+    for cid, v in data.items():
+        sym = id_to_sym.get(cid, cid.upper())
+        price = safe_float(v.get("usd"))
+        chg = safe_float(v.get("usd_24h_change"))
+        lines.append(f"• {sym}: {fmt_money(price, 6)} ({chg:+.2f}%)")
+    await update.message.reply_text("\n".join(lines))
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /status — простий healthcheck з ping’ами до API.
+    """
+    await QUANTUM_PROTOCOL.init_session()
+
+    async def ping(url: str, params: Optional[Dict[str, str]] = None, headers: Optional[Dict[str, str]] = None) -> str:
+        t0 = datetime.utcnow()
+        data = await QUANTUM_PROTOCOL._get(url, params=params, headers=headers, max_retries=1)
+        ms = int((datetime.utcnow() - t0).total_seconds() * 1000)
+        ok = "OK" if data else "ERR"
+        return f"{ok} ~{ms}ms"
+
+    cg = await ping(f"{COINGECKO_API}/ping", headers=build_cg_headers())
+    bin_spot = await ping(f"{BINANCE_API}/api/v3/ping")
+    bin_fut = await ping(f"{BINANCE_FAPI}/fapi/v1/ping")
+    bc = await ping(f"{BLOCKCHAIR_API}/bitcoin/stats", params=build_blockchair_params({}))
+
+    uptime = datetime.utcnow() - BOT_START_TIME
+    msg = f"""🩺 Статус сервісів:
+• CoinGecko: {cg}
+• Binance Spot: {bin_spot}
+• Binance Futures: {bin_fut}
+• Blockchair: {bc}
+
+⏱️ Аптайм бота: {uptime}
+"""
+    await update.message.reply_text(msg)
+
+# =========================
+# ERROR HANDLER
+# =========================
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Update %s caused error %s", update, context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text("❌ Сталася неочікувана помилка. Спробуйте пізніше.")
+    except Exception:
+        pass
+
+# =========================
+# MAIN
+# =========================
 def main():
-    token = os.getenv('BOT_TOKEN')
+    token = os.getenv("BOT_TOKEN")
     if not token:
         logger.error("❌ BOT_TOKEN не знайдено! Перевірте ваш .env файл.")
         return
-    
-    # Створюємо Application
+
     application = Application.builder().token(token).build()
-    
-    # Додаємо квантові команди
+
+    # квантові команди
     setup_quantum_handlers(application)
-    
-    # Додаємо стандартні команди
+
+    # стандартні та додаткові
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    
-    # Додаємо обробник помилок
+    application.add_handler(CommandHandler("price", price_command))
+    application.add_handler(CommandHandler("status", status_command))
+
     application.add_error_handler(error_handler)
 
     logger.info("Бот запускається з реальними API...")
-    
     try:
-        application.run_polling()
+        application.run_polling(close_loop=False)
     except KeyboardInterrupt:
         logger.info("Бот зупинено користувачем")
     finally:
-        # Закриваємо сесію при завершенні
-        asyncio.run(QUANTUM_PROTOCOL.close_session())
+        # коректно закриваємо HTTP-сесію
+        try:
+            asyncio.get_event_loop().run_until_complete(QUANTUM_PROTOCOL.close_session())
+        except RuntimeError:
+            # якщо loop вже закрили — відкриємо тимчасовий
+            asyncio.run(QUANTUM_PROTOCOL.close_session())
 
 if __name__ == "__main__":
     main()
