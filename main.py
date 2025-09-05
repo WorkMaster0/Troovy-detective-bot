@@ -16,10 +16,12 @@ TIMEFRAMES = ['15m', '1h', '4h']  # Мульті-фрейм
 N_CANDLES = 30
 FAST_EMA = 10
 SLOW_EMA = 30
+
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
 last_signal = None  # Для фільтра повторів
+last_status = None  # Для команди /status
 
 # -------------------------
 # Отримання даних з Binance
@@ -54,7 +56,7 @@ def calculate_ema(closes, period):
     return ema
 
 # -------------------------
-# Аналіз фаз Вайкоффа + подвійна EMA
+# Аналіз фаз Вайкоффа + EMA
 # -------------------------
 def analyze_phase(ohlc):
     closes = [c['close'] for c in ohlc][-N_CANDLES:]
@@ -67,8 +69,9 @@ def analyze_phase(ohlc):
     avg_volume = sum(volumes)/len(volumes)
     recent_high = max(closes)
     recent_low = min(closes)
+    volatility = max(highs) - min(lows)
 
-    # Перевірка тренду останніх 3 свічок
+    # Тренд останніх 3 свічок
     trend_up = closes[-3] < closes[-2] < closes[-1]
     trend_down = closes[-3] > closes[-2] > closes[-1]
 
@@ -84,23 +87,23 @@ def analyze_phase(ohlc):
 
     # Сигнал Вайкоффа + EMA
     if last_close <= recent_low*1.01 and last_volume > avg_volume and trend_up and ema_confirm == 'BUY':
-        return 'BUY', max(highs)-min(lows), True, ema_confirm, trend_up
+        return 'BUY', volatility, True, ema_confirm, trend_up
     elif last_close >= recent_high*0.99 and last_volume > avg_volume and trend_down and ema_confirm == 'SELL':
-        return 'SELL', max(highs)-min(lows), True, ema_confirm, trend_down
+        return 'SELL', volatility, True, ema_confirm, trend_down
     else:
-        return 'HOLD', 0, False, ema_confirm, None
+        return 'HOLD', volatility, False, ema_confirm, None
 
 # -------------------------
-# Відправка сигналу
+# Відправка сигналу з динамічним TP/SL
 # -------------------------
-def send_signal(signal, price, volatility):
+def send_signal(signal, price, max_volatility):
     global last_signal
     if signal == last_signal or signal == "HOLD":
         return
     last_signal = signal
 
-    tp = round(price + volatility*0.5 if signal=="BUY" else price - volatility*0.5, 2)
-    sl = round(price - volatility*0.3 if signal=="BUY" else price + volatility*0.3, 2)
+    tp = round(price + max_volatility*0.5 if signal=="BUY" else price - max_volatility*0.5, 2)
+    sl = round(price - max_volatility*0.3 if signal=="BUY" else price + max_volatility*0.3, 2)
 
     message = f"Сигнал: {signal}\nЦіна: {price}\nTake-profit: {tp}\nStop-loss: {sl}"
     bot.send_message(CHAT_ID, message)
@@ -112,6 +115,7 @@ def send_signal(signal, price, volatility):
 # Перевірка мульті-фрейм
 # -------------------------
 def check_market():
+    global last_status
     while True:
         try:
             signals = []
@@ -132,13 +136,13 @@ def check_market():
                 send_signal(signals[0], last_prices[-1], max(volatilities))
 
             # Збереження останнього статусу для команди /status
-            global last_status
             last_status = {
                 "signals": signals,
                 "ema_confirms": ema_confirms,
                 "trends": trends,
                 "timeframes": TIMEFRAMES,
-                "last_prices": last_prices
+                "last_prices": last_prices,
+                "volatilities": volatilities
             }
 
         except Exception as e:
@@ -148,36 +152,6 @@ def check_market():
         time.sleep(60)
 
 # -------------------------
-# Команда /status
-# -------------------------
-@bot.message_handler(commands=['status'])
-def send_status(message):
-    global last_status
-    if not last_status:
-        bot.send_message(message.chat.id, "Поки немає даних.")
-        return
-
-    text = "Статус сигналів:\n"
-    buy_count = 0
-    sell_count = 0
-    for i, tf in enumerate(last_status["timeframes"]):
-        sig = last_status["signals"][i]
-        ema_signal = last_status["trends"][i][0]
-        trend = last_status["trends"][i][1]
-        price = last_status['last_prices'][i]
-        text += f"{tf}: Сигнал {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend==False else '—'}, Ціна {price}\n"
-        if sig == "BUY":
-            buy_count += 1
-        elif sig == "SELL":
-            sell_count += 1
-
-    total = len(last_status["timeframes"])
-    text += f"\nПідтверджено BUY: {buy_count}/{total} ({buy_count/total*100:.0f}%)\n"
-    text += f"Підтверджено SELL: {sell_count}/{total} ({sell_count/total*100:.0f}%)"
-
-    bot.send_message(message.chat.id, text)
-
-# -------------------------
 # Вебхук для Telegram
 # -------------------------
 @app.route(f'/{API_KEY_TELEGRAM}', methods=['POST'])
@@ -185,12 +159,39 @@ def webhook():
     json_str = request.get_data().decode('utf-8')
     update = telebot.types.Update.de_json(json_str)
     bot.process_new_updates([update])
+
+    # Обробка команди /status
+    if update.message and update.message.text == "/status":
+        global last_status
+        if not last_status:
+            bot.send_message(update.message.chat.id, "Поки немає даних.")
+        else:
+            text = "Статус сигналів:\n"
+            buy_count = 0
+            sell_count = 0
+            for i, tf in enumerate(last_status["timeframes"]):
+                sig = last_status["signals"][i]
+                ema_signal = last_status["trends"][i][0]
+                trend = last_status["trends"][i][1]
+                price = last_status['last_prices'][i]
+                vol = last_status['volatilities'][i]
+                text += f"{tf}: Сигнал {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend==False else '—'}, Ціна {price}, Волатильність {vol:.2f}\n"
+                if sig == "BUY":
+                    buy_count += 1
+                elif sig == "SELL":
+                    sell_count += 1
+
+            total = len(last_status["timeframes"])
+            text += f"\nПідтверджено BUY: {buy_count}/{total} ({buy_count/total*100:.0f}%)\n"
+            text += f"Підтверджено SELL: {sell_count}/{total} ({sell_count/total*100:.0f}%)"
+
+            bot.send_message(update.message.chat.id, text)
+
     return "!", 200
 
 # -------------------------
 # Запуск сервера
 # -------------------------
 if __name__ == "__main__":
-    last_status = None
     threading.Thread(target=check_market, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
