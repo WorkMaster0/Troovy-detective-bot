@@ -26,6 +26,7 @@ def get_klines(symbol="BTCUSDT", interval="1h", limit=200):
     df['high'] = df['high'].astype(float)
     df['low'] = df['low'].astype(float)
     df['close'] = df['close'].astype(float)
+    df['volume'] = df['volume'].astype(float)
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     return df
 
@@ -81,20 +82,25 @@ def plot_chart(df, symbol="BTCUSDT"):
     plt.close()
     return filename
 
-# ---------- Асинхронна відправка в Telegram ----------
+# ---------- Асинхронна відправка ----------
 async def send_telegram_image(filename, chat_id=CHAT_ID, caption="SMC Analysis"):
     with open(filename, 'rb') as f:
         await bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
 
-# ---------- Команди для Telegram ----------
+# ---------- Команди ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привіт! Я бот Smart Money. Використовуй /smc щоб отримати сигнали.")
+    await update.message.reply_text(
+        "👋 Привіт! Я бот Smart Money.\n\n"
+        "📌 Доступні команди:\n"
+        "/smc SYMBOL TF — сигнали Smart Money (наприклад: /smc BTCUSDT 15m)\n"
+        "/liqmap SYMBOL — карта ліквідацій\n"
+        "/smartmoneyflow SYMBOL — аналіз потоків Smart vs Retail\n"
+    )
 
+# --- SMC ---
 async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Генерую сигнали, зачекай...")
-
     try:
-        # 🔹 символ і таймфрейм з аргументів
         symbol = "BTCUSDT"
         interval = "1h"
         if len(context.args) >= 1:
@@ -102,53 +108,102 @@ async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(context.args) >= 2:
             interval = context.args[1]
 
-        # 🔹 отримуємо дані і будуємо аналіз
         df = analyze_smc(get_klines(symbol, interval))
         chart_file = plot_chart(df, symbol)
 
-        # 🔹 формуємо сигнал (останні 5 або менше, якщо нема)
-        latest_signals = df.dropna(subset=['Signal']).tail(5)
-        if latest_signals.empty:
+        latest_signal = df.dropna(subset=['Signal']).tail(1)
+        if latest_signal.empty:
             await update.message.reply_text(f"⚠️ Немає сигналів для {symbol} {interval}")
             return
 
-        text_signals = ""
-        for idx, row in latest_signals.iterrows():
-            time_str = row['open_time'].strftime('%Y-%m-%d %H:%M')
-            text_signals += (
-                f"{time_str} | {row['Signal']} | "
-                f"Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}\n"
-            )
+        row = latest_signal.iloc[-1]
+        time_str = row['open_time'].strftime('%Y-%m-%d %H:%M')
+        text_signal = (
+            f"{time_str} | {row['Signal']} | "
+            f"Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}"
+        )
 
-        caption = f"📊 Smart Money Signals для *{symbol} {interval}*:\n\n{text_signals}"
+        caption = f"📊 Smart Money Signal для *{symbol} {interval}*:\n\n{text_signal}"
 
         await send_telegram_image(chart_file, caption=caption)
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка: {e}")
 
-# ---------- Запуск вебхука на Render ----------
+# --- Карта ліквідацій ---
+async def liqmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        symbol = "BTCUSDT"
+        if len(context.args) >= 1:
+            symbol = context.args[0].upper()
+
+        df = get_klines(symbol, "15m", 200)
+        df['liquidation_zone'] = (df['high'] + df['low']) / 2
+
+        plt.figure(figsize=(15,7))
+        plt.plot(df['open_time'], df['close'], label='Close', color='black')
+        plt.scatter(df['open_time'], df['liquidation_zone'], color='red', label='Liquidation Zones', marker='x')
+        plt.title(f"{symbol} - Liquidation Map")
+        plt.xlabel("Time")
+        plt.ylabel("Price")
+        plt.legend()
+
+        filename = f"{symbol}_liqmap.png"
+        plt.savefig(filename)
+        plt.close()
+
+        await send_telegram_image(filename, caption=f"🗺 Карта ліквідацій для {symbol}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка: {e}")
+
+# --- Потоки Smart Money ---
+async def smartmoneyflow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        symbol = "BTCUSDT"
+        if len(context.args) >= 1:
+            symbol = context.args[0].upper()
+
+        oi_data = client.futures_open_interest(symbol=symbol)
+        funding = client.futures_funding_rate(symbol=symbol, limit=1)[0]
+
+        oi = float(oi_data['openInterest'])
+        funding_rate = float(funding['fundingRate'])
+
+        sentiment = "📈 Bullish" if funding_rate > 0 else "📉 Bearish"
+
+        msg = (
+            f"💰 Smart Money Flow для {symbol}:\n\n"
+            f"📊 Open Interest: {oi:.2f}\n"
+            f"💵 Funding Rate: {funding_rate:.5f}\n"
+            f"📌 Sentiment: {sentiment}"
+        )
+
+        await update.message.reply_text(msg)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка: {e}")
+
+# ---------- Запуск вебхука ----------
 if __name__ == "__main__":
     import os
 
     WEBHOOK_URL = "https://quantum-trading-bot-wg5k.onrender.com/"
-    PORT = int(os.environ.get("PORT", 10000))  # Render сам задає PORT
+    PORT = int(os.environ.get("PORT", 10000))
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("smc", smc_command))
+    app.add_handler(CommandHandler("liqmap", liqmap_command))
+    app.add_handler(CommandHandler("smartmoneyflow", smartmoneyflow_command))
 
-    # Встановлюємо кнопки-команди для Telegram
     async def set_commands():
         await app.bot.set_my_commands([
             BotCommand("start", "Запустити бота"),
-            BotCommand("smc", "Отримати сигнали Smart Money")
+            BotCommand("smc", "Отримати SMC сигнал"),
+            BotCommand("liqmap", "Карта ліквідацій"),
+            BotCommand("smartmoneyflow", "Потік Smart Money"),
         ])
 
-    # запускаємо асинхронно тільки один раз
-    import asyncio
     asyncio.get_event_loop().run_until_complete(set_commands())
 
-    # 🚀 головний запуск вебхука (синхронно, без asyncio.run)
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
