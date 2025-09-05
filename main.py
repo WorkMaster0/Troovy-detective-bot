@@ -13,8 +13,9 @@ API_KEY_TELEGRAM = '8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI'
 CHAT_ID = '6053907025'
 SYMBOL = 'BTCUSDT'
 TIMEFRAMES = ['15m', '1h', '4h']  # Мульті-фрейм
-N_CANDLES = 20  # Кількість свічок для аналізу
-EMA_PERIOD = 10  # Період EMA
+N_CANDLES = 30
+FAST_EMA = 10
+SLOW_EMA = 30
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
@@ -45,7 +46,7 @@ def get_historical_data(symbol, interval, limit=100):
 # -------------------------
 # Розрахунок EMA
 # -------------------------
-def calculate_ema(closes, period=10):
+def calculate_ema(closes, period):
     ema = closes[0]
     k = 2 / (period + 1)
     for price in closes[1:]:
@@ -53,7 +54,7 @@ def calculate_ema(closes, period=10):
     return ema
 
 # -------------------------
-# Аналіз фаз Вайкоффа + EMA
+# Аналіз фаз Вайкоффа + подвійна EMA
 # -------------------------
 def analyze_phase(ohlc):
     closes = [c['close'] for c in ohlc][-N_CANDLES:]
@@ -71,19 +72,26 @@ def analyze_phase(ohlc):
     trend_up = closes[-3] < closes[-2] < closes[-1]
     trend_down = closes[-3] > closes[-2] > closes[-1]
 
-    # Розрахунок EMA
-    ema = calculate_ema(closes, EMA_PERIOD)
+    # EMA
+    fast_ema = calculate_ema(closes[-FAST_EMA:], FAST_EMA)
+    slow_ema = calculate_ema(closes[-SLOW_EMA:], SLOW_EMA)
 
-    # Сигнал BUY/SELL лише якщо ціна підтверджує EMA
-    if last_close <= recent_low*1.01 and last_volume > avg_volume and trend_up and last_close > ema:
-        return 'BUY', max(highs)-min(lows), last_close > ema
-    elif last_close >= recent_high*0.99 and last_volume > avg_volume and trend_down and last_close < ema:
-        return 'SELL', max(highs)-min(lows), last_close < ema
+    ema_confirm = None
+    if fast_ema > slow_ema:
+        ema_confirm = 'BUY'
+    elif fast_ema < slow_ema:
+        ema_confirm = 'SELL'
+
+    # Сигнал Вайкоффа + EMA
+    if last_close <= recent_low*1.01 and last_volume > avg_volume and trend_up and ema_confirm == 'BUY':
+        return 'BUY', max(highs)-min(lows), True, ema_confirm, trend_up
+    elif last_close >= recent_high*0.99 and last_volume > avg_volume and trend_down and ema_confirm == 'SELL':
+        return 'SELL', max(highs)-min(lows), True, ema_confirm, trend_down
     else:
-        return 'HOLD', 0, None
+        return 'HOLD', 0, False, ema_confirm, None
 
 # -------------------------
-# Відправка сигналу у Telegram
+# Відправка сигналу
 # -------------------------
 def send_signal(signal, price, volatility):
     global last_signal
@@ -101,7 +109,7 @@ def send_signal(signal, price, volatility):
         f.write(f"{datetime.now()} | {signal} | {price} | TP: {tp} | SL: {sl}\n")
 
 # -------------------------
-# Перевірка мульті-фрейм з EMA
+# Перевірка мульті-фрейм
 # -------------------------
 def check_market():
     while True:
@@ -109,24 +117,65 @@ def check_market():
             signals = []
             volatilities = []
             last_prices = []
-            ema_confirmations = []
+            ema_confirms = []
+            trends = []
             for tf in TIMEFRAMES:
                 ohlc = get_historical_data(SYMBOL, tf)
-                signal, volatility, ema_ok = analyze_phase(ohlc)
+                signal, volatility, ema_ok, ema_signal, trend = analyze_phase(ohlc)
                 signals.append(signal)
                 volatilities.append(volatility)
                 last_prices.append(ohlc[-1]['close'])
-                ema_confirmations.append(ema_ok)
+                ema_confirms.append(ema_ok)
+                trends.append((ema_signal, trend))
 
-            # Надсилаємо сигнал лише якщо всі таймфрейми однакові, EMA підтверджує і не HOLD
-            if len(set(signals)) == 1 and signals[0] != "HOLD" and all(ema_confirmations):
+            if len(set(signals)) == 1 and signals[0] != "HOLD" and all(ema_confirms):
                 send_signal(signals[0], last_prices[-1], max(volatilities))
+
+            # Збереження останнього статусу для команди /status
+            global last_status
+            last_status = {
+                "signals": signals,
+                "ema_confirms": ema_confirms,
+                "trends": trends,
+                "timeframes": TIMEFRAMES,
+                "last_prices": last_prices
+            }
 
         except Exception as e:
             print(f"{datetime.now()} - Помилка: {e}")
             with open("errors.log", "a") as f:
                 f.write(f"{datetime.now()} - {e}\n")
         time.sleep(60)
+
+# -------------------------
+# Команда /status
+# -------------------------
+@bot.message_handler(commands=['status'])
+def send_status(message):
+    global last_status
+    if not last_status:
+        bot.send_message(message.chat.id, "Поки немає даних.")
+        return
+
+    text = "Статус сигналів:\n"
+    buy_count = 0
+    sell_count = 0
+    for i, tf in enumerate(last_status["timeframes"]):
+        sig = last_status["signals"][i]
+        ema_signal = last_status["trends"][i][0]
+        trend = last_status["trends"][i][1]
+        price = last_status['last_prices'][i]
+        text += f"{tf}: Сигнал {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend==False else '—'}, Ціна {price}\n"
+        if sig == "BUY":
+            buy_count += 1
+        elif sig == "SELL":
+            sell_count += 1
+
+    total = len(last_status["timeframes"])
+    text += f"\nПідтверджено BUY: {buy_count}/{total} ({buy_count/total*100:.0f}%)\n"
+    text += f"Підтверджено SELL: {sell_count}/{total} ({sell_count/total*100:.0f}%)"
+
+    bot.send_message(message.chat.id, text)
 
 # -------------------------
 # Вебхук для Telegram
@@ -142,5 +191,6 @@ def webhook():
 # Запуск сервера
 # -------------------------
 if __name__ == "__main__":
+    last_status = None
     threading.Thread(target=check_market, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
