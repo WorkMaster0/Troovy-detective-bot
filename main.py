@@ -55,16 +55,20 @@ def analyze_smc(df):
 
 # ---------- Побудова графіка ----------
 def plot_chart(df, symbol="BTCUSDT"):
+    # робимо копію тільки OHLCV для свічок
     df_plot = df[['open_time','open','high','low','close','volume']].copy()
     df_plot.set_index('open_time', inplace=True)
 
-    # --- свічковий графік ---
-    apds = [
-        mpf.make_addplot(df['OB'], type='scatter', markersize=80, marker='s', color='blue'),
-        mpf.make_addplot(df['FVG'], type='scatter', markersize=80, marker='^', color='red'),
-        mpf.make_addplot(df['SL'], type='scatter', markersize=50, marker='x', color='red'),
-        mpf.make_addplot(df['TP'], type='scatter', markersize=80, marker='*', color='green'),
-    ]
+    # готуємо додаткові дані (але беремо з оригінального df!)
+    apds = []
+    if 'OB' in df.columns:
+        apds.append(mpf.make_addplot(df['OB'], type='scatter', markersize=80, marker='s', color='blue'))
+    if 'FVG' in df.columns:
+        apds.append(mpf.make_addplot(df['FVG'], type='scatter', markersize=80, marker='^', color='red'))
+    if 'SL' in df.columns:
+        apds.append(mpf.make_addplot(df['SL'], type='scatter', markersize=50, marker='x', color='red'))
+    if 'TP' in df.columns:
+        apds.append(mpf.make_addplot(df['TP'], type='scatter', markersize=80, marker='*', color='green'))
 
     filename = f"{symbol}_smc.png"
     mpf.plot(
@@ -72,7 +76,7 @@ def plot_chart(df, symbol="BTCUSDT"):
         type='candle',
         style='yahoo',
         title=f"{symbol} - Smart Money Concept Analysis",
-        addplot=apds,
+        addplot=apds if apds else None,
         volume=True,
         savefig=filename
     )
