@@ -123,8 +123,6 @@ if __name__ == "__main__":
     asyncio.run(set_commands())
 
     # Запуск вебхука
-    import asyncio
-
     async def main():
         await app.bot.set_my_commands([
             BotCommand("start", "Запустити бота"),
