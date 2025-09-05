@@ -1,17 +1,21 @@
 # main.py
 import requests
 import telebot
+from flask import Flask, request
 from datetime import datetime
+import threading
+import time
 
 # -------------------------
 # Налаштування
 # -------------------------
-API_KEY_TELEGRAM = '8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI'
-CHAT_ID = '6053907025'
+API_KEY_TELEGRAM = 'твій_telegram_bot_token'
+CHAT_ID = 'твій_chat_id'
 SYMBOL = 'BTCUSDT'
 INTERVAL = '1h'  # таймфрейм свічки
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
+app = Flask(__name__)
 
 # -------------------------
 # Отримання даних з Binance
@@ -53,12 +57,33 @@ def send_signal(signal, price):
     bot.send_message(CHAT_ID, message)
 
 # -------------------------
-# Головна функція
+# Функція перевірки кожну хвилину
 # -------------------------
-def main():
-    ohlc = get_historical_data(SYMBOL, INTERVAL)
-    signal = analyze_phase(ohlc)
-    send_signal(signal, ohlc[-1]['close'])
+def check_market():
+    while True:
+        try:
+            ohlc = get_historical_data(SYMBOL, INTERVAL)
+            signal = analyze_phase(ohlc)
+            send_signal(signal, ohlc[-1]['close'])
+        except Exception as e:
+            print("Помилка:", e)
+        time.sleep(60)  # перевірка кожну хвилину
 
+# -------------------------
+# Вебхук для Telegram
+# -------------------------
+@app.route(f'/{API_KEY_TELEGRAM}', methods=['POST'])
+def webhook():
+    json_str = request.get_data().decode('utf-8')
+    update = telebot.types.Update.de_json(json_str)
+    bot.process_new_updates([update])
+    return "!", 200
+
+# -------------------------
+# Запуск сервера і перевірки ринку
+# -------------------------
 if __name__ == "__main__":
-    main()
+    # Старт циклічної перевірки в окремому потоці
+    threading.Thread(target=check_market, daemon=True).start()
+    # Старт Flask сервера
+    app.run(host="0.0.0.0", port=5000)
