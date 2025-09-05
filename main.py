@@ -79,7 +79,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     "Команди:\n"
                                     "/smc SYMBOL TIMEFRAME – сигнал Smart Money\n"
                                     "/liqmap SYMBOL TIMEFRAME – карта ліквідності\n"
-                                    "/orderflow SYMBOL TIMEFRAME – ордер флоу\n"
+                                    "/orderflow SYMBOL TIMEFRAME – ордер флоу\n")
 
 # ---- SMC ----
 async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
