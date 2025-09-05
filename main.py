@@ -114,26 +114,18 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("smc", smc_command))
 
-    # Встановлюємо команди нижньої панелі Telegram
-    async def set_commands():
-        await app.bot.set_my_commands([
-            BotCommand("start", "Запустити бота"),
-            BotCommand("smc", "Отримати сигнали Smart Money")
-        ])
-    asyncio.run(set_commands())
-
-    # Запуск вебхука
     async def main():
+        # встановлюємо кнопки-команди
         await app.bot.set_my_commands([
             BotCommand("start", "Запустити бота"),
             BotCommand("smc", "Отримати сигнали Smart Money")
         ])
 
-    await app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=WEBHOOK_URL
-    )
+        # запускаємо вебхук
+        await app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=WEBHOOK_URL
+        )
 
-if __name__ == "__main__":
     asyncio.run(main())
