@@ -18,7 +18,7 @@ client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 bot = Bot(token=TELEGRAM_TOKEN)
 
 # ---------- Отримання свічок ----------
-def get_klines(symbol="BTCUSDT", interval="1h", limit=100):
+def get_klines(symbol="BTCUSDT", interval="1h", limit=300):
     klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(klines, columns=['open_time','open','high','low','close','volume','close_time',
                                        'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
