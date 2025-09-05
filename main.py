@@ -107,25 +107,29 @@ async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Запуск вебхука на Render ----------
 if __name__ == "__main__":
+    import os
+
     WEBHOOK_URL = "https://quantum-trading-bot-wg5k.onrender.com/"
-    PORT = 10000  # Render зазвичай дозволяє цей порт, можна замінити os.environ['PORT']
+    PORT = int(os.environ.get("PORT", 10000))  # Render сам задає PORT
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("smc", smc_command))
 
-    async def main():
-        # встановлюємо кнопки-команди
+    # Встановлюємо кнопки-команди для Telegram
+    async def set_commands():
         await app.bot.set_my_commands([
             BotCommand("start", "Запустити бота"),
             BotCommand("smc", "Отримати сигнали Smart Money")
         ])
 
-        # запускаємо вебхук
-        await app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=WEBHOOK_URL
-        )
+    # запускаємо асинхронно тільки один раз
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(set_commands())
 
-    asyncio.run(main())
+    # 🚀 головний запуск вебхука (синхронно, без asyncio.run)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL
+    )
