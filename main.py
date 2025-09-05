@@ -12,62 +12,107 @@ import time
 API_KEY_TELEGRAM = '8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI'
 CHAT_ID = '6053907025'
 SYMBOL = 'BTCUSDT'
-INTERVAL = '1h'  # таймфрейм свічки
-
+TIMEFRAMES = ['15m', '1h', '4h']  # Мульті-фрейм
+N_CANDLES = 20  # кількість свічок для аналізу
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
+
+last_signal = None  # Для фільтра повторів
 
 # -------------------------
 # Отримання даних з Binance
 # -------------------------
 def get_historical_data(symbol, interval, limit=100):
     url = f'https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
-    data = requests.get(url).json()
+    response = requests.get(url, timeout=10)
+    if response.status_code != 200:
+        raise Exception(f"Помилка API Binance: {response.status_code}")
+    data = response.json()
     ohlc = []
     for d in data:
         timestamp = datetime.fromtimestamp(d[0]/1000)
-        open_price = float(d[1])
-        high = float(d[2])
-        low = float(d[3])
-        close = float(d[4])
-        volume = float(d[5])
-        ohlc.append({'time': timestamp, 'open': open_price, 'high': high, 'low': low, 'close': close, 'volume': volume})
+        ohlc.append({
+            'time': timestamp,
+            'open': float(d[1]),
+            'high': float(d[2]),
+            'low': float(d[3]),
+            'close': float(d[4]),
+            'volume': float(d[5])
+        })
     return ohlc
 
 # -------------------------
-# Базовий аналіз фаз Вайкоффа
+# Аналіз фаз Вайкоффа з трендом
 # -------------------------
 def analyze_phase(ohlc):
-    closes = [c['close'] for c in ohlc]
-    avg_close = sum(closes[-20:])/20
-    last_close = closes[-1]
+    closes = [c['close'] for c in ohlc][-N_CANDLES:]
+    volumes = [c['volume'] for c in ohlc][-N_CANDLES:]
+    highs = [c['high'] for c in ohlc][-N_CANDLES:]
+    lows = [c['low'] for c in ohlc][-N_CANDLES:]
 
-    if last_close > avg_close:
-        return 'BUY'
-    elif last_close < avg_close:
-        return 'SELL'
+    last_close = closes[-1]
+    last_volume = volumes[-1]
+    avg_volume = sum(volumes)/len(volumes)
+    recent_high = max(closes)
+    recent_low = min(closes)
+
+    # Перевірка тренду останніх 3 свічок
+    trend_up = closes[-3] < closes[-2] < closes[-1]
+    trend_down = closes[-3] > closes[-2] > closes[-1]
+
+    # Визначення фази
+    if last_close <= recent_low*1.01 and last_volume > avg_volume and trend_up:
+        return 'BUY', max(highs)-min(lows)
+    elif last_close >= recent_high*0.99 and last_volume > avg_volume and trend_down:
+        return 'SELL', max(highs)-min(lows)
     else:
-        return 'HOLD'
+        return 'HOLD', 0
 
 # -------------------------
 # Відправка сигналу у Telegram
 # -------------------------
-def send_signal(signal, price):
-    message = f"Сигнал: {signal}\nЦіна: {price}"
+def send_signal(signal, price, volatility):
+    global last_signal
+    if signal == last_signal or signal == "HOLD":
+        return
+    last_signal = signal
+
+    # Динамічний TP/SL на основі волатильності останніх свічок
+    tp = round(price + volatility*0.5 if signal=="BUY" else price - volatility*0.5, 2)
+    sl = round(price - volatility*0.3 if signal=="BUY" else price + volatility*0.3, 2)
+
+    message = f"Сигнал: {signal}\nЦіна: {price}\nTake-profit: {tp}\nStop-loss: {sl}"
     bot.send_message(CHAT_ID, message)
 
+    # Логування сигналів
+    with open("signals.log", "a") as f:
+        f.write(f"{datetime.now()} | {signal} | {price} | TP: {tp} | SL: {sl}\n")
+
 # -------------------------
-# Функція перевірки кожну хвилину
+# Перевірка мульті-фрейм
 # -------------------------
 def check_market():
     while True:
         try:
-            ohlc = get_historical_data(SYMBOL, INTERVAL)
-            signal = analyze_phase(ohlc)
-            send_signal(signal, ohlc[-1]['close'])
+            signals = []
+            volatilities = []
+            last_prices = []
+            for tf in TIMEFRAMES:
+                ohlc = get_historical_data(SYMBOL, tf)
+                signal, volatility = analyze_phase(ohlc)
+                signals.append(signal)
+                volatilities.append(volatility)
+                last_prices.append(ohlc[-1]['close'])
+
+            # Надсилаємо сигнал лише якщо всі таймфрейми однакові і не HOLD
+            if len(set(signals)) == 1 and signals[0] != "HOLD":
+                send_signal(signals[0], last_prices[-1], max(volatilities))
+
         except Exception as e:
-            print("Помилка:", e)
-        time.sleep(60)  # перевірка кожну хвилину
+            print(f"{datetime.now()} - Помилка: {e}")
+            with open("errors.log", "a") as f:
+                f.write(f"{datetime.now()} - {e}\n")
+        time.sleep(60)  # кожну хвилину
 
 # -------------------------
 # Вебхук для Telegram
@@ -80,10 +125,8 @@ def webhook():
     return "!", 200
 
 # -------------------------
-# Запуск сервера і перевірки ринку
+# Запуск сервера
 # -------------------------
 if __name__ == "__main__":
-    # Старт циклічної перевірки в окремому потоці
     threading.Thread(target=check_market, daemon=True).start()
-    # Старт Flask сервера
     app.run(host="0.0.0.0", port=5000)
