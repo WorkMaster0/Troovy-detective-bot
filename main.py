@@ -1,17 +1,17 @@
 # main.py
 import requests
+import telebot
 from datetime import datetime
-import telegram
 
 # -------------------------
 # Налаштування
 # -------------------------
-API_KEY_TELEGRAM = '8063113740:AAGC-9PHzZD65jPad2lxP5mTmlWuQwvKwrU'
-CHAT_ID = '6053907025'
+API_KEY_TELEGRAM = 'твій_telegram_bot_token'
+CHAT_ID = 'твій_chat_id'
 SYMBOL = 'BTCUSDT'
 INTERVAL = '1h'  # таймфрейм свічки
 
-bot = telegram.Bot(token=API_KEY_TELEGRAM)
+bot = telebot.TeleBot(API_KEY_TELEGRAM)
 
 # -------------------------
 # Отримання даних з Binance
@@ -34,7 +34,6 @@ def get_historical_data(symbol, interval, limit=100):
 # Базовий аналіз фаз Вайкоффа
 # -------------------------
 def analyze_phase(ohlc):
-    # Проста логіка: якщо ціна останньої свічки > середнє останніх 20 свічок → Buy сигнал
     closes = [c['close'] for c in ohlc]
     avg_close = sum(closes[-20:])/20
     last_close = closes[-1]
@@ -51,7 +50,7 @@ def analyze_phase(ohlc):
 # -------------------------
 def send_signal(signal, price):
     message = f"Сигнал: {signal}\nЦіна: {price}"
-    bot.send_message(chat_id=CHAT_ID, text=message)
+    bot.send_message(CHAT_ID, message)
 
 # -------------------------
 # Головна функція
