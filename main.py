@@ -30,7 +30,7 @@ def get_klines(symbol="BTCUSDT", interval="1h", limit=200):
     df['open_time'] = pd.to_datetime(df['open_time'], unit='ms')
     return df
 
-# ---------- Базовий SMC аналіз ----------
+# ---------- SMC аналіз ----------
 def analyze_smc(df):
     df = df.copy()
     df['prev_high'] = df['high'].shift(1)
@@ -39,20 +39,16 @@ def analyze_smc(df):
     df['BOS_up'] = df['high'] > df['prev_high']
     df['BOS_down'] = df['low'] < df['prev_low']
     
-    df['ChoCH_up'] = df['BOS_down'] & df['BOS_up'].shift(1)
-    df['ChoCH_down'] = df['BOS_up'] & df['BOS_down'].shift(1)
-    
     df['OB'] = np.where(df['BOS_up'], df['low'].shift(1),
                         np.where(df['BOS_down'], df['high'].shift(1), np.nan))
-    
-    df['FVG'] = np.where(df['BOS_up'], df['low'] + (df['high'] - df['close'])/2,
-                         np.where(df['BOS_down'], df['high'] - (df['close'] - df['low'])/2, np.nan))
     
     df['Signal'] = np.where(df['BOS_up'] & (~df['OB'].isna()), 'BUY',
                          np.where(df['BOS_down'] & (~df['OB'].isna()), 'SELL', None)).astype(object)
     
-    df['SL'] = np.where(df['Signal']=='BUY', df['OB']*0.995, np.where(df['Signal']=='SELL', df['OB']*1.005, np.nan))
-    df['TP'] = np.where(df['Signal']=='BUY', df['close']*1.01, np.where(df['Signal']=='SELL', df['close']*0.99, np.nan))
+    df['SL'] = np.where(df['Signal']=='BUY', df['OB']*0.995, 
+                        np.where(df['Signal']=='SELL', df['OB']*1.005, np.nan))
+    df['TP'] = np.where(df['Signal']=='BUY', df['close']*1.01, 
+                        np.where(df['Signal']=='SELL', df['close']*0.99, np.nan))
     
     return df
 
@@ -60,131 +56,116 @@ def analyze_smc(df):
 def plot_chart(df, symbol="BTCUSDT"):
     plt.figure(figsize=(15,7))
     plt.plot(df['open_time'], df['close'], label='Close', color='black')
-    
     plt.scatter(df['open_time'], df['OB'], color='blue', label='Order Block', marker='s')
-    plt.scatter(df['open_time'], df['FVG'], color='red', label='FVG', marker='^')
-    
-    plt.scatter(df['open_time'][df['BOS_up']], df['close'][df['BOS_up']], color='green', label='BOS Up', marker='^')
-    plt.scatter(df['open_time'][df['BOS_down']], df['close'][df['BOS_down']], color='orange', label='BOS Down', marker='v')
-    plt.scatter(df['open_time'][df['ChoCH_up']], df['close'][df['ChoCH_up']], color='lime', label='ChoCH Up', marker='o')
-    plt.scatter(df['open_time'][df['ChoCH_down']], df['close'][df['ChoCH_down']], color='magenta', label='ChoCH Down', marker='o')
-    
     plt.scatter(df['open_time'], df['SL'], color='red', label='Stop Loss', marker='x')
     plt.scatter(df['open_time'], df['TP'], color='green', label='Take Profit', marker='*')
-    
     plt.title(f"{symbol} - Smart Money Concept Analysis")
     plt.xlabel("Time")
     plt.ylabel("Price")
     plt.legend()
-    
     filename = f"{symbol}_smc.png"
     plt.savefig(filename)
     plt.close()
     return filename
 
-# ---------- Асинхронна відправка ----------
+# ---------- Асинхронна відправка в Telegram ----------
 async def send_telegram_image(filename, chat_id=CHAT_ID, caption="SMC Analysis"):
     with open(filename, 'rb') as f:
         await bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
 
 # ---------- Команди ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Привіт! Я бот Smart Money.\n\n"
-        "📌 Доступні команди:\n"
-        "/smc SYMBOL TF — сигнали Smart Money (наприклад: /smc BTCUSDT 15m)\n"
-        "/liqmap SYMBOL — карта ліквідацій\n"
-        "/smartmoneyflow SYMBOL — аналіз потоків Smart vs Retail\n"
-    )
+    await update.message.reply_text("👋 Привіт! Я бот Smart Money.\n\n"
+                                    "Команди:\n"
+                                    "/smc SYMBOL TIMEFRAME – сигнал Smart Money\n"
+                                    "/liqmap SYMBOL TIMEFRAME – карта ліквідності\n"
+                                    "/orderflow SYMBOL TIMEFRAME – ордер флоу\n"
+                                    "/mystery – секретна команда 😉")
 
-# --- SMC ---
+# ---- SMC ----
 async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Генерую сигнали, зачекай...")
+    await update.message.reply_text("🔎 Генерую сигнал...")
     try:
-        symbol = "BTCUSDT"
-        interval = "1h"
-        if len(context.args) >= 1:
-            symbol = context.args[0].upper()
-        if len(context.args) >= 2:
-            interval = context.args[1]
-
+        symbol = context.args[0].upper() if len(context.args) >= 1 else "BTCUSDT"
+        interval = context.args[1] if len(context.args) >= 2 else "1h"
         df = analyze_smc(get_klines(symbol, interval))
         chart_file = plot_chart(df, symbol)
-
         latest_signal = df.dropna(subset=['Signal']).tail(1)
         if latest_signal.empty:
-            await update.message.reply_text(f"⚠️ Немає сигналів для {symbol} {interval}")
+            await update.message.reply_text(f"⚠️ Немає сигналу для {symbol} {interval}")
             return
-
-        row = latest_signal.iloc[-1]
+        row = latest_signal.iloc[0]
         time_str = row['open_time'].strftime('%Y-%m-%d %H:%M')
-        text_signal = (
-            f"{time_str} | {row['Signal']} | "
-            f"Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}"
-        )
-
-        caption = f"📊 Smart Money Signal для *{symbol} {interval}*:\n\n{text_signal}"
-
+        caption = (f"📊 Smart Money Signal для *{symbol} {interval}*:\n\n"
+                   f"{time_str} | {row['Signal']} | "
+                   f"Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}")
         await send_telegram_image(chart_file, caption=caption)
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка: {e}")
 
-# --- Карта ліквідацій ---
+# ---- LIQUIDITY MAP ----
 async def liqmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📡 Аналізую ліквідність...")
     try:
-        symbol = "BTCUSDT"
-        if len(context.args) >= 1:
-            symbol = context.args[0].upper()
+        symbol = context.args[0].upper() if len(context.args) >= 1 else "BTCUSDT"
+        interval = context.args[1] if len(context.args) >= 2 else "1h"
+        df = get_klines(symbol, interval)
 
-        df = get_klines(symbol, "15m", 200)
-        df['liquidation_zone'] = (df['high'] + df['low']) / 2
+        highs = df['high'].rolling(window=5).max()
+        lows = df['low'].rolling(window=5).min()
 
         plt.figure(figsize=(15,7))
-        plt.plot(df['open_time'], df['close'], label='Close', color='black')
-        plt.scatter(df['open_time'], df['liquidation_zone'], color='red', label='Liquidation Zones', marker='x')
-        plt.title(f"{symbol} - Liquidation Map")
+        plt.plot(df['open_time'], df['close'], color='black', label="Close")
+        plt.scatter(df['open_time'], highs, color='red', label="Liquidity Above (Stop Hunt ↑)")
+        plt.scatter(df['open_time'], lows, color='blue', label="Liquidity Below (Stop Hunt ↓)")
+        plt.title(f"{symbol} - Liquidity Pools")
         plt.xlabel("Time")
         plt.ylabel("Price")
         plt.legend()
-
         filename = f"{symbol}_liqmap.png"
         plt.savefig(filename)
         plt.close()
 
-        await send_telegram_image(filename, caption=f"🗺 Карта ліквідацій для {symbol}")
+        await send_telegram_image(filename, caption=f"🌊 Liquidity Map для *{symbol} {interval}*")
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка: {e}")
 
-# --- Потоки Smart Money ---
-async def smartmoneyflow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---- ORDERFLOW ----
+async def orderflow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 Аналізую Order Flow...")
     try:
-        symbol = "BTCUSDT"
-        if len(context.args) >= 1:
-            symbol = context.args[0].upper()
+        symbol = context.args[0].upper() if len(context.args) >= 1 else "BTCUSDT"
+        interval = context.args[1] if len(context.args) >= 2 else "1h"
+        df = get_klines(symbol, interval)
 
-        oi_data = client.futures_open_interest(symbol=symbol)
-        funding = client.futures_funding_rate(symbol=symbol, limit=1)[0]
+        df['buy_vol'] = np.where(df['close'] > df['open'], df['volume'], df['volume']*0.3)
+        df['sell_vol'] = np.where(df['close'] < df['open'], df['volume'], df['volume']*0.3)
+        df['delta'] = df['buy_vol'] - df['sell_vol']
 
-        oi = float(oi_data['openInterest'])
-        funding_rate = float(funding['fundingRate'])
+        plt.figure(figsize=(15,7))
+        plt.bar(df['open_time'], df['delta'], color=np.where(df['delta']>0,'green','red'))
+        plt.title(f"{symbol} - Order Flow Delta")
+        plt.xlabel("Time")
+        plt.ylabel("Delta Volume")
+        filename = f"{symbol}_orderflow.png"
+        plt.savefig(filename)
+        plt.close()
 
-        sentiment = "📈 Bullish" if funding_rate > 0 else "📉 Bearish"
+        last_delta = df['delta'].iloc[-1]
+        trend = "🟢 Покупці домінують" if last_delta > 0 else "🔴 Продавці домінують"
 
-        msg = (
-            f"💰 Smart Money Flow для {symbol}:\n\n"
-            f"📊 Open Interest: {oi:.2f}\n"
-            f"💵 Funding Rate: {funding_rate:.5f}\n"
-            f"📌 Sentiment: {sentiment}"
-        )
-
-        await update.message.reply_text(msg)
+        await send_telegram_image(filename, caption=f"📊 Order Flow для *{symbol} {interval}*\n\n{trend}")
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка: {e}")
+
+# ---- MYSTERY ----
+async def mystery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🤫 Виконую секретну команду...\n")
+    # тут сюрприз – ти дізнаєшся тільки коли виконаєш ;)
 
 # ---------- Запуск вебхука ----------
 if __name__ == "__main__":
     import os
-
     WEBHOOK_URL = "https://quantum-trading-bot-wg5k.onrender.com/"
     PORT = int(os.environ.get("PORT", 10000))
 
@@ -192,20 +173,17 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("smc", smc_command))
     app.add_handler(CommandHandler("liqmap", liqmap_command))
-    app.add_handler(CommandHandler("smartmoneyflow", smartmoneyflow_command))
+    app.add_handler(CommandHandler("orderflow", orderflow_command))
+    app.add_handler(CommandHandler("mystery", mystery_command))
 
     async def set_commands():
         await app.bot.set_my_commands([
             BotCommand("start", "Запустити бота"),
-            BotCommand("smc", "Отримати SMC сигнал"),
-            BotCommand("liqmap", "Карта ліквідацій"),
-            BotCommand("smartmoneyflow", "Потік Smart Money"),
+            BotCommand("smc", "Smart Money сигнал"),
+            BotCommand("liqmap", "Карта ліквідності"),
+            BotCommand("orderflow", "Ордер флоу"),
+            BotCommand("mystery", "??")
         ])
 
     asyncio.get_event_loop().run_until_complete(set_commands())
-
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=WEBHOOK_URL
-    )
+    app.run_webhook(listen="0.0.0.0", port=PORT, webhook_url=WEBHOOK_URL)
