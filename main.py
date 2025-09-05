@@ -123,8 +123,19 @@ if __name__ == "__main__":
     asyncio.run(set_commands())
 
     # Запуск вебхука
-    app.run_webhook(
+    import asyncio
+
+    async def main():
+        await app.bot.set_my_commands([
+            BotCommand("start", "Запустити бота"),
+            BotCommand("smc", "Отримати сигнали Smart Money")
+        ])
+
+    await app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         webhook_url=WEBHOOK_URL
     )
+
+if __name__ == "__main__":
+    asyncio.run(main())
