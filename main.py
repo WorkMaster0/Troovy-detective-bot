@@ -156,15 +156,15 @@ def check_market():
 # -------------------------
 @app.route(f'/{API_KEY_TELEGRAM}', methods=['POST'])
 def webhook():
+    global last_status
     json_str = request.get_data().decode('utf-8')
     update = telebot.types.Update.de_json(json_str)
     bot.process_new_updates([update])
 
-    # Обробка команди /status
-    if update.message and update.message.text == "/status":
-        global last_status
+    message_obj = update.message or update.edited_message
+    if message_obj and message_obj.text == "/status":
         if not last_status:
-            bot.send_message(update.message.chat.id, "Поки немає даних.")
+            bot.send_message(message_obj.chat.id, "Поки немає даних.")
         else:
             text = "Статус сигналів:\n"
             buy_count = 0
@@ -185,7 +185,7 @@ def webhook():
             text += f"\nПідтверджено BUY: {buy_count}/{total} ({buy_count/total*100:.0f}%)\n"
             text += f"Підтверджено SELL: {sell_count}/{total} ({sell_count/total*100:.0f}%)"
 
-            bot.send_message(update.message.chat.id, text)
+            bot.send_message(message_obj.chat.id, text)
 
     return "!", 200
 
