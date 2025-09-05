@@ -80,7 +80,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     "/smc SYMBOL TIMEFRAME – сигнал Smart Money\n"
                                     "/liqmap SYMBOL TIMEFRAME – карта ліквідності\n"
                                     "/orderflow SYMBOL TIMEFRAME – ордер флоу\n"
-                                    "/mystery – секретна команда 😉")
 
 # ---- SMC ----
 async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -158,10 +157,44 @@ async def orderflow_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"❌ Помилка: {e}")
 
-# ---- MYSTERY ----
-async def mystery_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤫 Виконую секретну команду...\n")
-    # тут сюрприз – ти дізнаєшся тільки коли виконаєш ;)
+# ---------- Ультра секретна команда ----------
+async def ultrasecret(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🕵️ Виконую надсекретну операцію... зачекай...")
+
+    try:
+        # 🌀 Секретна логіка (навіть в коді виглядає замасковано)
+        import base64, random, hashlib
+
+        # Робимо "ключ" із символа та часу
+        symbol = "BTCUSDT"
+        interval = "1h"
+        if len(context.args) >= 1:
+            symbol = context.args[0].upper()
+        if len(context.args) >= 2:
+            interval = context.args[1]
+
+        df = get_klines(symbol, interval, limit=150)
+
+        # Секретна метрика 🤫
+        secret_metric = (
+            df["close"].pct_change().rolling(10).std().iloc[-1]
+            * random.uniform(0.8, 1.2)
+        )
+
+        # Робимо «хеш-печатку» щоб виглядало ще більш секретно
+        stamp = hashlib.md5(str(secret_metric).encode()).hexdigest()[:8]
+
+        # Відповідь (користь побачиш сам 😉)
+        msg = (
+            f"🔒 Ультра-секретний аналіз для {symbol} {interval}\n\n"
+            f"Секретна метрика: {secret_metric:.5f}\n"
+            f"Ідентифікатор: {stamp}\n\n"
+            f"(🧩 Розгадати значення можеш лише сам...)"
+        )
+        await update.message.reply_text(msg)
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Помилка секретної операції: {e}")
 
 # ---------- Запуск вебхука ----------
 if __name__ == "__main__":
@@ -174,7 +207,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("smc", smc_command))
     app.add_handler(CommandHandler("liqmap", liqmap_command))
     app.add_handler(CommandHandler("orderflow", orderflow_command))
-    app.add_handler(CommandHandler("mystery", mystery_command))
+    app.add_handler(CommandHandler("ultrasecret", ultrasecret))
+
 
     async def set_commands():
         await app.bot.set_my_commands([
