@@ -1,3 +1,4 @@
+import mplfinance as mpf
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -54,18 +55,27 @@ def analyze_smc(df):
 
 # ---------- Побудова графіка ----------
 def plot_chart(df, symbol="BTCUSDT"):
-    plt.figure(figsize=(15,7))
-    plt.plot(df['open_time'], df['close'], label='Close', color='black')
-    plt.scatter(df['open_time'], df['OB'], color='blue', label='Order Block', marker='s')
-    plt.scatter(df['open_time'], df['SL'], color='red', label='Stop Loss', marker='x')
-    plt.scatter(df['open_time'], df['TP'], color='green', label='Take Profit', marker='*')
-    plt.title(f"{symbol} - Smart Money Concept Analysis")
-    plt.xlabel("Time")
-    plt.ylabel("Price")
-    plt.legend()
+    df_plot = df[['open_time','open','high','low','close','volume']].copy()
+    df_plot.set_index('open_time', inplace=True)
+
+    # --- свічковий графік ---
+    apds = [
+        mpf.make_addplot(df['OB'], type='scatter', markersize=80, marker='s', color='blue'),
+        mpf.make_addplot(df['FVG'], type='scatter', markersize=80, marker='^', color='red'),
+        mpf.make_addplot(df['SL'], type='scatter', markersize=50, marker='x', color='red'),
+        mpf.make_addplot(df['TP'], type='scatter', markersize=80, marker='*', color='green'),
+    ]
+
     filename = f"{symbol}_smc.png"
-    plt.savefig(filename)
-    plt.close()
+    mpf.plot(
+        df_plot,
+        type='candle',
+        style='yahoo',
+        title=f"{symbol} - Smart Money Concept Analysis",
+        addplot=apds,
+        volume=True,
+        savefig=filename
+    )
     return filename
 
 # ---------- Асинхронна відправка в Telegram ----------
