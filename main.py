@@ -92,28 +92,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def smc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Генерую сигнали, зачекай...")
+
     try:
-        df = analyze_smc(get_klines("BTCUSDT"))
-        chart_file = plot_chart(df, "BTCUSDT")
+        # 🔹 символ і таймфрейм з аргументів
+        symbol = "BTCUSDT"
+        interval = "1h"
+        if len(context.args) >= 1:
+            symbol = context.args[0].upper()
+        if len(context.args) >= 2:
+            interval = context.args[1]
 
-        # беремо останній рядок (навіть незакритий)
-        last_row = df.iloc[-1]
+        # 🔹 отримуємо дані і будуємо аналіз
+        df = analyze_smc(get_klines(symbol, interval))
+        chart_file = plot_chart(df, symbol)
 
-        if pd.notna(last_row["Signal"]):
-            time_str = last_row['open_time'].strftime('%Y-%m-%d %H:%M')
-            caption = (
-                f"Smart Money Signal (онлайн):\n\n"
-                f"{time_str} | {last_row['Signal']} | "
-                f"Entry: {last_row['close']:.2f} | "
-                f"SL: {last_row['SL']:.2f} | TP: {last_row['TP']:.2f}"
+        # 🔹 формуємо сигнал (останні 5 або менше, якщо нема)
+        latest_signals = df.dropna(subset=['Signal']).tail(5)
+        if latest_signals.empty:
+            await update.message.reply_text(f"⚠️ Немає сигналів для {symbol} {interval}")
+            return
+
+        text_signals = ""
+        for idx, row in latest_signals.iterrows():
+            time_str = row['open_time'].strftime('%Y-%m-%d %H:%M')
+            text_signals += (
+                f"{time_str} | {row['Signal']} | "
+                f"Entry: {row['close']:.2f} | SL: {row['SL']:.2f} | TP: {row['TP']:.2f}\n"
             )
-        else:
-            caption = "Зараз немає активного сигналу."
+
+        caption = f"📊 Smart Money Signals для *{symbol} {interval}*:\n\n{text_signals}"
 
         await send_telegram_image(chart_file, caption=caption)
-
     except Exception as e:
-        await update.message.reply_text(f"Помилка: {e}")
+        await update.message.reply_text(f"❌ Помилка: {e}")
 
 # ---------- Запуск вебхука на Render ----------
 if __name__ == "__main__":
