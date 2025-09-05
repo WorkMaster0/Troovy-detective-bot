@@ -9,8 +9,8 @@ import time
 # -------------------------
 # Налаштування
 # -------------------------
-API_KEY_TELEGRAM = 'твій_telegram_bot_token'
-CHAT_ID = 'твій_chat_id'
+API_KEY_TELEGRAM = '8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI'
+CHAT_ID = '6053907025'
 SYMBOL = 'BTCUSDT'
 INTERVAL = '1h'  # таймфрейм свічки
 
