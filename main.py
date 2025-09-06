@@ -26,13 +26,16 @@ last_signals = {}   # останні сигнали по монетах
 last_status = {}    # останній стан по монетах
 
 # -------------------------
-# Топ-30 монет по волатильності (% за 24h)
+# Топ-30 монет по волатильності (% за 24h), мінімальний обсяг 1 млн USDT
 # -------------------------
-def get_top_symbols(limit=30):
+def get_top_symbols(limit=30, min_volume=1_000_000):
     url = "https://api.binance.com/api/v3/ticker/24hr"
     data = requests.get(url, timeout=10).json()
     usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
-    sorted_pairs = sorted(usdt_pairs, key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
+    # Фільтруємо за обсягом
+    filtered_pairs = [x for x in usdt_pairs if float(x["quoteVolume"]) >= min_volume]
+    # Сортуємо за абсолютним відсотком зміни ціни
+    sorted_pairs = sorted(filtered_pairs, key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
     return [x["symbol"] for x in sorted_pairs[:limit]]
 
 # -------------------------
