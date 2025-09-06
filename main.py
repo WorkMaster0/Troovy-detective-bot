@@ -50,8 +50,19 @@ def is_pair_available(symbol):
 # -------------------------
 def get_top_tokens(limit=10):
     try:
-        resp = requests.get("https://api.dexscreener.com/latest/dex/pairs/ethereum")
-        data = resp.json()
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get("https://api.dexscreener.com/latest/dex/pairs/ethereum", headers=headers, timeout=10)
+
+        if resp.status_code != 200:
+            print(f"{datetime.now()} | ❌ Dexscreener HTTP {resp.status_code}")
+            return []
+
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"{datetime.now()} | ❌ Некоректна відповідь від Dexscreener:\n{resp.text[:200]}")
+            return []
+
         tokens = []
         for pair in data.get("pairs", [])[:limit]:
             base = pair.get("baseToken", {})
