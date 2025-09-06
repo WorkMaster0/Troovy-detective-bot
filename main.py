@@ -4,6 +4,7 @@ from flask import Flask, request
 from datetime import datetime
 import threading
 import time
+import ccxt   # <-- для торгівлі на Kraken
 
 # -------------------------
 # Налаштування
@@ -19,6 +20,17 @@ WEBHOOK_HOST = "https://your-app-name.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
+# Kraken API
+KRAKEN_API_KEY = "EJFD4SE1w1j27j5XR9g2cubrreHE9W3zHDmZ9/g5j4rxpAHtfFF/UIoF"
+KRAKEN_API_SECRET = "T6vGYJ7TWL3fICHeMJVUXMgfJ5SYjYrpburigi/bI3nwJvdzpJE0L4lFi6hf/uLdQDKAm8LgM8vgQBKUbAhGig=="
+
+kraken = ccxt.kraken({
+    "apiKey": KRAKEN_API_KEY,
+    "secret": KRAKEN_API_SECRET
+})
+
+TRADE_AMOUNT_USD = 10   # розмір тестової позиції
+
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
@@ -26,7 +38,7 @@ last_signals = {}   # останні сигнали по монетах
 last_status = {}    # останній стан по монетах
 
 # -------------------------
-# Топ монет по волатильності (% за 24h), мінімальний обсяг 1 млн USDT
+# Топ монет по волатильності
 # -------------------------
 def get_top_symbols(min_volume=1_000_000):
     url = "https://api.binance.com/api/v3/ticker/24hr"
@@ -68,13 +80,12 @@ def calculate_ema(closes, period):
     return ema
 
 # -------------------------
-# Аналіз сигналів (EMA + тренд + волатильність)
+# Аналіз сигналів
 # -------------------------
 def analyze_phase(ohlc):
     closes = [c["close"] for c in ohlc][-N_CANDLES:]
     highs = [c["high"] for c in ohlc][-N_CANDLES:]
     lows = [c["low"] for c in ohlc][-N_CANDLES:]
-    volumes = [c["volume"] for c in ohlc][-N_CANDLES:]
 
     last_close = closes[-1]
     volatility = max(highs) - min(lows)
@@ -97,6 +108,43 @@ def analyze_phase(ohlc):
         return "SELL", volatility, True, ema_confirm, trend_down
     else:
         return "HOLD", volatility, False, ema_confirm, None
+
+# -------------------------
+# Торгівля на Kraken
+# -------------------------
+def place_order(symbol, side, amount_usd, tp, sl):
+    try:
+        # Binance дає формат BTCUSDT → Kraken очікує BTC/USDT
+        pair = symbol.replace("USDT", "/USDT")
+
+        ticker = kraken.fetch_ticker(pair)
+        coin_price = ticker["last"]
+        amount = amount_usd / coin_price
+
+        # Ринковий ордер
+        order = kraken.create_order(
+            symbol=pair,
+            type="market",
+            side=side.lower(),
+            amount=amount
+        )
+
+        # TP/SL (OCO може залежати від біржі, Kraken підтримує через params)
+        params = {"takeProfitPrice": tp, "stopLossPrice": sl}
+        oco_order = kraken.create_order(
+            symbol=pair,
+            type="limit",
+            side="sell" if side == "BUY" else "buy",
+            amount=amount,
+            price=tp,
+            params=params
+        )
+
+        print("✅ Ордер виконано:", order)
+        print("🎯 TP/SL виставлено:", oco_order)
+
+    except Exception as e:
+        print("❌ Помилка ордера:", e)
 
 # -------------------------
 # Відправка сигналу
@@ -123,11 +171,9 @@ def send_signal(symbol, signal, price, max_volatility, confidence):
     )
     bot.send_message(CHAT_ID, msg)
 
-    with open("signals.log", "a") as f:
-        f.write(
-            f"{datetime.now()} | {symbol} | {signal} | {price} "
-            f"| TP: {last_signals[symbol]['tp']} | SL: {last_signals[symbol]['sl']} | {note}\n"
-        )
+    # 🚀 Автоматична торгівля (тільки якщо всі 4/4)
+    if confidence == total_tfs:
+        place_order(symbol, signal, TRADE_AMOUNT_USD, last_signals[symbol]["tp"], last_signals[symbol]["sl"])
 
 # -------------------------
 # Перевірка ринку
@@ -138,15 +184,13 @@ def check_market():
         try:
             symbols = get_top_symbols()
             for symbol in symbols:
-                signals, volatilities, last_prices, ema_confirms, trends = [], [], [], [], []
+                signals, volatilities, last_prices = [], [], []
                 for tf in TIMEFRAMES:
                     ohlc = get_historical_data(symbol, tf)
-                    signal, volatility, ema_ok, ema_signal, trend = analyze_phase(ohlc)
+                    signal, volatility, _, ema_signal, trend = analyze_phase(ohlc)
                     signals.append(signal)
                     volatilities.append(volatility)
                     last_prices.append(ohlc[-1]["close"])
-                    ema_confirms.append(ema_ok)
-                    trends.append((ema_signal, trend))
 
                 buy_count = signals.count("BUY")
                 sell_count = signals.count("SELL")
@@ -159,15 +203,6 @@ def check_market():
                 elif sell_count >= total_tfs - 1:
                     send_signal(symbol, "SELL", last_prices[-1], max(volatilities), sell_count)
 
-                last_status[symbol] = {
-                    "signals": signals,
-                    "ema_confirms": ema_confirms,
-                    "trends": trends,
-                    "timeframes": TIMEFRAMES,
-                    "last_prices": last_prices,
-                    "volatilities": volatilities
-                }
-
                 time.sleep(0.5)
 
         except Exception as e:
@@ -177,66 +212,17 @@ def check_market():
         time.sleep(10)
 
 # -------------------------
-# Вебхук Telegram
+# Webhook Telegram
 # -------------------------
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
-    global last_status
     json_str = request.get_data().decode("utf-8")
     update = telebot.types.Update.de_json(json_str)
     bot.process_new_updates([update])
-
-    message_obj = update.message or update.edited_message
-    if not message_obj:
-        return "!", 200
-
-    text = message_obj.text.strip()
-
-    if text.startswith("/status"):
-        args = text.split()
-        if len(args) == 2:
-            symbol = args[1].upper()
-            if symbol in last_status:
-                s = last_status[symbol]
-                out = f"📊 {symbol}:\n"
-                buy_count = sell_count = 0
-                for i, tf in enumerate(s["timeframes"]):
-                    sig = s["signals"][i]
-                    ema_signal = s["trends"][i][0]
-                    trend = s["trends"][i][1]
-                    price = s["last_prices"][i]
-                    vol = s["volatilities"][i]
-                    out += f"{tf}: {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend == False else '—'}, Ціна {price}, Волатильність {vol:.2f}\n"
-                    if sig == "BUY": buy_count += 1
-                    elif sig == "SELL": sell_count += 1
-                total = len(s["timeframes"])
-                out += f"\n✅ BUY: {buy_count}/{total}\n❌ SELL: {sell_count}/{total}"
-                bot.send_message(message_obj.chat.id, out)
-            else:
-                bot.send_message(message_obj.chat.id, f"❌ Немає даних для {symbol}")
-        else:
-            bot.send_message(message_obj.chat.id, "Використання: /status SYMBOL")
-
-    elif text.startswith("/top"):
-        symbols = get_top_symbols()[:10]
-        msg = "🔥 Топ-10 монет за добовим рухом %:\n" + "\n".join(symbols)
-        bot.send_message(message_obj.chat.id, msg)
-
-    elif text.startswith("/last"):
-        if not last_signals:
-            bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
-        else:
-            msg = "📝 Останні сигнали:\n"
-            total_tfs = len(TIMEFRAMES)
-            for sym, info in last_signals.items():
-                note = "✅ Підтверджено всіма ТФ" if info["confidence"] == total_tfs else f"⚠️ Лише {info['confidence']}/{total_tfs} ТФ"
-                msg += f"{sym}: {info['signal']} | Ціна {info['price']} | TP {info['tp']} | SL {info['sl']} | {note}\n"
-            bot.send_message(message_obj.chat.id, msg)
-
     return "!", 200
 
 # -------------------------
-# Встановлення Webhook
+# Setup Webhook
 # -------------------------
 def setup_webhook():
     url = f"https://api.telegram.org/bot{API_KEY_TELEGRAM}/setWebhook"
