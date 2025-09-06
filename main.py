@@ -287,7 +287,7 @@ def health_check():
             msg += f"📊 Активних позицій: {len(active_positions)}"
             
             bot.send_message(CHAT_ID, msg)
-            time.sleep(7200)  Кожні 2 години
+            time.sleep(7200)  #Кожні 2 години
             
         except Exception as e:
             error_msg = f"❌ Проблема з системою: {e}"
