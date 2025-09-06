@@ -133,21 +133,21 @@ def get_tokens_from_moralis_fixed(chain, limit=10):
 def get_backup_tokens():
     """Резервний список популярних токенів з правильними символами"""
     backup_tokens = [
-        ("BTC_USDT", 50000),
-        ("ETH_USDT", 3000),
-        ("BNB_USDT", 500),
-        ("SOL_USDT", 100),
-        ("XRP_USDT", 0.5),
-        ("ADA_USDT", 0.4),
-        ("DOGE_USDT", 0.1),
-        ("DOT_USDT", 5),
-        ("LINK_USDT", 15),
-        ("MATIC_USDT", 0.8),
-        ("AVAX_USDT", 20),
-        ("ATOM_USDT", 10),
-        ("LTC_USDT", 70),
-        ("UNI_USDT", 6),
-        ("XLM_USDT", 0.12)
+        ("BTC", 50000),
+        ("ETH", 3000),
+        ("BNB", 500),
+        ("SOL", 100),
+        ("XRP", 0.5),
+        ("ADA", 0.4),
+        ("DOGE", 0.1),
+        ("DOT", 5),
+        ("LINK", 15),
+        ("POL", 0.8),
+        ("AVAX", 20),
+        ("ATOM", 10),
+        ("LTC", 70),
+        ("UNI", 6),
+        ("XLM", 0.12)
     ]
     print(f"{datetime.now()} | ✅ Резервний список: {len(backup_tokens)} токенів")
     return backup_tokens
