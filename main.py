@@ -10,7 +10,7 @@ import time
 # -------------------------
 API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
 CHAT_ID = "6053907025"
-TIMEFRAMES = ["15m", "1h", "4h"]
+TIMEFRAMES = ["5m","15m", "1h", "4h"]
 N_CANDLES = 30
 FAST_EMA = 10
 SLOW_EMA = 30
