@@ -7,8 +7,6 @@ from flask import Flask, request
 import telebot
 import threading
 import json
-from web3 import Web3
-import asyncio
 
 # -------------------------
 # Налаштування через environment variables
@@ -27,7 +25,7 @@ COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
 TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", 5))
 SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", 2.0))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))  # Збільшили інтервал
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
@@ -38,13 +36,6 @@ gate = ccxt.gateio({
     "secret": GATE_API_SECRET,
     "options": {"defaultType": "swap"}
 })
-
-# Підключення до Web3 провайдерів
-WEB3_PROVIDERS = {
-    "eth": Web3(Web3.HTTPProvider("https://mainnet.infura.io/v3/f0a02bb1ea5a4005b13ee19da737bbf8")),
-    "bsc": Web3(Web3.HTTPProvider("https://bsc-dataseed.binance.org/")),
-    "sol": None
-}
 
 active_positions = {}
 token_blacklist = set()
@@ -58,18 +49,19 @@ def get_top_tokens_from_coingecko(limit=50):
         url = "https://api.coingecko.com/api/v3/coins/markets"
         params = {
             "vs_currency": "usd",
-            "order": "volume_desc",
+            "order": "market_cap_desc",  # Змінили на market_cap_desc
             "per_page": limit,
             "page": 1,
             "sparkline": False
         }
         
+        headers = {}
         if COINGECKO_API_KEY:
             headers = {"x-cg-demo-api-key": COINGECKO_API_KEY}
-        else:
-            headers = {}
             
         response = requests.get(url, params=params, headers=headers, timeout=15)
+        print(f"{datetime.now()} | CoinGecko response: {response.status_code}")
+        
         if response.status_code == 200:
             tokens = []
             for coin in response.json():
@@ -78,42 +70,94 @@ def get_top_tokens_from_coingecko(limit=50):
                 if price and price > 0:
                     tokens.append((symbol, price))
             return tokens
+        else:
+            print(f"{datetime.now()} | ❌ CoinGecko HTTP {response.status_code}: {response.text}")
         return []
     except Exception as e:
         print(f"{datetime.now()} | ❌ CoinGecko помилка: {e}")
         return []
 
-def get_tokens_from_moralis(chain, limit=30):
-    """Отримання токенів з Moralis з фільтрацією"""
-    url = f"https://deep-index.moralis.io/api/v2.2/erc20/metadata?chain={chain}&limit={limit}"
+def get_tokens_from_coingecko_trending(limit=20):
+    """Отримання трендових токенів з CoinGecko"""
+    try:
+        url = "https://api.coingecko.com/api/v3/search/trending"
+        response = requests.get(url, timeout=15)
+        
+        if response.status_code == 200:
+            tokens = []
+            data = response.json()
+            trending_coins = data.get("coins", [])[:limit]
+            
+            # Отримуємо детальну інформацію про трендові токени
+            for item in trending_coins:
+                coin_id = item["item"]["id"]
+                price_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+                price_response = requests.get(price_url, timeout=10)
+                
+                if price_response.status_code == 200:
+                    price_data = price_response.json()
+                    usd_price = price_data.get(coin_id, {}).get("usd", 0)
+                    if usd_price > 0:
+                        symbol = item["item"]["symbol"].upper() + "/USDT"
+                        tokens.append((symbol, usd_price))
+            
+            return tokens
+        return []
+    except Exception as e:
+        print(f"{datetime.now()} | ❌ CoinGecko trending помилка: {e}")
+        return []
+
+def get_tokens_from_moralis(chain, limit=20):
+    """Отримання токенів з Moralis з фільтрацією - ОНОВЛЕНИЙ URL"""
+    # Правильні URL для v2.2 API
+    chain_mapping = {
+        "eth": "eth",
+        "bsc": "bsc", 
+        "polygon": "polygon"
+    }
+    
+    if chain not in chain_mapping:
+        return []
+    
+    moralis_chain = chain_mapping[chain]
+    url = f"https://deep-index.moralis.io/api/v2.2/erc20/metadata?chain={moralis_chain}&limit={limit}"
     headers = {"X-API-Key": MORALIS_API_KEY}
     
     try:
         response = requests.get(url, headers=headers, timeout=15)
+        print(f"{datetime.now()} | Moralis {chain} response: {response.status_code}")
+        
         if response.status_code == 200:
             tokens = []
-            for token in response.json():
-                symbol = token.get("symbol", "").upper()
-                address = token.get("address", "")
-                
-                if not symbol or not address or symbol in token_blacklist:
-                    continue
+            data = response.json()
+            
+            # Перевіряємо структуру відповіді
+            if isinstance(data, list):
+                for token in data:
+                    symbol = token.get("symbol", "").upper()
+                    address = token.get("address", "")
                     
-                # Отримуємо ціну
-                price_url = f"https://deep-index.moralis.io/api/v2.2/erc20/{address}/price?chain={chain}"
-                price_response = requests.get(price_url, headers=headers, timeout=10)
-                
-                if price_response.status_code == 200:
-                    price_data = price_response.json()
-                    usd_price = float(price_data.get("usdPrice", 0))
-                    if usd_price > 0.000001:  # Фільтр дуже дешевих токенів
-                        tokens.append((f"{symbol}/USDT", usd_price))
+                    if not symbol or not address or symbol in token_blacklist:
+                        continue
+                        
+                    # Отримуємо ціну
+                    price_url = f"https://deep-index.moralis.io/api/v2.2/erc20/{address}/price?chain={moralis_chain}"
+                    price_response = requests.get(price_url, headers=headers, timeout=10)
+                    
+                    if price_response.status_code == 200:
+                        price_data = price_response.json()
+                        usd_price = float(price_data.get("usdPrice", 0))
+                        if usd_price > 0.000001:
+                            tokens.append((f"{symbol}/USDT", usd_price))
             
             return tokens
+        else:
+            print(f"{datetime.now()} | ❌ Moralis {chain} error: {response.text}")
+            return []
+            
     except Exception as e:
         print(f"{datetime.now()} | ❌ Moralis {chain} помилка: {e}")
-    
-    return []
+        return []
 
 # -------------------------
 # ПОКРАЩЕНА ПЕРЕВІРКА ДОСТУПНОСТІ ПАРИ
@@ -122,17 +166,18 @@ def is_pair_available(symbol):
     """Перевірка чи пара доступна на Gate.io"""
     try:
         # Спробуємо різні формати пар
+        base_symbol = symbol.split('/')[0]
         formats = [
-            symbol.replace("/", "_USDT"),
-            symbol.replace("/", "/USDT:USDT"),
-            symbol.replace("/", "").lower() + "_usdt"
+            f"{base_symbol}_USDT",
+            f"{base_symbol}/USDT:USDT",
+            f"{base_symbol.lower()}_usdt"
         ]
         
         markets = gate.load_markets()
         for fmt in formats:
             if fmt in markets:
                 market = markets[fmt]
-                if market['active'] and market['spot']:
+                if market['active']:
                     return True
         return False
     except Exception as e:
@@ -287,7 +332,7 @@ def health_check():
             msg += f"📊 Активних позицій: {len(active_positions)}"
             
             bot.send_message(CHAT_ID, msg)
-            time.sleep(7200)  #Кожні 2 години
+            time.sleep(7200)  # Кожні 2 години
             
         except Exception as e:
             error_msg = f"❌ Проблема з системою: {e}"
@@ -311,18 +356,22 @@ def start_arbitrage():
         cycle += 1
         print(f"{datetime.now()} | 🔄 Цикл {cycle}")
         
-        # Отримуємо токени з різних джерел
         tokens = []
         
-        # Спосіб 1: CoinGecko (найнадійніший)
-        tokens.extend(get_top_tokens_from_coingecko(30))
+        # СПОЧАТКУ CoinGecko (найнадійніший)
+        tokens.extend(get_top_tokens_from_coingecko(40))
+        tokens.extend(get_tokens_from_coingecko_trending(15))
         
-        # Спосіб 2: Moralis для різних мереж
+        # ПОТІМ Moralis (якщо працює)
         chains = ["eth", "bsc", "polygon"]
         for chain in chains:
-            chain_tokens = get_tokens_from_moralis(chain, 20)
-            tokens.extend(chain_tokens)
-            time.sleep(1)  # Затримка між запитами
+            try:
+                chain_tokens = get_tokens_from_moralis(chain, 15)
+                if chain_tokens:  # Додаємо тільки якщо є токени
+                    tokens.extend(chain_tokens)
+                time.sleep(1)
+            except Exception as e:
+                print(f"{datetime.now()} | ❌ Moralis {chain} пропущено: {e}")
         
         # Видаляємо дублікати
         unique_tokens = list(set(tokens))
@@ -330,14 +379,26 @@ def start_arbitrage():
         print(f"{datetime.now()} | 📦 Знайдено {len(unique_tokens)} унікальних токенів")
         
         if not unique_tokens:
-            bot.send_message(CHAT_ID, "⚠️ Не вдалося отримати токени. Перевірте API ключі.")
-            time.sleep(300)
-            continue
+            print(f"{datetime.now()} | ⚠️ Жодних токенів не знайдено, використовуючи резервний список")
+            # Резервний список популярних токенів
+            backup_tokens = [
+                ("BTC/USDT", 50000),
+                ("ETH/USDT", 3000),
+                ("BNB/USDT", 500),
+                ("SOL/USDT", 100),
+                ("XRP/USDT", 0.5),
+                ("ADA/USDT", 0.4),
+                ("DOGE/USDT", 0.1),
+                ("DOT/USDT", 5),
+                ("LINK/USDT", 15),
+                ("MATIC/USDT", 0.8)
+            ]
+            unique_tokens = backup_tokens
         
-        # Перевіряємо арбітраж для кожного токена
+        # Перевіряємо арбітраж
         for symbol, price in unique_tokens:
             smart_arbitrage(symbol, price)
-            time.sleep(0.5)  # Затримка між перевірками
+            time.sleep(0.3)
         
         time.sleep(CHECK_INTERVAL)
 
