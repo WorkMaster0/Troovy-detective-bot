@@ -392,7 +392,29 @@ def show_balance(message):
     bot.reply_to(message, msg)
 
 # -------------------------
-# ЗАПУСК
+# ВИПРАВЛЕННЯ WEBHOOK
+# -------------------------
+@app.route(WEBHOOK_PATH, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    return 'Bad Request', 400
+
+def setup_webhook():
+    """Налаштування вебхука для Telegram"""
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        print(f"{datetime.now()} | ✅ Вебхук налаштовано: {WEBHOOK_URL}")
+    except Exception as e:
+        print(f"{datetime.now()} | ❌ Помилка налаштування вебхука: {e}")
+
+# -------------------------
+# ЗАПУСК З ВИПРАВЛЕННЯМИ
 # -------------------------
 if __name__ == "__main__":
     print(f"{datetime.now()} | 🚀 Запуск ф'ючерсного арбітражного бота...")
@@ -403,9 +425,14 @@ if __name__ == "__main__":
         print(f"{datetime.now()} | ❌ Відсутні обов'язкові API ключі!")
         exit(1)
     
-    # Запуск арбітражу в окремому потоці
+    # Налаштовуємо вебхук
+    setup_webhook()
+    
+    # Запускаємо арбітраж в окремому потоці
     arbitrage_thread = threading.Thread(target=start_futures_arbitrage, daemon=True)
     arbitrage_thread.start()
     
-    # Запуск Flask для webhook
-    app.run(host="0.0.0.0", port=5000)
+    print(f"{datetime.now()} | ✅ Бот запущено. Очікую команди...")
+    
+    # Запускаємо Flask
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
