@@ -9,3 +9,5 @@ cryptography
 aiohttp
 asyncio
 python-dotenv
+beautifulsoup4
+lxml
