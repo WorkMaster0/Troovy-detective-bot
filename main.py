@@ -1,7 +1,7 @@
 import requests
 import telebot
 from flask import Flask, request
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 import time
 
@@ -14,8 +14,6 @@ TIMEFRAMES = ["15m", "1h", "4h"]
 N_CANDLES = 30
 FAST_EMA = 10
 SLOW_EMA = 30
-MIN_VOLUME = 1_000_000
-SIGNAL_COOLDOWN = 5 * 60  # 5 хвилин для кожної монети
 
 WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
@@ -24,20 +22,21 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
-last_signals = {}       # останні сигнали по монетах
-last_status = {}        # останній стан по монетах
-last_sent_time = {}     # час останнього сигналу по монеті
+last_signals = {}   # останні сигнали по монетах
+last_status = {}    # останній стан по монетах
 
 # -------------------------
-# Топ-30 монет по волатильності (% за 24h), мінімальний обсяг
+# Топ монет по волатильності (% за 24h), мінімальний обсяг 1 млн USDT
 # -------------------------
-def get_top_symbols(limit=30, min_volume=MIN_VOLUME):
+def get_top_symbols(min_volume=1_000_000):
     url = "https://api.binance.com/api/v3/ticker/24hr"
     data = requests.get(url, timeout=10).json()
     usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
+    # Фільтруємо за обсягом
     filtered_pairs = [x for x in usdt_pairs if float(x["quoteVolume"]) >= min_volume]
+    # Сортуємо за абсолютним відсотком зміни ціни
     sorted_pairs = sorted(filtered_pairs, key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
-    return [x["symbol"] for x in sorted_pairs[:limit]]
+    return [x["symbol"] for x in sorted_pairs]
 
 # -------------------------
 # Історичні дані
@@ -71,25 +70,22 @@ def calculate_ema(closes, period):
     return ema
 
 # -------------------------
-# Аналіз сигналів (покращений)
+# Аналіз сигналів (EMA + тренд + волатильність)
 # -------------------------
 def analyze_phase(ohlc):
     closes = [c["close"] for c in ohlc][-N_CANDLES:]
-    volumes = [c["volume"] for c in ohlc][-N_CANDLES:]
     highs = [c["high"] for c in ohlc][-N_CANDLES:]
     lows = [c["low"] for c in ohlc][-N_CANDLES:]
+    volumes = [c["volume"] for c in ohlc][-N_CANDLES:]
 
     last_close = closes[-1]
-    avg_volume = sum(volumes) / len(volumes)
-    recent_high = max(closes)
-    recent_low = min(closes)
+    avg_volume = sum(volumes)/len(volumes)
     volatility = max(highs) - min(lows)
 
-    # Покращений тренд: останні 3 свічки
-    trend_up = closes[-3] < closes[-2] < closes[-1]
-    trend_down = closes[-3] > closes[-2] > closes[-1]
+    # Тренд: дивимося останню свічку + EMA
+    trend_up = closes[-2] < closes[-1]
+    trend_down = closes[-2] > closes[-1]
 
-    # EMA
     fast_ema = calculate_ema(closes[-FAST_EMA:], FAST_EMA)
     slow_ema = calculate_ema(closes[-SLOW_EMA:], SLOW_EMA)
     ema_confirm = None
@@ -98,11 +94,10 @@ def analyze_phase(ohlc):
     elif fast_ema < slow_ema:
         ema_confirm = "SELL"
 
-    # Умови сигналу: тренд + EMA + достатня волатильність
-    min_volatility = 0.5 * (recent_high - recent_low)
-    if trend_up and ema_confirm == "BUY" and volatility >= min_volatility:
+    # Умови сигналів
+    if trend_up and ema_confirm=="BUY" and last_close>min(closes)*1.005 and last_close<max(closes)*0.995:
         return "BUY", volatility, True, ema_confirm, trend_up
-    elif trend_down and ema_confirm == "SELL" and volatility >= min_volatility:
+    elif trend_down and ema_confirm=="SELL" and last_close>min(closes)*1.005 and last_close<max(closes)*0.995:
         return "SELL", volatility, True, ema_confirm, trend_down
     else:
         return "HOLD", volatility, False, ema_confirm, None
@@ -111,33 +106,25 @@ def analyze_phase(ohlc):
 # Відправка сигналу
 # -------------------------
 def send_signal(symbol, signal, price, max_volatility, confidence):
-    global last_signals, last_sent_time
-    now = datetime.now()
-    # Перевірка на частоту сигналу
-    if symbol in last_sent_time and (now - last_sent_time[symbol]).total_seconds() < SIGNAL_COOLDOWN:
+    global last_signals
+    if signal=="HOLD":
         return
-    if signal == "HOLD":
-        return
-
-    last_sent_time[symbol] = now
     last_signals[symbol] = {
         "signal": signal,
         "price": price,
-        "tp": round(price + max_volatility * 0.5 if signal=="BUY" else price - max_volatility * 0.5, 4),
-        "sl": round(price - max_volatility * 0.3 if signal=="BUY" else price + max_volatility * 0.3, 4),
+        "tp": round(price + max_volatility*0.5 if signal=="BUY" else price - max_volatility*0.5, 4),
+        "sl": round(price - max_volatility*0.3 if signal=="BUY" else price + max_volatility*0.3, 4),
         "confidence": confidence,
-        "time": now
+        "time": datetime.now()
     }
-
     note = "✅ Підтверджено всіма ТФ" if confidence==3 else "⚠️ Лише 2/3 ТФ співпали"
     msg = f"📢 {symbol}\nСигнал: {signal}\n💰 Ціна: {price}\n🎯 TP: {last_signals[symbol]['tp']}\n🛑 SL: {last_signals[symbol]['sl']}\n{note}"
     bot.send_message(CHAT_ID, msg)
-
-    with open("signals.log", "a") as f:
+    with open("signals.log","a") as f:
         f.write(f"{datetime.now()} | {symbol} | {signal} | {price} | TP: {last_signals[symbol]['tp']} | SL: {last_signals[symbol]['sl']} | {note}\n")
 
 # -------------------------
-# Перевірка ринку
+# Перевірка ринку (максимально багато токенів, без перевантаження)
 # -------------------------
 def check_market():
     global last_status
@@ -146,7 +133,6 @@ def check_market():
             symbols = get_top_symbols()
             for symbol in symbols:
                 signals, volatilities, last_prices, ema_confirms, trends = [], [], [], [], []
-
                 for tf in TIMEFRAMES:
                     ohlc = get_historical_data(symbol, tf)
                     signal, volatility, ema_ok, ema_signal, trend = analyze_phase(ohlc)
@@ -159,15 +145,15 @@ def check_market():
                 buy_count = signals.count("BUY")
                 sell_count = signals.count("SELL")
 
-                # Всі 3 ТФ
+                # Відправка сигналів
                 if len(set(signals))==1 and signals[0]!="HOLD":
                     send_signal(symbol, signals[0], last_prices[-1], max(volatilities), 3)
-                # 2 з 3 ТФ
                 elif buy_count==2:
                     send_signal(symbol, "BUY", last_prices[-1], max(volatilities), 2)
                 elif sell_count==2:
                     send_signal(symbol, "SELL", last_prices[-1], max(volatilities), 2)
 
+                # Зберігаємо стан
                 last_status[symbol] = {
                     "signals": signals,
                     "ema_confirms": ema_confirms,
@@ -177,11 +163,14 @@ def check_market():
                     "volatilities": volatilities
                 }
 
+                # Невелика пауза між токенами, щоб сервер не зламався
+                time.sleep(0.5)
+
         except Exception as e:
             print(f"{datetime.now()} - Помилка: {e}")
-            with open("errors.log", "a") as f:
+            with open("errors.log","a") as f:
                 f.write(f"{datetime.now()} - {e}\n")
-        time.sleep(5)  # перевірка кожні 5 секунд
+        time.sleep(10)  # невелика пауза після обходу всіх токенів
 
 # -------------------------
 # Вебхук Telegram
@@ -221,26 +210,26 @@ def webhook():
                 out += f"\n✅ BUY: {buy_count}/{total}\n❌ SELL: {sell_count}/{total}"
                 bot.send_message(message_obj.chat.id, out)
             else:
-                bot.send_message(message_obj.chat.id, f"❌ Немає даних для {symbol}")
+                bot.send_message(message_obj.chat.id,f"❌ Немає даних для {symbol}")
         else:
-            bot.send_message(message_obj.chat.id, "Використання: /status SYMBOL")
+            bot.send_message(message_obj.chat.id,"Використання: /status SYMBOL")
 
     # /top
     elif text.startswith("/top"):
-        symbols = get_top_symbols(10)
+        symbols = get_top_symbols()[:10]
         msg = "🔥 Топ-10 монет за добовим рухом %:\n" + "\n".join(symbols)
-        bot.send_message(message_obj.chat.id, msg)
+        bot.send_message(message_obj.chat.id,msg)
 
     # /last
     elif text.startswith("/last"):
         if not last_signals:
-            bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
+            bot.send_message(message_obj.chat.id,"❌ Немає надісланих сигналів")
         else:
             msg = "📝 Останні сигнали:\n"
             for sym, info in last_signals.items():
                 note = "✅ Підтверджено всіма ТФ" if info["confidence"]==3 else "⚠️ Лише 2/3 ТФ"
                 msg += f"{sym}: {info['signal']} | Ціна {info['price']} | TP {info['tp']} | SL {info['sl']} | {note}\n"
-            bot.send_message(message_obj.chat.id, msg)
+            bot.send_message(message_obj.chat.id,msg)
 
     return "!", 200
 
