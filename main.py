@@ -49,32 +49,43 @@ def is_pair_available(symbol):
         return False
 
 # -------------------------
-# Отримання всіх токенів з Moralis
+# Отримання токенів з Moralis з реальною ціною
 # -------------------------
-def get_all_tokens(chain, limit=100, retries=3):
-    url = f"https://deep-index.moralis.io/api/v2/erc20?chain={chain}&limit={limit}"
+def get_all_tokens(chain, limit=50, retries=3):
+    url_list = f"https://deep-index.moralis.io/api/v2/erc20/addresses?chain={chain}&limit={limit}"
     headers = {"X-API-Key": MORALIS_API_KEY}
+    tokens = []
 
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, headers=headers, timeout=10)
+            resp = requests.get(url_list, headers=headers, timeout=10)
             if resp.status_code != 200:
-                print(f"{datetime.now()} | ⚠️ Moralis ({chain}) HTTP {resp.status_code} спроба {attempt}")
+                print(f"{datetime.now()} | ⚠️ Moralis ({chain}) HTTP {resp.status_code}, спроба {attempt}")
                 time.sleep(2)
                 continue
 
             data = resp.json()
-            tokens = []
-            for token in data:
-                symbol = token.get("symbol")
-                price = float(token.get("usdPrice", 0))
-                if symbol and price > 0:
-                    tokens.append((symbol + "/USDT", price))
+            for token_info in data[:limit]:
+                address = token_info.get("address")
+                symbol = token_info.get("symbol")
+                if not address or not symbol:
+                    continue
+                try:
+                    price_url = f"https://deep-index.moralis.io/api/v2/erc20/{address}/price?chain={chain}"
+                    price_resp = requests.get(price_url, headers=headers, timeout=5)
+                    if price_resp.status_code != 200:
+                        continue
+                    price_data = price_resp.json()
+                    usd_price = float(price_data.get("usdPrice", 0))
+                    if usd_price > 0:
+                        tokens.append((symbol + "/USDT", usd_price))
+                except Exception as e:
+                    print(f"{datetime.now()} | ⚠️ Помилка отримання ціни {symbol} ({address}): {e}")
             return tokens
         except Exception as e:
             print(f"{datetime.now()} | ❌ Помилка Moralis ({chain}) спроба {attempt}: {e}")
             time.sleep(2)
-    return []
+    return tokens
 
 # -------------------------
 # Відкриття позиції
@@ -151,10 +162,10 @@ def start_arbitrage():
         cycle += 1
         all_tokens = []
         for chain in chains:
-            tokens = get_all_tokens(chain, limit=100)
+            tokens = get_all_tokens(chain, limit=50)
             all_tokens.extend(tokens)
-            bot.send_message(CHAT_ID, f"🔍 {chain.upper()}: отримано {len(tokens)} токенів")
             print(f"{datetime.now()} | {chain.upper()} отримано {len(tokens)} токенів")
+            bot.send_message(CHAT_ID, f"🔍 {chain.upper()}: отримано {len(tokens)} токенів")
         if not all_tokens:
             bot.send_message(CHAT_ID, f"⚠️ Цикл {cycle}: токенів не знайдено")
         for symbol, price in all_tokens:
