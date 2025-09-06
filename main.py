@@ -70,36 +70,35 @@ def calculate_ema(closes, period):
     return ema
 
 # -------------------------
-# Аналіз Вайкофф + EMA
+# Аналіз Вайкофф + EMA (полегшений)
 # -------------------------
 def analyze_phase(ohlc):
     closes = [c["close"] for c in ohlc][-N_CANDLES:]
-    volumes = [c["volume"] for c in ohlc][-N_CANDLES:]
     highs = [c["high"] for c in ohlc][-N_CANDLES:]
     lows = [c["low"] for c in ohlc][-N_CANDLES:]
 
     last_close = closes[-1]
-    last_volume = volumes[-1]
-    avg_volume = sum(volumes) / len(volumes)
     recent_high = max(closes)
     recent_low = min(closes)
     volatility = max(highs) - min(lows)
 
-    trend_up = closes[-3] < closes[-2] < closes[-1]
-    trend_down = closes[-3] > closes[-2] > closes[-1]
+    # Полегшений тренд: дивимося лише останню свічку
+    trend_up = closes[-2] < closes[-1]
+    trend_down = closes[-2] > closes[-1]
 
+    # EMA
     fast_ema = calculate_ema(closes[-FAST_EMA:], FAST_EMA)
     slow_ema = calculate_ema(closes[-SLOW_EMA:], SLOW_EMA)
-
     ema_confirm = None
     if fast_ema > slow_ema:
         ema_confirm = "BUY"
     elif fast_ema < slow_ema:
         ema_confirm = "SELL"
 
-    if last_close <= recent_low * 1.01 and last_volume > avg_volume and trend_up and ema_confirm == "BUY":
+    # Сигнали тепер більш ймовірні
+    if trend_up and ema_confirm == "BUY":
         return "BUY", volatility, True, ema_confirm, trend_up
-    elif last_close >= recent_high * 0.99 and last_volume > avg_volume and trend_down and ema_confirm == "SELL":
+    elif trend_down and ema_confirm == "SELL":
         return "SELL", volatility, True, ema_confirm, trend_down
     else:
         return "HOLD", volatility, False, ema_confirm, None
