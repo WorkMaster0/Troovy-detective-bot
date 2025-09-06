@@ -32,9 +32,7 @@ def get_top_symbols(limit=30, min_volume=1_000_000):
     url = "https://api.binance.com/api/v3/ticker/24hr"
     data = requests.get(url, timeout=10).json()
     usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
-    # Фільтруємо за обсягом
     filtered_pairs = [x for x in usdt_pairs if float(x["quoteVolume"]) >= min_volume]
-    # Сортуємо за абсолютним відсотком зміни ціни
     sorted_pairs = sorted(filtered_pairs, key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
     return [x["symbol"] for x in sorted_pairs[:limit]]
 
@@ -82,11 +80,9 @@ def analyze_phase(ohlc):
     recent_low = min(closes)
     volatility = max(highs) - min(lows)
 
-    # Полегшений тренд: дивимося лише останню свічку
     trend_up = closes[-2] < closes[-1]
     trend_down = closes[-2] > closes[-1]
 
-    # EMA
     fast_ema = calculate_ema(closes[-FAST_EMA:], FAST_EMA)
     slow_ema = calculate_ema(closes[-SLOW_EMA:], SLOW_EMA)
     ema_confirm = None
@@ -95,7 +91,6 @@ def analyze_phase(ohlc):
     elif fast_ema < slow_ema:
         ema_confirm = "SELL"
 
-    # Сигнали тепер більш ймовірні
     if trend_up and ema_confirm == "BUY":
         return "BUY", volatility, True, ema_confirm, trend_up
     elif trend_down and ema_confirm == "SELL":
@@ -104,19 +99,28 @@ def analyze_phase(ohlc):
         return "HOLD", volatility, False, ema_confirm, None
 
 # -------------------------
-# Відправка сигналу
+# Відправка сигналу з таймером 5 хв для кожної монети
 # -------------------------
 def send_signal(symbol, signal, price, max_volatility, confidence):
     global last_signals
+    now = datetime.now()
+
     if signal == "HOLD":
         return
+
+    # Перевірка індивідуального таймера на 5 хв
+    if symbol in last_signals:
+        last_time = last_signals[symbol]["time"]
+        if (now - last_time).total_seconds() < 300:
+            return
+
     last_signals[symbol] = {
         "signal": signal,
         "price": price,
         "tp": round(price + max_volatility * 0.5 if signal=="BUY" else price - max_volatility * 0.5, 4),
         "sl": round(price - max_volatility * 0.3 if signal=="BUY" else price + max_volatility * 0.3, 4),
         "confidence": confidence,
-        "time": datetime.now()
+        "time": now
     }
 
     note = "✅ Підтверджено всіма ТФ" if confidence==3 else "⚠️ Лише 2/3 ТФ співпали"
@@ -124,7 +128,7 @@ def send_signal(symbol, signal, price, max_volatility, confidence):
     bot.send_message(CHAT_ID, msg)
 
     with open("signals.log", "a") as f:
-        f.write(f"{datetime.now()} | {symbol} | {signal} | {price} | TP: {last_signals[symbol]['tp']} | SL: {last_signals[symbol]['sl']} | {note}\n")
+        f.write(f"{now} | {symbol} | {signal} | {price} | TP: {last_signals[symbol]['tp']} | SL: {last_signals[symbol]['sl']} | {note}\n")
 
 # -------------------------
 # Перевірка ринку
@@ -149,7 +153,6 @@ def check_market():
                 buy_count = signals.count("BUY")
                 sell_count = signals.count("SELL")
 
-                # всі 3 ТФ
                 if len(set(signals))==1 and signals[0]!="HOLD":
                     send_signal(symbol, signals[0], last_prices[-1], max(volatilities), 3)
                 elif buy_count==2:
@@ -188,7 +191,6 @@ def webhook():
 
     text = message_obj.text.strip()
 
-    # /status SYMBOL
     if text.startswith("/status"):
         args = text.split()
         if len(args)==2:
@@ -214,13 +216,11 @@ def webhook():
         else:
             bot.send_message(message_obj.chat.id, "Використання: /status SYMBOL")
 
-    # /top
     elif text.startswith("/top"):
         symbols = get_top_symbols(10)
         msg = "🔥 Топ-10 монет за добовим рухом %:\n" + "\n".join(symbols)
         bot.send_message(message_obj.chat.id, msg)
 
-    # /last
     elif text.startswith("/last"):
         if not last_signals:
             bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
