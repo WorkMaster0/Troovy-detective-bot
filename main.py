@@ -9,7 +9,7 @@ import threading
 # -------------------------
 # Налаштування
 # -------------------------
-API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVZI"
+API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
 CHAT_ID = "6053907025"
 WEBHOOK_HOST = "https://troovy-detective-bot-1.onrender.com"
 WEBHOOK_PATH = "/webhook"
