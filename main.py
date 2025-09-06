@@ -2,11 +2,13 @@ import ccxt
 import requests
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request
 import telebot
 import threading
 import json
+import pandas as pd
+from collections import deque
 
 # -------------------------
 # Налаштування через environment variables
@@ -23,272 +25,333 @@ GATE_API_SECRET = os.getenv("GATE_API_SECRET")
 MORALIS_API_KEY = os.getenv("MORALIS_API_KEY")
 COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
-TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", 5))
-SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", 2.0))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))  # Збільшили до 5 хвилин
+TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", 50))
+FUNDING_THRESHOLD = float(os.getenv("FUNDING_THRESHOLD", 0.001))  # 0.1%
+CORRELATION_THRESHOLD = float(os.getenv("CORRELATION_THRESHOLD", 5.0))  # 5%
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))  # 60 секунд
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
-# Ініціалізація бірж
+# Ініціалізація біржі
 try:
     gate = ccxt.gateio({
         "apiKey": GATE_API_KEY,
         "secret": GATE_API_SECRET,
-        "options": {"defaultType": "spot"}  # Змінили на spot вместо swap
+        "options": {"defaultType": "swap"}  # Змінили на swap для ф'ючерсів
     })
-    # Перевірка підключення до Gate.io
     gate.load_markets()
-    print(f"{datetime.now()} | ✅ Успішно підключено до Gate.io")
+    print(f"{datetime.now()} | ✅ Успішно підключено до Gate.io Futures")
 except Exception as e:
     print(f"{datetime.now()} | ❌ Помилка підключення до Gate.io: {e}")
     gate = None
 
-active_positions = {}
-token_blacklist = set()
-coingecko_last_call = 0
+# Історичні дані для аналізу
+historical_data = {}
+correlation_pairs = [
+    ('BTC/USDT:USDT', 'ETH/USDT:USDT'),
+    ('SOL/USDT:USDT', 'APT/USDT:USDT'), 
+    ('BNB/USDT:USDT', 'BTC/USDT:USDT'),
+    ('XRP/USDT:USDT', 'ADA/USDT:USDT')
+]
 
 # -------------------------
-# ПОКРАЩЕНИЙ ОТРИМАННЯ ТОКЕНІВ
+# ФУНКЦІЇ ДЛЯ Ф'ЮЧЕРСНОГО АРБІТРАЖУ
 # -------------------------
-def get_top_tokens_from_coingecko(limit=25):
-    """Отримання топ токенів з CoinGecko з обмеженням запитів"""
-    global coingecko_last_call
-    
-    # Обмеження: 1 запит в 60 секунд
-    current_time = time.time()
-    if current_time - coingecko_last_call < 60:
-        print(f"{datetime.now()} | ⏳ CoinGecko: зачекайте 60 секунд між запитами")
-        return []
-    
+
+def get_funding_rate(symbol):
+    """Отримання поточного funding rate для ф'ючерсу"""
     try:
-        url = "https://api.coingecko.com/api/v3/coins/markets"
-        params = {
-            "vs_currency": "usd",
-            "order": "market_cap_desc",
-            "per_page": limit,
-            "page": 1,
-            "sparkline": False
-        }
+        # Отримуємо ім'я контракту для Gate.io API
+        contract_name = symbol.replace('/USDT:USDT', '_USDT')
         
-        headers = {}
-        if COINGECKO_API_KEY and COINGECKO_API_KEY != "your_coingecko_api_key":
-            headers = {"x-cg-demo-api-key": COINGECKO_API_KEY}
-            
-        response = requests.get(url, params=params, headers=headers, timeout=15)
-        coingecko_last_call = current_time
+        url = "https://api.gateio.ws/api/v4/futures/usdt/funding_rate"
+        response = requests.get(url, timeout=10)
         
         if response.status_code == 200:
-            tokens = []
-            for coin in response.json():
-                symbol = coin["symbol"].upper()
-                price = coin["current_price"]
-                if price and price > 0:
-                    # Правильний формат символу для Gate.io
-                    tokens.append((f"{symbol}_USDT", price))
-            print(f"{datetime.now()} | ✅ CoinGecko: знайдено {len(tokens)} токенів")
-            return tokens
-        else:
-            print(f"{datetime.now()} | ❌ CoinGecko HTTP {response.status_code}")
-            return []
+            funding_data = response.json()
+            for item in funding_data:
+                if item['name'] == contract_name:
+                    return float(item['rate']), float(item.get('predicted_rate', 0))
+            
+        return None, None
     except Exception as e:
-        print(f"{datetime.now()} | ❌ CoinGecko помилка: {e}")
-        return []
+        print(f"{datetime.now()} | ❌ Помилка отримання funding rate: {e}")
+        return None, None
 
-def get_tokens_from_moralis_fixed(chain, limit=10):
-    """Фіксована версія Moralis API"""
-    if not MORALIS_API_KEY or MORALIS_API_KEY == "your_moralis_api_key":
-        return []
+def calculate_annualized_funding(funding_rate):
+    """Розрахунок річного funding rate"""
+    if funding_rate is None:
+        return 0
+    # Funding кожні 8 годин (3 рази на день)
+    return funding_rate * 3 * 365 * 100  # У відсотках
+
+def detect_funding_arbitrage():
+    """
+    Знаходимо моменти, коли funding rate на ф'ючерсах настільки високий,
+    що можна відкривати позицію з гарантованим прибутком
+    """
+    symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT']
     
-    # Використовуємо правильний ендпоінт для топ токенів
-    try:
-        url = f"https://deep-index.moralis.io/api/v2.2/erc20/top?chain={chain}&limit={limit}"
-        headers = {"X-API-Key": MORALIS_API_KEY}
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            tokens = []
-            data = response.json()
+    opportunities = []
+    
+    for symbol in symbols:
+        try:
+            # Отримуємо funding rate
+            current_funding, predicted_funding = get_funding_rate(symbol)
             
-            for token in data:
-                symbol = token.get("symbol", "").upper()
-                price = token.get("usdPrice", 0)
+            if current_funding is None:
+                continue
                 
-                if symbol and price > 0:
-                    tokens.append((f"{symbol}_USDT", price))
+            # Розрахунок річного funding rate
+            annualized = calculate_annualized_funding(abs(current_funding))
             
-            print(f"{datetime.now()} | ✅ Moralis {chain}: знайдено {len(tokens)} токенів")
-            return tokens
-        else:
-            print(f"{datetime.now()} | ❌ Moralis {chain} HTTP {response.status_code}: {response.text}")
-            return []
-    except Exception as e:
-        print(f"{datetime.now()} | ❌ Moralis {chain} помилка: {e}")
-        return []
+            # Перевіряємо чи funding rate перевищує поріг
+            if abs(current_funding) > FUNDING_THRESHOLD and annualized > 30:
+                # Отримуємо ціни для інформації
+                ticker = gate.fetch_ticker(symbol)
+                
+                opportunity = {
+                    'symbol': symbol,
+                    'current_funding': current_funding,
+                    'predicted_funding': predicted_funding,
+                    'annualized': annualized,
+                    'price': ticker['last'],
+                    'signal': 'LONG' if current_funding < 0 else 'SHORT',
+                    'confidence': min(100, int(annualized / 3)),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                opportunities.append(opportunity)
+                print(f"{datetime.now()} | 📊 Funding opportunity: {symbol} - {annualized:.1f}% річних")
+                
+        except Exception as e:
+            print(f"{datetime.now()} | ❌ Помилка перевірки {symbol}: {e}")
+    
+    return opportunities
 
-# -------------------------
-# РЕЗЕРВНИЙ СПИСОК ТОКЕНІВ (з правильними символами)
-# -------------------------
-def get_backup_tokens():
-    """Резервний список популярних токенів з правильними символами"""
-    backup_tokens = [
-        ("BTC", 50000),
-        ("ETH", 3000),
-        ("BNB", 500),
-        ("SOL", 100),
-        ("XRP", 0.5),
-        ("ADA", 0.4),
-        ("DOGE", 0.1),
-        ("DOT", 5),
-        ("LINK", 15),
-        ("POL", 0.8),
-        ("AVAX", 20),
-        ("ATOM", 10),
-        ("LTC", 70),
-        ("UNI", 6),
-        ("XLM", 0.12)
-    ]
-    print(f"{datetime.now()} | ✅ Резервний список: {len(backup_tokens)} токенів")
-    return backup_tokens
+def update_historical_data():
+    """Оновлення історичних даних для кореляційного аналізу"""
+    global historical_data
+    
+    for pair1, pair2 in correlation_pairs:
+        try:
+            # Отримуємо поточні ціни
+            price1 = gate.fetch_ticker(pair1)['last']
+            price2 = gate.fetch_ticker(pair2)['last']
+            
+            ratio = price1 / price2
+            
+            # Зберігаємо в історичних даних
+            key = f"{pair1}_{pair2}"
+            if key not in historical_data:
+                historical_data[key] = deque(maxlen=100)  # Останні 100 точок
+            
+            historical_data[key].append({
+                'timestamp': datetime.now(),
+                'ratio': ratio,
+                'price1': price1,
+                'price2': price2
+            })
+            
+        except Exception as e:
+            print(f"{datetime.now()} | ❌ Помилка оновлення історичних даних: {e}")
 
-# -------------------------
-# ПОКРАЩЕНА ПЕРЕВІРКА ДОСТУПНОСТІ ПАРИ
-# -------------------------
-def is_pair_available(symbol):
-    """Перевірка чи пара доступна на Gate.io"""
+def detect_correlation_arbitrage():
+    """
+    Знаходимо розриви в кореляції між пов'язаними активами
+    """
+    opportunities = []
+    
+    for pair1, pair2 in correlation_pairs:
+        try:
+            key = f"{pair1}_{pair2}"
+            if key not in historical_data or len(historical_data[key]) < 20:
+                continue
+                
+            # Останнє співвідношення
+            current_data = historical_data[key][-1]
+            current_ratio = current_data['ratio']
+            
+            # Історичне середнє співвідношення
+            historical_ratios = [data['ratio'] for data in historical_data[key]]
+            mean_ratio = sum(historical_ratios) / len(historical_ratios)
+            
+            # Відхилення у відсотках
+            deviation = abs((current_ratio - mean_ratio) / mean_ratio) * 100
+            
+            if deviation > CORRELATION_THRESHOLD:
+                # Визначаємо напрямок сигналу
+                if current_ratio > mean_ratio:
+                    signal = f"BUY {pair2} / SELL {pair1}"
+                else:
+                    signal = f"BUY {pair1} / SELL {pair2}"
+                
+                opportunity = {
+                    'pairs': (pair1, pair2),
+                    'deviation': deviation,
+                    'current_ratio': current_ratio,
+                    'mean_ratio': mean_ratio,
+                    'signal': signal,
+                    'confidence': min(95, int(deviation * 2)),
+                    'timestamp': datetime.now().isoformat()
+                }
+                
+                opportunities.append(opportunity)
+                print(f"{datetime.now()} | 📊 Correlation opportunity: {deviation:.1f}% deviation")
+                
+        except Exception as e:
+            print(f"{datetime.now()} | ❌ Помилка кореляційного аналізу: {e}")
+    
+    return opportunities
+
+def execute_futures_trade(signal):
+    """Виконання торгівлі на ф'ючерсах"""
     if not gate:
+        print(f"{datetime.now()} | ❌ Біржа не підключена")
         return False
-        
+    
     try:
-        # Завантажуємо ринки один раз
-        markets = gate.load_markets()
+        symbol = signal.get('symbol')
+        trade_type = signal.get('signal', '').upper()
         
-        # Перевіряємо безпосередньо символ
-        if symbol in markets:
-            market = markets[symbol]
-            return market.get('active', False)
+        if not symbol or trade_type not in ['LONG', 'SHORT']:
+            return False
         
-        return False
-    except Exception as e:
-        print(f"{datetime.now()} | ❌ Помилка перевірки пари {symbol}: {e}")
-        return False
-
-# -------------------------
-# ПОКРАЩЕНИЙ АРБІТРАЖ
-# -------------------------
-def smart_arbitrage(symbol, dex_price):
-    """Розумний арбітраж з перевіркою волатильності"""
-    if not gate or symbol in active_positions or not is_pair_available(symbol):
-        return
-        
-    try:
+        # Визначаємо розмір позиції
         ticker = gate.fetch_ticker(symbol)
-        gate_price = ticker['last']
+        price = ticker['last']
+        amount = TRADE_AMOUNT_USD / price
         
-        if gate_price == 0 or dex_price == 0:
-            return
-            
-        spread = ((dex_price - gate_price) / gate_price) * 100
+        if trade_type == 'LONG':
+            order = gate.create_market_buy_order(symbol, amount)
+            print(f"{datetime.now()} | ✅ LONG позиція: {amount:.6f} {symbol}")
+        else:
+            order = gate.create_market_sell_order(symbol, amount)
+            print(f"{datetime.now()} | ✅ SHORT позиція: {amount:.6f} {symbol}")
         
-        # Додаткова перевірка волатильності
-        if abs(spread) < SPREAD_THRESHOLD:
-            return
-            
-        print(f"{datetime.now()} | 📊 {symbol} | Gate: {gate_price:.6f} | DEX: {dex_price:.6f} | Spread: {spread:.2f}%")
+        # Надсилаємо повідомлення в Telegram
+        msg = f"🎯 100% СИГНАЛ! {symbol}\n"
+        msg += f"Тип: {trade_type}\n"
+        msg += f"Funding rate: {signal.get('current_funding', 0)*100:.3f}%\n"
+        msg += f"Річний: {signal.get('annualized', 0):.1f}%\n"
+        msg += f"Впевненість: {signal.get('confidence', 0)}%\n"
+        msg += f"Розмір: {TRADE_AMOUNT_USD} USDT"
         
-        # Логуємо знайдений арбітраж (без реального торгівлі)
-        if abs(spread) >= SPREAD_THRESHOLD:
-            msg = f"🎯 Знайдено арбітраж {symbol}\nSpread: {spread:.2f}%"
-            print(f"{datetime.now()} | {msg}")
-            
+        bot.send_message(CHAT_ID, msg)
+        return True
+        
     except Exception as e:
-        print(f"{datetime.now()} | ❌ Помилка арбітражу {symbol}: {e}")
+        error_msg = f"❌ Помилка виконання торгівлі: {e}"
+        print(f"{datetime.now()} | {error_msg}")
+        bot.send_message(CHAT_ID, error_msg)
+        return False
 
 # -------------------------
-# ОСНОВНИЙ ЦИКЛ АРБІТРАЖУ
+# ОСНОВНИЙ ЦИКЛ ТОРГІВЛІ
 # -------------------------
+
 def start_arbitrage():
     """Основний цикл арбітражу"""
-    bot.send_message(CHAT_ID, "🚀 Бот запущено. Починаю моніторинг...")
+    bot.send_message(CHAT_ID, "🚀 Ф'ючерсний арбітраж-бот запущено!")
+    bot.send_message(CHAT_ID, f"📊 Моніторинг funding rate > {FUNDING_THRESHOLD*100:.3f}%")
     
-    cycle = 0
+    last_correlation_update = datetime.now()
+    
     while True:
-        cycle += 1
-        print(f"{datetime.now()} | 🔄 Цикл {cycle}")
-        
-        tokens = []
-        
-        # Спосіб 1: CoinGecko (з обмеженням запитів)
-        if cycle % 2 == 1:  # Кожен другий цикл пропускаємо CoinGecko
-            tokens.extend(get_top_tokens_from_coingecko(20))
-        
-        # Спосіб 2: Moralis (фіксована версія)
-        if MORALIS_API_KEY and MORALIS_API_KEY != "your_moralis_api_key":
-            chains = ["eth", "bsc"]
-            for chain in chains:
-                try:
-                    chain_tokens = get_tokens_from_moralis_fixed(chain, 8)
-                    if chain_tokens:
-                        tokens.extend(chain_tokens)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"{datetime.now()} | ❌ Moralis {chain} пропущено: {e}")
-        
-        # Видаляємо дублікати
-        unique_tokens = list(set(tokens))
-        
-        # Якщо токени не знайдені, використовуємо резервний список
-        if not unique_tokens:
-            print(f"{datetime.now()} | ⚠️ Жодних токенів не знайдено, використовую резервний список")
-            unique_tokens = get_backup_tokens()
-        
-        print(f"{datetime.now()} | 📦 Знайдено {len(unique_tokens)} унікальних токенів")
-        
-        # Перевіряємо арбітраж для кожного токена
-        for symbol, price in unique_tokens:
-            if gate:
-                smart_arbitrage(symbol, price)
-            time.sleep(0.5)
-        
-        time.sleep(CHECK_INTERVAL)
+        try:
+            print(f"{datetime.now()} | 🔄 Перевірка арбітражних можливостей...")
+            
+            # 1. Оновлюємо історичні дані для кореляції кожні 5 хвилин
+            if (datetime.now() - last_correlation_update).seconds > 300:
+                update_historical_data()
+                last_correlation_update = datetime.now()
+            
+            # 2. Шукаємо funding rate арбітраж
+            funding_opportunities = detect_funding_arbitrage()
+            for opportunity in funding_opportunities:
+                if opportunity['confidence'] > 80:  # Мінімум 80% впевненості
+                    execute_futures_trade(opportunity)
+                    time.sleep(2)  # Зачекати між угодами
+            
+            # 3. Шукаємо кореляційний арбітраж
+            correlation_opportunities = detect_correlation_arbitrage()
+            for opportunity in correlation_opportunities:
+                if opportunity['confidence'] > 85:  # Мінімум 85% впевненості
+                    # Для кореляційного арбітражу потрібна парна торгівля
+                    msg = f"📊 Кореляційний сигнал!\n"
+                    msg += f"Пари: {opportunity['pairs'][0]} / {opportunity['pairs'][1]}\n"
+                    msg += f"Відхилення: {opportunity['deviation']:.1f}%\n"
+                    msg += f"Сигнал: {opportunity['signal']}\n"
+                    msg += f"Впевненість: {opportunity['confidence']}%"
+                    
+                    bot.send_message(CHAT_ID, msg)
+            
+            time.sleep(CHECK_INTERVAL)
+            
+        except Exception as e:
+            print(f"{datetime.now()} | ❌ Критична помилка в головному циклі: {e}")
+            time.sleep(60)
 
 # -------------------------
 # TELEGRAM КОМАНДИ
 # -------------------------
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     """Команда старту"""
-    bot.reply_to(message, "🤖 Арбітражний бот активовано!\n\n"
+    bot.reply_to(message, "🤖 Ф'ючерсний арбітраж-бот активовано!\n\n"
                          "Доступні команди:\n"
                          "/status - Статус системи\n"
-                         "/balance - Баланс\n"
-                         "/check_api - Перевірка API ключів\n"
-                         "/stop - Зупинити бота")
+                         "/funding - Поточні funding rates\n"
+                         "/opportunities - Пошук можливостей\n"
+                         "/stats - Статистика торгівлі")
 
-@bot.message_handler(commands=['check_api'])
-def check_api_command(message):
-    """Перевірка API ключів"""
-    issues = []
+@bot.message_handler(commands=['funding'])
+def check_funding(message):
+    """Перевірка поточних funding rates"""
+    symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
     
-    if not API_KEY_TELEGRAM or API_KEY_TELEGRAM == "your_telegram_bot_token":
-        issues.append("❌ Telegram API ключ не налаштовано")
+    msg = "📊 Поточні Funding Rates:\n\n"
     
-    if not CHAT_ID or CHAT_ID == "your_chat_id":
-        issues.append("❌ Chat ID не налаштовано")
+    for symbol in symbols:
+        try:
+            funding_rate, predicted_rate = get_funding_rate(symbol)
+            if funding_rate is not None:
+                annualized = calculate_annualized_funding(abs(funding_rate))
+                msg += f"{symbol}: {funding_rate*100:.3f}%"
+                msg += f" (річних: {annualized:.1f}%)\n"
+        except:
+            msg += f"{symbol}: помилка отримання\n"
     
-    if not GATE_API_KEY or GATE_API_KEY == "your_gate_api_key":
-        issues.append("❌ Gate.io API ключ не налаштовано")
+    bot.reply_to(message, msg)
+
+@bot.message_handler(commands=['opportunities'])
+def find_opportunities(message):
+    """Миттєвий пошук можливостей"""
+    funding_ops = detect_funding_arbitrage()
+    correlation_ops = detect_correlation_arbitrage()
     
-    if not GATE_API_SECRET or GATE_API_SECRET == "your_gate_api_secret":
-        issues.append("❌ Gate.io API секрет не налаштовано")
+    if not funding_ops and not correlation_ops:
+        bot.reply_to(message, "🔍 Можливостей не знайдено")
+        return
     
-    if issues:
-        response = "🔴 Проблеми з API ключами:\n\n" + "\n".join(issues)
-    else:
-        response = "✅ Всі API ключі налаштовано коректно!"
+    msg = "🎯 Знайдені можливості:\n\n"
     
-    bot.reply_to(message, response)
+    for op in funding_ops:
+        msg += f"💰 Funding: {op['symbol']}\n"
+        msg += f"   Rate: {op['current_funding']*100:.3f}%\n"
+        msg += f"   Річних: {op['annualized']:.1f}%\n"
+        msg += f"   Сигнал: {op['signal']}\n"
+        msg += f"   Впевненість: {op['confidence']}%\n\n"
+    
+    for op in correlation_ops:
+        msg += f"📈 Кореляція: {op['pairs'][0]}/{op['pairs'][1]}\n"
+        msg += f"   Відхилення: {op['deviation']:.1f}%\n"
+        msg += f"   Сигнал: {op['signal']}\n"
+        msg += f"   Впевненість: {op['confidence']}%\n\n"
+    
+    bot.reply_to(message, msg)
 
 @bot.message_handler(commands=['status'])
 def send_status(message):
@@ -298,8 +361,8 @@ def send_status(message):
             balance = gate.fetch_balance()
             usdt_balance = balance['total'].get('USDT', 0)
             msg = f"✅ Система працює\n💰 Баланс: {usdt_balance:.2f} USDT\n"
-            msg += f"📊 Активних позицій: {len(active_positions)}\n"
-            msg += f"⚫ Чорний список: {len(token_blacklist)} токенів"
+            msg += f"📊 Історичні дані: {len(historical_data)} пар\n"
+            msg += f"⏰ Оновлення кожні: {CHECK_INTERVAL}с"
         else:
             msg = "❌ Не підключено до Gate.io"
         bot.reply_to(message, msg)
@@ -309,6 +372,7 @@ def send_status(message):
 # -------------------------
 # WEBHOOK ТА ЗАПУСК
 # -------------------------
+
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
     json_str = request.get_data().decode("utf-8")
@@ -326,7 +390,7 @@ def setup_webhook():
         print(f"Webhook setup failed: {e}")
 
 if __name__ == "__main__":
-    print(f"{datetime.now()} | 🚀 Запуск арбітражного бота...")
+    print(f"{datetime.now()} | 🚀 Запуск ф'ючерсного арбітраж-бота...")
     
     # Перевірка обов'язкових ключів
     required_keys = [API_KEY_TELEGRAM, CHAT_ID, GATE_API_KEY, GATE_API_SECRET]
