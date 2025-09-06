@@ -9,7 +9,7 @@ import threading
 # -------------------------
 # Налаштування
 # -------------------------
-API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
+API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVZI"
 CHAT_ID = "6053907025"
 WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
@@ -22,7 +22,7 @@ MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImI4NjlmZDRj
 
 TRADE_AMOUNT_USD = 5
 SPREAD_THRESHOLD = 2.0   # мінімальний спред %
-CHECK_INTERVAL = 10
+CHECK_INTERVAL = 10       # інтервал між циклами
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
@@ -48,28 +48,32 @@ def is_pair_available(symbol):
         return False
 
 # -------------------------
-# Отримання токенів через Moralis
+# Отримання топ токенів через Moralis
 # -------------------------
-def get_top_tokens(chain, limit=10):
-    url = f"https://deep-index.moralis.io/api/v2/erc20/addresses?chain={chain}&limit={limit}"
+def get_top_tokens(chain, limit=10, retries=3):
+    url = f"https://deep-index.moralis.io/api/v2/erc20?chain={chain}&limit={limit}"
     headers = {"X-API-Key": MORALIS_API_KEY}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            print(f"{datetime.now()} | ⚠️ Moralis ({chain}) HTTP {resp.status_code} — пропускаю")
-            return []
 
-        data = resp.json()
-        tokens = []
-        for token in data[:limit]:
-            symbol = token.get("symbol")
-            price = float(token.get("usdPrice", 0))
-            if symbol and price > 0:
-                tokens.append((symbol + "/USDT", price))
-        return tokens
-    except Exception as e:
-        print(f"{datetime.now()} | ❌ Помилка отримання токенів з Moralis ({chain}):", e)
-        return []
+    for attempt in range(1, retries+1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                print(f"{datetime.now()} | ⚠️ Moralis ({chain}) HTTP {resp.status_code}, спроба {attempt}")
+                time.sleep(2)
+                continue
+
+            data = resp.json()
+            tokens = []
+            for token in data[:limit]:
+                symbol = token.get("symbol")
+                price = token.get("usdPrice", 0)
+                if symbol and price > 0:
+                    tokens.append((symbol + "/USDT", float(price)))
+            return tokens
+        except Exception as e:
+            print(f"{datetime.now()} | ❌ Помилка отримання токенів Moralis ({chain}), спроба {attempt}: {e}")
+            time.sleep(2)
+    return []
 
 # -------------------------
 # Відкриття позиції на Gate
@@ -151,6 +155,7 @@ def arbitrage(symbol, dex_price):
 def start_arbitrage():
     chains = ["eth", "bsc", "sol"]  # Ethereum, BSC, Solana
     cycle = 0
+    bot.send_message(CHAT_ID, "🚀 Бот запущено. Починаю моніторинг (Moralis API)")
     while True:
         cycle += 1
         all_tokens = []
@@ -158,8 +163,10 @@ def start_arbitrage():
             tokens = get_top_tokens(chain, limit=10)
             all_tokens.extend(tokens)
             print(f"{datetime.now()} | Moralis ({chain}) отримано токенів {len(tokens)}")
+            bot.send_message(CHAT_ID, f"🔍 Moralis ({chain}): отримано {len(tokens)} токенів")
         if not all_tokens:
             print(f"{datetime.now()} | 🔁 Цикл {cycle}: токенів не знайдено")
+            bot.send_message(CHAT_ID, f"⚠️ Цикл {cycle}: токенів не знайдено, пробуємо знову")
         for symbol, price in all_tokens:
             arbitrage(symbol, price)
         time.sleep(CHECK_INTERVAL)
@@ -184,6 +191,5 @@ def setup_webhook():
 # -------------------------
 if __name__ == "__main__":
     setup_webhook()
-    bot.send_message(CHAT_ID, "🚀 Бот запущено. Починаю моніторинг (Moralis API)")
     threading.Thread(target=start_arbitrage, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
