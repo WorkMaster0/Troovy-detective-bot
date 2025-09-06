@@ -10,7 +10,6 @@ import time
 # -------------------------
 API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
 CHAT_ID = "6053907025"
-SYMBOL = "BTCUSDT"
 TIMEFRAMES = ["15m", "1h", "4h"]  # Мультіфрейм
 N_CANDLES = 30
 FAST_EMA = 10
@@ -24,8 +23,19 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
-last_signal = None   # для фільтра сигналів
-last_status = None   # для команди /status
+last_signals = {}   # для фільтра сигналів по кожній монеті
+last_status = {}    # для команди /status
+
+
+# -------------------------
+# Топ-30 монет по волатильності (% за 24h)
+# -------------------------
+def get_top_symbols(limit=30):
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    data = requests.get(url, timeout=10).json()
+    usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
+    sorted_pairs = sorted(usdt_pairs, key=lambda x: abs(float(x["priceChangePercent"])), reverse=True)
+    return [x["symbol"] for x in sorted_pairs[:limit]]
 
 
 # -------------------------
@@ -100,20 +110,23 @@ def analyze_phase(ohlc):
 # -------------------------
 # Відправка сигналу
 # -------------------------
-def send_signal(signal, price, max_volatility):
-    global last_signal
-    if signal == last_signal or signal == "HOLD":
+def send_signal(symbol, signal, price, max_volatility):
+    global last_signals
+    if symbol in last_signals and last_signals[symbol] == signal:
         return
-    last_signal = signal
+    if signal == "HOLD":
+        return
 
-    tp = round(price + max_volatility * 0.5 if signal == "BUY" else price - max_volatility * 0.5, 2)
-    sl = round(price - max_volatility * 0.3 if signal == "BUY" else price + max_volatility * 0.3, 2)
+    last_signals[symbol] = signal
 
-    message = f"📢 Сигнал: {signal}\n💰 Ціна: {price}\n🎯 Take-profit: {tp}\n🛑 Stop-loss: {sl}"
+    tp = round(price + max_volatility * 0.5 if signal == "BUY" else price - max_volatility * 0.5, 4)
+    sl = round(price - max_volatility * 0.3 if signal == "BUY" else price + max_volatility * 0.3, 4)
+
+    message = f"📢 {symbol}\nСигнал: {signal}\n💰 Ціна: {price}\n🎯 Take-profit: {tp}\n🛑 Stop-loss: {sl}"
     bot.send_message(CHAT_ID, message)
 
     with open("signals.log", "a") as f:
-        f.write(f"{datetime.now()} | {signal} | {price} | TP: {tp} | SL: {sl}\n")
+        f.write(f"{datetime.now()} | {symbol} | {signal} | {price} | TP: {tp} | SL: {sl}\n")
 
 
 # -------------------------
@@ -123,28 +136,31 @@ def check_market():
     global last_status
     while True:
         try:
-            signals, volatilities, last_prices, ema_confirms, trends = [], [], [], [], []
+            symbols = get_top_symbols()
+            for symbol in symbols:
+                signals, volatilities, last_prices, ema_confirms, trends = [], [], [], [], []
 
-            for tf in TIMEFRAMES:
-                ohlc = get_historical_data(SYMBOL, tf)
-                signal, volatility, ema_ok, ema_signal, trend = analyze_phase(ohlc)
-                signals.append(signal)
-                volatilities.append(volatility)
-                last_prices.append(ohlc[-1]["close"])
-                ema_confirms.append(ema_ok)
-                trends.append((ema_signal, trend))
+                for tf in TIMEFRAMES:
+                    ohlc = get_historical_data(symbol, tf)
+                    signal, volatility, ema_ok, ema_signal, trend = analyze_phase(ohlc)
+                    signals.append(signal)
+                    volatilities.append(volatility)
+                    last_prices.append(ohlc[-1]["close"])
+                    ema_confirms.append(ema_ok)
+                    trends.append((ema_signal, trend))
 
-            if len(set(signals)) == 1 and signals[0] != "HOLD" and all(ema_confirms):
-                send_signal(signals[0], last_prices[-1], max(volatilities))
+                # якщо всі таймфрейми співпали і сигнал не HOLD
+                if len(set(signals)) == 1 and signals[0] != "HOLD" and all(ema_confirms):
+                    send_signal(symbol, signals[0], last_prices[-1], max(volatilities))
 
-            last_status = {
-                "signals": signals,
-                "ema_confirms": ema_confirms,
-                "trends": trends,
-                "timeframes": TIMEFRAMES,
-                "last_prices": last_prices,
-                "volatilities": volatilities
-            }
+                last_status[symbol] = {
+                    "signals": signals,
+                    "ema_confirms": ema_confirms,
+                    "trends": trends,
+                    "timeframes": TIMEFRAMES,
+                    "last_prices": last_prices,
+                    "volatilities": volatilities
+                }
 
         except Exception as e:
             print(f"{datetime.now()} - Помилка: {e}")
@@ -164,31 +180,37 @@ def webhook():
     bot.process_new_updates([update])
 
     message_obj = update.message or update.edited_message
-    if message_obj and message_obj.text == "/status":
-        if not last_status:
-            bot.send_message(message_obj.chat.id, "Поки немає даних (аналіз ще не завершився).")
+    if message_obj and message_obj.text.startswith("/status"):
+        args = message_obj.text.split()
+        if len(args) == 2:
+            symbol = args[1].upper()
+            if symbol in last_status:
+                s = last_status[symbol]
+                text = f"📊 {symbol}:\n"
+                buy_count = sell_count = 0
+                for i, tf in enumerate(s["timeframes"]):
+                    sig = s["signals"][i]
+                    ema_signal = s["trends"][i][0]
+                    trend = s["trends"][i][1]
+                    price = s["last_prices"][i]
+                    vol = s["volatilities"][i]
+
+                    text += f"{tf}: {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend==False else '—'}, Ціна {price}, Волатильність {vol:.2f}\n"
+
+                    if sig == "BUY":
+                        buy_count += 1
+                    elif sig == "SELL":
+                        sell_count += 1
+
+                total = len(s["timeframes"])
+                text += f"\n✅ BUY: {buy_count}/{total} ({buy_count/total*100:.0f}%)\n"
+                text += f"❌ SELL: {sell_count}/{total} ({sell_count/total*100:.0f}%)"
+
+                bot.send_message(message_obj.chat.id, text)
+            else:
+                bot.send_message(message_obj.chat.id, f"❌ Немає даних для {symbol}")
         else:
-            text = "📊 Статус сигналів:\n"
-            buy_count = sell_count = 0
-            for i, tf in enumerate(last_status["timeframes"]):
-                sig = last_status["signals"][i]
-                ema_signal = last_status["trends"][i][0]
-                trend = last_status["trends"][i][1]
-                price = last_status["last_prices"][i]
-                vol = last_status["volatilities"][i]
-
-                text += f"{tf}: {sig}, EMA {ema_signal}, Тренд {'UP' if trend else 'DOWN' if trend==False else '—'}, Ціна {price}, Волатильність {vol:.2f}\n"
-
-                if sig == "BUY":
-                    buy_count += 1
-                elif sig == "SELL":
-                    sell_count += 1
-
-            total = len(last_status["timeframes"])
-            text += f"\n✅ BUY: {buy_count}/{total} ({buy_count/total*100:.0f}%)\n"
-            text += f"❌ SELL: {sell_count}/{total} ({sell_count/total*100:.0f}%)"
-
-            bot.send_message(message_obj.chat.id, text)
+            bot.send_message(message_obj.chat.id, "Використання: /status SYMBOL")
 
     return "!", 200
 
@@ -206,6 +228,6 @@ def setup_webhook():
 # Запуск
 # -------------------------
 if __name__ == "__main__":
-    setup_webhook()  # автоматично реєструє webhook у Telegram
+    setup_webhook()
     threading.Thread(target=check_market, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
