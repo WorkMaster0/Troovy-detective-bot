@@ -2,3 +2,10 @@ ccxt
 Flask
 pyTelegramBotAPI
 requests
+web3
+pandas
+numpy
+cryptography
+aiohttp
+asyncio
+python-dotenv
