@@ -11,17 +11,17 @@ import threading
 # -------------------------
 API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
 CHAT_ID = "6053907025"
-WEBHOOK_HOST = "https://troovy-detective-bot-1.onrender.com"
+WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
-
-MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImI4NjlmZDRjLTRmMTEtNGUxYi1hYjk2LWUyYjhlOTYxMDAzNiIsIm9yZ0lkIjoiNDY5NDkxIiwidXNlcklkIjoiNDgyOTgzIiwidHlwZUlkIjoiN2I3YTRhM2ItOWJlMC00YWVlLWJkZDAtNmEwZTdmNGYyNzc0IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NTcxODYzOTksImV4cCI6NDkxMjk0NjM5OX0.WwfzETTGBUWMApDPuWVW8p8tuTdreYKOAgrolp5TuWM"
 
 GATE_API_KEY = "cf99af3f8c0c1a711408f1a1970be8be"
 GATE_API_SECRET = "4bd0a51eac2133386e60f4c5e1a78ea9c364e542399bc1865e679f509e93f72e"
 
+MORALIS_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImI4NjlmZDRjLTRmMTEtNGUxYi1hYjk2LWUyYjhlOTYxMDAzNiIsIm9yZ0lkIjoiNDY5NDkxIiwidXNlcklkIjoiNDgyOTgzIiwidHlwZUlkIjoiN2I3YTRhM2ItOWJlMC00YWVlLWJkZDAtNmEwZTdmNGYyNzc0IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NTcxODYzOTksImV4cCI6NDkxMjk0NjM5OX0.WwfzETTGBUWMApDPuWVW8p8tuTdreYKOAgrolp5TuWM"
+
 TRADE_AMOUNT_USD = 5
-SPREAD_THRESHOLD = 2.0
+SPREAD_THRESHOLD = 2.0   # мінімальний спред %
 CHECK_INTERVAL = 10
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
@@ -30,42 +30,13 @@ app = Flask(__name__)
 gate = ccxt.gateio({
     "apiKey": GATE_API_KEY,
     "secret": GATE_API_SECRET,
-    "options": {"defaultType": "swap"}  # ф'ючерси
+    "options": {"defaultType": "swap"}  # ф’ючерси USDT
 })
 
-active_positions = {}
+active_positions = {}  # ключ = символ, значення = "BUY"/"SELL"
 
 # -------------------------
-# Moralis API: отримання топ токенів
-# -------------------------
-def get_top_tokens_moralis(chain="eth", limit=10):
-    url = f"https://deep-index.moralis.io/api/v2.2/market-data/{chain}/erc20/top-tokens"
-    headers = {"X-API-Key": MORALIS_API_KEY}
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            print(f"{datetime.now()} | ⚠️ Moralis {chain} HTTP {resp.status_code}")
-            return []
-
-        data = resp.json()
-        tokens = []
-        for t in data.get("result", [])[:limit]:
-            symbol = t["symbol"].upper() + "/USDT"
-            price = float(t["price_usd"])
-            tokens.append((symbol, price))
-        return tokens
-    except Exception as e:
-        print(f"{datetime.now()} | ❌ Помилка Moralis ({chain}):", e)
-        return []
-
-def get_all_tokens(limit=5):
-    tokens = []
-    for chain in ["eth", "bsc", "solana"]:
-        tokens.extend(get_top_tokens_moralis(chain, limit))
-    return tokens
-
-# -------------------------
-# Gate: перевірка пари
+# Перевірка чи пара існує на Gate Futures
 # -------------------------
 def is_pair_available(symbol):
     pair = symbol.replace("/", "/USDT:USDT")
@@ -77,33 +48,55 @@ def is_pair_available(symbol):
         return False
 
 # -------------------------
-# Відкриття позиції
+# Отримання токенів через Moralis
+# -------------------------
+def get_top_tokens(chain, limit=10):
+    url = f"https://deep-index.moralis.io/api/v2/erc20/addresses?chain={chain}&limit={limit}"
+    headers = {"X-API-Key": MORALIS_API_KEY}
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            print(f"{datetime.now()} | ⚠️ Moralis ({chain}) HTTP {resp.status_code} — пропускаю")
+            return []
+
+        data = resp.json()
+        tokens = []
+        for token in data[:limit]:
+            symbol = token.get("symbol")
+            price = float(token.get("usdPrice", 0))
+            if symbol and price > 0:
+                tokens.append((symbol + "/USDT", price))
+        return tokens
+    except Exception as e:
+        print(f"{datetime.now()} | ❌ Помилка отримання токенів з Moralis ({chain}):", e)
+        return []
+
+# -------------------------
+# Відкриття позиції на Gate
 # -------------------------
 def open_gate_position(symbol, side):
     pair = symbol.replace("/", "/USDT:USDT")
     if not is_pair_available(symbol):
+        print(f"{datetime.now()} | ⚠️ Пара {pair} відсутня на Gate Futures")
         return None, None
     if symbol in active_positions:
+        print(f"{datetime.now()} | ⚠️ Позиція по {symbol} вже відкрита")
         return None, None
-
     try:
         balance = gate.fetch_balance()
         usdt_available = balance['total'].get('USDT', 0)
         if usdt_available < TRADE_AMOUNT_USD:
+            print(f"{datetime.now()} | ❌ Недостатньо USDT ({usdt_available})")
             return None, None
 
         ticker = gate.fetch_ticker(pair)
         gate_price = ticker['last']
         amount = TRADE_AMOUNT_USD / gate_price
 
-        gate.create_order(
-            symbol=pair,
-            type="market",
-            side=side.lower(),
-            amount=amount
-        )
+        gate.create_order(symbol=pair, type="market", side=side.lower(), amount=amount)
         active_positions[symbol] = side
-        msg = f"✅ Відкрито {side} {amount:.4f} {symbol}\nGate ціна: {gate_price:.4f}"
+        msg = f"✅ Відкрито {side} {amount:.4f} {symbol} за Gate ціною {gate_price:.4f}"
+        print(f"{datetime.now()} | {msg}")
         bot.send_message(CHAT_ID, msg)
         return amount, gate_price
     except Exception as e:
@@ -111,23 +104,19 @@ def open_gate_position(symbol, side):
         return None, None
 
 # -------------------------
-# Закриття позиції
+# Лімітний ордер на закриття
 # -------------------------
 def close_gate_position(symbol, side, amount, dex_price):
     pair = symbol.replace("/", "/USDT:USDT")
     if not is_pair_available(symbol):
+        print(f"{datetime.now()} | ⚠️ Пара {pair} відсутня на Gate Futures")
         return
     try:
         close_side = "SELL" if side == "BUY" else "BUY"
-        gate.create_order(
-            symbol=pair,
-            type="limit",
-            side=close_side.lower(),
-            amount=amount,
-            price=dex_price,
-            params={"reduceOnly": True}
-        )
-        msg = f"🎯 Закриття {close_side} {amount:.4f} {symbol}\nDEX ціна: {dex_price:.4f}"
+        gate.create_order(symbol=pair, type="limit", side=close_side.lower(),
+                          amount=amount, price=dex_price, params={"reduceOnly": True})
+        msg = f"🎯 Лімітний ордер {close_side} {amount:.4f} {symbol} за ціною {dex_price:.4f}"
+        print(f"{datetime.now()} | {msg}")
         bot.send_message(CHAT_ID, msg)
         if symbol in active_positions:
             del active_positions[symbol]
@@ -135,18 +124,15 @@ def close_gate_position(symbol, side, amount, dex_price):
         print(f"{datetime.now()} | ❌ Помилка закриття позиції:", e)
 
 # -------------------------
-# Арбітраж
+# Арбітраж по одному токені
 # -------------------------
 def arbitrage(symbol, dex_price):
     try:
-        pair = symbol.replace("/", "/USDT:USDT")
         if not is_pair_available(symbol):
             return
-
-        gate_price = gate.fetch_ticker(pair)['last']
+        gate_price = gate.fetch_ticker(symbol.replace("/", "/USDT:USDT"))['last']
         spread = (dex_price - gate_price) / gate_price * 100
-
-        bot.send_message(CHAT_ID, f"{symbol} | DEX: {dex_price:.4f} | Gate: {gate_price:.4f} | Spread: {spread:.2f}%")
+        print(f"{datetime.now()} | {symbol} | Gate: {gate_price:.4f} | DEX: {dex_price:.4f} | Spread: {spread:.2f}%")
 
         if spread >= SPREAD_THRESHOLD:
             amount, _ = open_gate_position(symbol, "BUY")
@@ -163,13 +149,19 @@ def arbitrage(symbol, dex_price):
 # Основний цикл
 # -------------------------
 def start_arbitrage():
+    chains = ["eth", "bsc", "sol"]  # Ethereum, BSC, Solana
     cycle = 0
     while True:
         cycle += 1
-        tokens = get_all_tokens(limit=5)
-        bot.send_message(CHAT_ID, f"🔎 Цикл {cycle}: отримано {len(tokens)} токенів")
-        for symbol, dex_price in tokens:
-            arbitrage(symbol, dex_price)
+        all_tokens = []
+        for chain in chains:
+            tokens = get_top_tokens(chain, limit=10)
+            all_tokens.extend(tokens)
+            print(f"{datetime.now()} | Moralis ({chain}) отримано токенів {len(tokens)}")
+        if not all_tokens:
+            print(f"{datetime.now()} | 🔁 Цикл {cycle}: токенів не знайдено")
+        for symbol, price in all_tokens:
+            arbitrage(symbol, price)
         time.sleep(CHECK_INTERVAL)
 
 # -------------------------
