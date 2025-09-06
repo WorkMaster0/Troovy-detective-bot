@@ -4,7 +4,7 @@ from flask import Flask, request
 from datetime import datetime
 import threading
 import time
-import ccxt   # <-- для торгівлі на Kraken
+import ccxt   # <-- для торгівлі на Gate.io
 
 # -------------------------
 # Налаштування
@@ -20,13 +20,14 @@ WEBHOOK_HOST = "https://your-app-name.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
-# Kraken API
-KRAKEN_API_KEY = "EJFD4SE1w1j27j5XR9g2cubrreHE9W3zHDmZ9/g5j4rxpAHtfFF/UIoF"
-KRAKEN_API_SECRET = "T6vGYJ7TWL3fICHeMJVUXMgfJ5SYjYrpburigi/bI3nwJvdzpJE0L4lFi6hf/uLdQDKAm8LgM8vgQBKUbAhGig=="
+# Gate API (фʼючерси USDT)
+GATE_API_KEY = "cf99af3f8c0c1a711408f1a1970be8be"
+GATE_API_SECRET = "4bd0a51eac2133386e60f4c5e1a78ea9c364e542399bc1865e679f509e93f72e"
 
-kraken = ccxt.kraken({
-    "apiKey": KRAKEN_API_KEY,
-    "secret": KRAKEN_API_SECRET
+gate = ccxt.gateio({
+    "apiKey": GATE_API_KEY,
+    "secret": GATE_API_SECRET,
+    "options": {"defaultType": "swap"}   # дуже важливо: тільки тоді буде futures
 })
 
 TRADE_AMOUNT_USD = 10   # розмір тестової позиції
@@ -49,7 +50,7 @@ def get_top_symbols(min_volume=1_000_000):
     return [x["symbol"] for x in sorted_pairs]
 
 # -------------------------
-# Історичні дані
+# Історичні дані (з Binance для аналізу)
 # -------------------------
 def get_historical_data(symbol, interval, limit=100):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -110,38 +111,47 @@ def analyze_phase(ohlc):
         return "HOLD", volatility, False, ema_confirm, None
 
 # -------------------------
-# Торгівля на Kraken
+# Торгівля на Gate Futures
 # -------------------------
 def place_order(symbol, side, amount_usd, tp, sl):
     try:
-        # Binance дає формат BTCUSDT → Kraken очікує BTC/USDT
-        pair = symbol.replace("USDT", "/USDT")
+        # Binance дає формат BTCUSDT → для Gate Futures треба BTC/USDT:USDT
+        pair = symbol.replace("USDT", "/USDT:USDT")
 
-        ticker = kraken.fetch_ticker(pair)
+        ticker = gate.fetch_ticker(pair)
         coin_price = ticker["last"]
         amount = amount_usd / coin_price
 
         # Ринковий ордер
-        order = kraken.create_order(
+        order = gate.create_order(
             symbol=pair,
             type="market",
             side=side.lower(),
             amount=amount
         )
 
-        # TP/SL (OCO може залежати від біржі, Kraken підтримує через params)
-        params = {"takeProfitPrice": tp, "stopLossPrice": sl}
-        oco_order = kraken.create_order(
+        print("✅ Ордер виконано:", order)
+
+        # Gate futures TP/SL можна виставляти окремими ордерами
+        tp_order = gate.create_order(
             symbol=pair,
             type="limit",
             side="sell" if side == "BUY" else "buy",
             amount=amount,
             price=tp,
-            params=params
+            params={"reduceOnly": True}
+        )
+        sl_order = gate.create_order(
+            symbol=pair,
+            type="stop",
+            side="sell" if side == "BUY" else "buy",
+            amount=amount,
+            price=sl,
+            params={"stopPrice": sl, "reduceOnly": True}
         )
 
-        print("✅ Ордер виконано:", order)
-        print("🎯 TP/SL виставлено:", oco_order)
+        print("🎯 TP виставлено:", tp_order)
+        print("🛑 SL виставлено:", sl_order)
 
     except Exception as e:
         print("❌ Помилка ордера:", e)
@@ -171,7 +181,7 @@ def send_signal(symbol, signal, price, max_volatility, confidence):
     )
     bot.send_message(CHAT_ID, msg)
 
-    # 🚀 Автоматична торгівля (тільки якщо всі 4/4)
+    # 🚀 Автоматична торгівля (тільки якщо всі ТФ збігаються)
     if confidence == total_tfs:
         place_order(symbol, signal, TRADE_AMOUNT_USD, last_signals[symbol]["tp"], last_signals[symbol]["sl"])
 
