@@ -1,3 +1,4 @@
+ccxt
 Flask
 pyTelegramBotAPI
 requests
