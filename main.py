@@ -29,6 +29,7 @@ GATE_API_SECRET = os.getenv("GATE_API_SECRET")
 
 TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", 100))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 30))  # 30 секунд
+DEMO_MODE = os.getenv("DEMO_MODE", "True").lower() == "true"  # Демо-режим за замовчуванням
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
@@ -54,17 +55,50 @@ liquidity_vortex = {}
 dark_pool_detector = {}
 market_memory = {}
 
+# Механізми безпеки
+SAFETY_MECHANISMS = {
+    'max_position_size': 0.1,  # Макс 10% від балансу
+    'daily_loss_limit': -0.05, # Макс -5% в день
+    'min_confidence': 0.85,    # Мінімум 85% впевненості
+    'cooldown_period': 60,     # 60 сек між угодами
+    'symbol_blacklist': ['SHIB/USDT:USDT', 'PEPE/USDT:USDT', 'DOGE/USDT:USDT']  # Ризиковані токени
+}
+
 # -------------------------
-# КВАНТОВО-МЕМНІЧНИЙ АНАЛІЗ (НОВА ТЕХНОЛОГІЯ)
+# ФУНКЦІЇ БЕЗПЕКИ
+# -------------------------
+
+def safety_check(symbol, amount_usd, confidence):
+    """Перевірка безпеки перед угодою"""
+    if confidence < SAFETY_MECHANISMS['min_confidence']:
+        return False
+        
+    if symbol in SAFETY_MECHANISMS['symbol_blacklist']:
+        return False
+        
+    if DEMO_MODE:
+        return True
+        
+    # Перевірка балансу (тільки для реального режиму)
+    try:
+        balance = gate.fetch_balance()
+        total_usdt = balance['total'].get('USDT', 0)
+        
+        if amount_usd > total_usdt * SAFETY_MECHANISMS['max_position_size']:
+            print(f"❌ Перевищено максимальний розмір позиції")
+            return False
+    except:
+        return False
+        
+    return True
+
+# -------------------------
+# КВАНТОВО-МЕМНІЧНИЙ АНАЛІЗ
 # -------------------------
 
 def quantum_memory_analysis(symbol, timeframe='5m', memory_depth=50):
-    """
-    Аналізує "пам'ять" ринку через квантово-механічні аналоги
-    Знаходить паттерни, які не видно звичайним методам
-    """
+    """Аналізує пам'ять ринку через спектральний аналіз"""
     try:
-        # Отримуємо історичні дані
         ohlcv = gate.fetch_ohlcv(symbol, timeframe, limit=memory_depth)
         if len(ohlcv) < memory_depth:
             return None
@@ -72,14 +106,14 @@ def quantum_memory_analysis(symbol, timeframe='5m', memory_depth=50):
         closes = np.array([x[4] for x in ohlcv])
         volumes = np.array([x[5] for x in ohlcv])
         
-        # Квантово-подібне перетворення даних
+        # Спектральний аналіз
         wave_function = np.fft.fft(closes)
         probability_density = np.abs(wave_function) ** 2
         
-        # Аналіз "квантової когерентності"
+        # Аналіз когерентності
         coherence = np.std(probability_density) / np.mean(probability_density)
         
-        # Механічна пам'ять ринку
+        # Самокореляція для виявлення пам'яті ринку
         memory_decay = self_correlation_analysis(closes)
         
         # Ентропія інформації
@@ -101,7 +135,7 @@ def quantum_memory_analysis(symbol, timeframe='5m', memory_depth=50):
         return None
 
 def self_correlation_analysis(data):
-    """Аналіз самокореляції для виявлення пам'яті ринку"""
+    """Аналіз самокореляції"""
     lags = range(1, min(20, len(data)//2))
     correlations = []
     
@@ -118,22 +152,19 @@ def calculate_market_entropy(prices, volumes):
     price_changes = np.diff(prices) / prices[:-1]
     volume_changes = np.diff(volumes) / volumes[:-1]
     
-    # Комбінована ентропія
     combined = price_changes * volume_changes
-    entropy = stats.entropy(np.abs(combined))
-    
-    return entropy / 10  # Нормалізація
+    if len(combined) > 0:
+        entropy = stats.entropy(np.abs(combined))
+        return entropy / 10
+    return 0
 
 # -------------------------
-# ТЕМПОРАЛЬНІ АНОМАЛІЇ (МАШИНА ЧАСУ)
+# ТЕМПОРАЛЬНІ АНОМАЛІЇ
 # -------------------------
 
 def detect_temporal_anomalies(symbol):
-    """
-    Виявляє аномалії в часових рядах, які передують великим рухам
-    """
+    """Виявляє аномалії в часових рядах"""
     try:
-        # Отримуємо дані різних таймфреймів
         timeframes = ['1m', '5m', '15m', '1h']
         anomalies = []
         
@@ -142,7 +173,6 @@ def detect_temporal_anomalies(symbol):
             if len(ohlcv) < 50:
                 continue
                 
-            # Перетворюємо в numpy
             highs = np.array([x[2] for x in ohlcv])
             lows = np.array([x[3] for x in ohlcv])
             closes = np.array([x[4] for x in ohlcv])
@@ -173,13 +203,11 @@ def detect_temporal_anomalies(symbol):
     return None
 
 # -------------------------
-# ВИЯВЛЕННЯ ТЕМНИХ ПУЛІВ (DARK POOL DETECTION)
+# ВИЯВЛЕННЯ ТЕМНИХ ПУЛІВ
 # -------------------------
 
 def detect_dark_pool_activity(symbol):
-    """
-    Виявляє активність темних пулів через аномалії в об'ємах
-    """
+    """Виявляє активність темних пулів через аномалії в об'ємах"""
     try:
         orderbook = gate.fetch_order_book(symbol, limit=1000)
         trades = gate.fetch_trades(symbol, limit=500)
@@ -192,12 +220,12 @@ def detect_dark_pool_activity(symbol):
         asks_volume = sum(ask[1] for ask in orderbook['asks'][:20])
         volume_imbalance = (bids_volume - asks_volume) / (bids_volume + asks_volume)
         
-        # Аналіз великих торгів
-        large_trades = [t for t in trades if t['amount'] * t['price'] > 50000]  > 50k USDT
+        # Аналіз великих торгів (понад 50k USDT)
+        large_trades = [t for t in trades if t['amount'] * t['price'] > 50000]
         large_buys = sum(1 for t in large_trades if t['side'] == 'buy')
         large_sells = sum(1 for t in large_trades if t['side'] == 'sell')
         
-        # Детекція "стелен" купівлі/продажу
+        # Детекція стін ліквідності
         bid_walls = detect_liquidity_walls(orderbook['bids'])
         ask_walls = detect_liquidity_walls(orderbook['asks'])
         
@@ -223,20 +251,18 @@ def detect_liquidity_walls(orders, threshold=100000):
     """Виявляє великі стіни ліквідності"""
     walls = []
     for price, amount in orders:
-        if amount * price > threshold:  # Стіна більше 100k USDT
-            walls.append({'price': price, 'amount': amount, 'value': amount * price})
+        order_value = amount * price
+        if order_value > threshold:  # Стіна більше 100k USDT
+            walls.append({'price': price, 'amount': amount, 'value': order_value})
     return walls
 
 # -------------------------
-# ВОРТЕКС ЛІКВІДНОСТІ (LIQUIDITY VORTEX)
+# ВОРТЕКС ЛІКВІДНОСТІ
 # -------------------------
 
 def analyze_liquidity_vortex(symbol):
-    """
-    Аналізує "вихори" ліквідності, які утворюються перед великими рухами
-    """
+    """Аналізує динаміку ліквідності"""
     try:
-        # Отримуємо глибину ринку
         orderbook = gate.fetch_order_book(symbol, limit=1000)
         if not orderbook:
             return None
@@ -275,19 +301,19 @@ def liquidity_volatility(orders, lookback=10):
         return 0
     
     volumes = [amount for _, amount in orders[:lookback]]
+    if len(volumes) < 2:
+        return 0
+        
     returns = np.diff(volumes) / volumes[:-1]
     return np.std(returns) if len(returns) > 0 else 0
 
 # -------------------------
-# НЕЙРОННА МЕРЕЖА В РЕАЛЬНОМУ ЧАСІ (СИМУЛЯЦІЯ)
+# НЕЙРОННА МЕРЕЖА В РЕАЛЬНОМУ ЧАСІ
 # -------------------------
 
 def neural_market_sentiment(symbol):
-    """
-    Симвулює роботу нейронної мережі для аналізу ринкових настроїв
-    """
+    """Аналіз ринкових настроїв"""
     try:
-        # Отримуємо різні види даних
         ohlcv = gate.fetch_ohlcv(symbol, '5m', limit=100)
         orderbook = gate.fetch_order_book(symbol, limit=200)
         trades = gate.fetch_trades(symbol, limit=200)
@@ -295,12 +321,12 @@ def neural_market_sentiment(symbol):
         if len(ohlcv) < 50 or not orderbook or not trades:
             return None
         
-        # Складові нейронного аналізу
+        # Складові аналізу
         technical_score = analyze_technical_patterns(ohlcv)
         orderbook_score = analyze_orderbook_dynamics(orderbook)
         trade_flow_score = analyze_trade_flow(trades)
         
-        # Комбінований сигнал нейронної мережі
+        # Комбінований сигнал
         neural_signal = (technical_score * 0.4 + 
                         orderbook_score * 0.3 + 
                         trade_flow_score * 0.3)
@@ -322,35 +348,36 @@ def neural_market_sentiment(symbol):
 def analyze_technical_patterns(ohlcv):
     """Аналіз технічних паттернів"""
     closes = np.array([x[4] for x in ohlcv])
-    rsi = talib.RSI(closes, timeperiod=14)[-1]
+    rsi = talib.RSI(closes, timeperiod=14)[-1] if len(closes) >= 14 else 50
     macd, signal, _ = talib.MACD(closes)
     
     # Нормалізація в [0, 1]
     rsi_score = 1 - abs(rsi - 50) / 50 if not np.isnan(rsi) else 0.5
     macd_score = 0.5
     if len(macd) > 1 and not np.isnan(macd[-1]) and not np.isnan(signal[-1]):
-        macd_score = 0.5 + (macd[-1] - signal[-1]) / (2 * np.std(macd[-20:]) if np.std(macd[-20:]) > 0 else 1)
+        macd_std = np.std(macd[-20:]) if len(macd) >= 20 and np.std(macd[-20:]) > 0 else 1
+        macd_score = 0.5 + (macd[-1] - signal[-1]) / (2 * macd_std)
     
-    return (rsi_score + macd_score) / 2
+    return (rsi_score + max(0, min(1, macd_score))) / 2
 
 def analyze_orderbook_dynamics(orderbook):
     """Аналіз динаміки стакану"""
-    bids = orderbook['bids'][:20]
-    asks = orderbook['asks'][:20]
+    bids = orderbook['bids'][:20] if len(orderbook['bids']) >= 20 else orderbook['bids']
+    asks = orderbook['asks'][:20] if len(orderbook['asks']) >= 20 else orderbook['asks']
     
-    bid_volume = sum(amount for _, amount in bids)
-    ask_volume = sum(amount for _, amount in asks)
+    bid_volume = sum(amount for _, amount in bids) if bids else 1
+    ask_volume = sum(amount for _, amount in asks) if asks else 1
     
     imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
     return 0.5 + imbalance / 2
 
 def analyze_trade_flow(trades):
     """Аналіз потоку торгів"""
-    if not trades:
+    if not trades or len(trades) == 0:
         return 0.5
         
-    buy_volume = sum(t['amount'] for t in trades if t['side'] == 'buy')
-    sell_volume = sum(t['amount'] for t in trades if t['side'] == 'sell')
+    buy_volume = sum(t['amount'] for t in trades if t.get('side') == 'buy')
+    sell_volume = sum(t['amount'] for t in trades if t.get('side') == 'sell')
     
     total_volume = buy_volume + sell_volume
     if total_volume == 0:
@@ -360,13 +387,11 @@ def analyze_trade_flow(trades):
     return 0.5 + flow / 2
 
 # -------------------------
-# КВАНТОВИЙ ТРЕЙДИНГ (ОСНОВНА ФУНКЦІЯ)
+# КВАНТОВИЙ ТРЕЙДИНГ
 # -------------------------
 
 def quantum_trading_engine():
-    """
-    Основний двигун квантового трейдингу - комбінує всі методи
-    """
+    """Основний двигун квантового трейдингу"""
     symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 
                'XRP/USDT:USDT', 'ADA/USDT:USDT', 'DOT/USDT:USDT']
     
@@ -374,14 +399,14 @@ def quantum_trading_engine():
     
     for symbol in symbols:
         try:
-            # Запускаємо всі аналізи паралельно
+            # Запускаємо всі аналізи
             quantum_signal = quantum_memory_analysis(symbol)
             temporal_signal = detect_temporal_anomalies(symbol)
             dark_pool_signal = detect_dark_pool_activity(symbol)
             vortex_signal = analyze_liquidity_vortex(symbol)
             neural_signal = neural_market_sentiment(symbol)
             
-            # Комбінуємо сигнали з вагами
+            # Комбінуємо сигнали
             signals = [s for s in [quantum_signal, temporal_signal, dark_pool_signal, 
                                   vortex_signal, neural_signal] if s is not None]
             
@@ -405,7 +430,7 @@ def quantum_trading_engine():
     return sorted(all_signals, key=lambda x: abs(x['composite_score']), reverse=True)
 
 def calculate_composite_score(signals):
-    """Розрахунок комбінованого скору з різних методів"""
+    """Розрахунок комбінованого скору"""
     total_score = 0
     weights = {
         'quantum': 0.25,
@@ -428,7 +453,7 @@ def calculate_composite_score(signals):
         elif 'neural_score' in signal:
             total_score += (signal['neural_score'] - 0.5) * 2 * weights['neural']
     
-    return np.tanh(total_score)  # Нормалізація до [-1, 1]
+    return np.tanh(total_score)
 
 # -------------------------
 # ВИКОНАННЯ ТОРГІВЛІ
@@ -442,52 +467,49 @@ def execute_quantum_trade(signal):
     try:
         symbol = signal['symbol']
         action = signal['action']
-        confidence = signal['confidence']
+        confidence = signal['confidence'] / 100  # Конвертуємо у десятковий формат
         
-        if confidence < 85:  # Мінімум 85% впевненості
+        if not safety_check(symbol, TRADE_AMOUNT_USD, confidence):
             return False
         
-        # Розмір позиції на основі впевненості
-        size_multiplier = min(1.0, confidence / 100)
-        amount_usd = TRADE_AMOUNT_USD * size_multiplier
-        
-        ticker = gate.fetch_ticker(symbol)
-        price = ticker['last']
-        amount = amount_usd / price
-        
-        if action == 'BUY':
-            order = gate.create_market_buy_order(symbol, amount)
-            print(f"{datetime.now()} | ✅ QUANTUM BUY: {amount:.6f} {symbol}")
+        if DEMO_MODE:
+            # Симуляція торгівлі
+            msg = f"📊 ДЕМО УГОДА: {action} {symbol}\n"
+            msg += f"Впевненість: {signal['confidence']:.1f}%\n"
+            msg += f"Розмір: {TRADE_AMOUNT_USD:.2f} USDT\n"
+            msg += f"Час: {datetime.now().strftime('%H:%M:%S')}"
+            
+            bot.send_message(CHAT_ID, msg)
+            print(f"{datetime.now()} | 📊 DEMO: {action} {symbol}")
+            return True
         else:
-            order = gate.create_market_sell_order(symbol, amount)
-            print(f"{datetime.now()} | ✅ QUANTUM SELL: {amount:.6f} {symbol}")
-        
-        # Детальне повідомлення
-        msg = f"⚛️ КВАНТОВИЙ СИГНАЛ! {symbol}\n"
-        msg += f"Дія: {action}\n"
-        msg += f"Впевненість: {confidence:.1f}%\n"
-        msg += f"Розмір: {amount_usd:.2f} USDT\n"
-        msg += f"Ціна: {price:.6f}\n"
-        msg += f"Час: {datetime.now().strftime('%H:%M:%S')}\n"
-        msg += f"---\nКомпоненти:\n"
-        
-        for s in signal['signals']:
-            if 'quantum_score' in s:
-                msg += f"• Квант: {s['quantum_score']:.3f}\n"
-            elif 'composite_score' in s:
-                msg += f"• Аномалія: {s['composite_score']:.3f}\n"
-            elif 'dark_pool_score' in s:
-                msg += f"• Dark Pool: {s['dark_pool_score']:.3f}\n"
-            elif 'vortex_strength' in s:
-                msg += f"• Вихор: {s['vortex_strength']:.3f}\n"
-            elif 'neural_score' in s:
-                msg += f"• Нейромережа: {s['neural_score']:.3f}\n"
-        
-        bot.send_message(CHAT_ID, msg)
-        return True
-        
+            # Реальна торгівля
+            size_multiplier = min(1.0, confidence)
+            amount_usd = TRADE_AMOUNT_USD * size_multiplier
+            
+            ticker = gate.fetch_ticker(symbol)
+            price = ticker['last']
+            amount = amount_usd / price
+            
+            if action == 'BUY':
+                order = gate.create_market_buy_order(symbol, amount)
+                print(f"{datetime.now()} | ✅ QUANTUM BUY: {amount:.6f} {symbol}")
+            else:
+                order = gate.create_market_sell_order(symbol, amount)
+                print(f"{datetime.now()} | ✅ QUANTUM SELL: {amount:.6f} {symbol}")
+            
+            # Детальне повідомлення
+            msg = f"⚛️ КВАНТОВИЙ СИГНАЛ! {symbol}\n"
+            msg += f"Дія: {action}\n"
+            msg += f"Впевненість: {signal['confidence']:.1f}%\n"
+            msg += f"Розмір: {amount_usd:.2f} USDT\n"
+            msg += f"Ціна: {price:.6f}"
+            
+            bot.send_message(CHAT_ID, msg)
+            return True
+            
     except Exception as e:
-        error_msg = f"❌ Помилка квантової торгівлі: {e}"
+        error_msg = f"❌ Помилка торгівлі: {e}"
         print(f"{datetime.now()} | {error_msg}")
         bot.send_message(CHAT_ID, error_msg)
         return False
@@ -498,13 +520,20 @@ def execute_quantum_trade(signal):
 
 def start_quantum_trading():
     """Основний цикл квантового трейдингу"""
-    bot.send_message(CHAT_ID, "⚛️ Запуск КВАНТОВОГО ТРЕЙДИНГУ...")
-    bot.send_message(CHAT_ID, "🔭 Сканування часових аномалій...")
-    bot.send_message(CHAT_ID, "🌌 Моніторинг темних пулів...")
-    bot.send_message(CHAT_ID, "🌀 Аналіз вихорів ліквідності...")
+    mode = "ДЕМО-РЕЖИМ" if DEMO_MODE else "РЕАЛЬНИЙ РЕЖИМ"
+    bot.send_message(CHAT_ID, f"⚛️ Запуск КВАНТОВОГО ТРЕЙДИНГУ ({mode})...")
+    
+    last_trade_time = datetime.now() - timedelta(seconds=SAFETY_MECHANISMS['cooldown_period'])
     
     while True:
         try:
+            current_time = datetime.now()
+            
+            # Перевірка часу між угодами
+            if (current_time - last_trade_time).seconds < SAFETY_MECHANISMS['cooldown_period']:
+                time.sleep(1)
+                continue
+            
             print(f"{datetime.now()} | ⚛️ Запуск квантового аналізу...")
             
             # Знаходимо квантові сигнали
@@ -516,8 +545,9 @@ def start_quantum_trading():
                 
                 # Виконуємо торгівлю
                 if best_signal['confidence'] > 90:
-                    execute_quantum_trade(best_signal)
-                    time.sleep(10)  # Пауза між угодами
+                    if execute_quantum_trade(best_signal):
+                        last_trade_time = datetime.now()
+                        time.sleep(SAFETY_MECHANISMS['cooldown_period'])
             
             time.sleep(CHECK_INTERVAL)
             
@@ -526,8 +556,20 @@ def start_quantum_trading():
             time.sleep(60)
 
 # -------------------------
-# УНІКАЛЬНІ TELEGRAM КОМАНДИ
+# TELEGRAM КОМАНДИ
 # -------------------------
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    """Команда старту"""
+    mode = "ДЕМО-РЕЖИМ" if DEMO_MODE else "РЕАЛЬНИЙ РЕЖИМ"
+    bot.reply_to(message, f"🤖 КВАНТОВИЙ ТРЕЙДИНГ-БОТ ({mode})\n\n"
+                         "Доступні команди:\n"
+                         "/quantum_scan - Миттєвий аналіз\n"
+                         "/dark_pool_check - Активність темних пулів\n"
+                         "/vortex_analysis - Аналіз ліквідності\n"
+                         "/mode - Змінити режим роботи\n"
+                         "/status - Статус системи")
 
 @bot.message_handler(commands=['quantum_scan'])
 def quantum_scan(message):
@@ -540,7 +582,7 @@ def quantum_scan(message):
         return
     
     msg = "⚛️ РЕЗУЛЬТАТИ КВАНТОВОГО СКАНУ:\n\n"
-    for i, signal in enumerate(signals[:5]):  # Топ-5 сигналів
+    for i, signal in enumerate(signals[:3]):
         msg += f"{i+1}. {signal['symbol']} - {signal['action']}\n"
         msg += f"   Впевненість: {signal['confidence']:.1f}%\n"
         msg += f"   Скор: {signal['composite_score']:.3f}\n\n"
@@ -568,49 +610,49 @@ def dark_pool_check(message):
 def vortex_analysis(message):
     """Аналіз вихорів ліквідності"""
     symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
-    msg = "🌀 АНАЛІЗ ВИХОРІВ ЛІКВІДНОСТІ:\n\n"
+    msg = "🌀 АНАЛІЗ ЛІКВІДНОСТІ:\n\n"
     
     for symbol in symbols:
         signal = analyze_liquidity_vortex(symbol)
         if signal:
             msg += f"{symbol}:\n"
-            msg += f"• Сила вихору: {signal['vortex_strength']:.3f}\n"
+            msg += f"• Сила: {signal['vortex_strength']:.3f}\n"
             msg += f"• Напрямок: {signal['direction']}\n"
             msg += f"• Впевненість: {signal['forecast_confidence']:.1f}%\n\n"
     
     bot.reply_to(message, msg)
 
-@bot.message_handler(commands=['temporal_anomalies'])
-def temporal_anomalies_cmd(message):
-    """Пошук часових аномалій"""
-    symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
-    msg = "⏰ ЧАСОВІ АНОМАЛІЇ:\n\n"
-    
-    for symbol in symbols:
-        signal = detect_temporal_anomalies(symbol)
-        if signal:
-            msg += f"{symbol}:\n"
-            msg += f"• Скор: {signal['composite_score']:.3f}\n"
-            msg += f"• Сигнал: {signal['signal']}\n"
-            msg += f"• Аномалій: {len(signal['anomalies'])}\n\n"
-    
-    bot.reply_to(message, msg)
+@bot.message_handler(commands=['mode'])
+def change_mode(message):
+    """Зміна режиму роботи"""
+    global DEMO_MODE
+    DEMO_MODE = not DEMO_MODE
+    mode = "ДЕМО-РЕЖИМ" if DEMO_MODE else "РЕАЛЬНИЙ РЕЖИМ"
+    bot.reply_to(message, f"🔁 Режим змінено на: {mode}")
 
-@bot.message_handler(commands=['neural_sentiment'])
-def neural_sentiment_cmd(message):
-    """Нейромережевий аналіз настроїв"""
-    symbols = ['BTC/USDT:USDT', 'ETH/USDT:USDT']
-    msg = "🧠 НЕЙРОМЕРЕЖЕВІ НАСТРОЇ:\n\n"
-    
-    for symbol in symbols:
-        signal = neural_market_sentiment(symbol)
-        if signal:
-            msg += f"{symbol}:\n"
-            msg += f"• Скор: {signal['neural_score']:.3f}\n"
-            msg += f"• Сигнал: {signal['signal']}\n"
-            msg += f"• Впевненість: {signal['confidence']:.1f}%\n\n"
-    
-    bot.reply_to(message, msg)
+@bot.message_handler(commands=['status'])
+def send_status(message):
+    """Статус системи"""
+    try:
+        status_msg = f"⚡ СТАТУС СИСТЕМИ:\n\n"
+        status_msg += f"• Режим: {'ДЕМО' if DEMO_MODE else 'РЕАЛЬНИЙ'}\n"
+        status_msg += f"• Інтервал: {CHECK_INTERVAL}с\n"
+        status_msg += f"• Розмір угоди: {TRADE_AMOUNT_USD} USDT\n"
+        
+        if gate:
+            try:
+                balance = gate.fetch_balance()
+                usdt_balance = balance['total'].get('USDT', 0)
+                status_msg += f"• Баланс: {usdt_balance:.2f} USDT\n"
+            except:
+                status_msg += "• Баланс: Недоступний\n"
+        
+        status_msg += f"• Чорний список: {len(SAFETY_MECHANISMS['symbol_blacklist'])} токенів\n"
+        status_msg += f"• Мін. впевненість: {SAFETY_MECHANISMS['min_confidence']*100}%"
+        
+        bot.reply_to(message, status_msg)
+    except Exception as e:
+        bot.reply_to(message, f"❌ Помилка: {e}")
 
 # -------------------------
 # WEBHOOK ТА ЗАПУСК
@@ -634,12 +676,18 @@ def setup_webhook():
 
 if __name__ == "__main__":
     print(f"{datetime.now()} | ⚛️ Запуск КВАНТОВОГО ТРЕЙДИНГ-БОТА...")
+    print(f"Режим: {'ДЕМО' if DEMO_MODE else 'РЕАЛЬНИЙ'}")
     
     # Перевірка обов'язкових ключів
-    required_keys = [API_KEY_TELEGRAM, CHAT_ID, GATE_API_KEY, GATE_API_SECRET]
+    required_keys = [API_KEY_TELEGRAM, CHAT_ID]
     if not all(required_keys):
         print(f"{datetime.now()} | ❌ Відсутні обов'язкові API ключі!")
         exit(1)
+    
+    if not DEMO_MODE and (not GATE_API_KEY or not GATE_API_SECRET):
+        print(f"{datetime.now()} | ❌ Відсутні ключі Gate.io для реального режиму!")
+        print("Переходжу в демо-режим...")
+        DEMO_MODE = True
     
     setup_webhook()
     threading.Thread(target=start_quantum_trading, daemon=True).start()
