@@ -18,8 +18,9 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 GATE_API_KEY = "cf99af3f8c0c1a711408f1a1970be8be"
 GATE_API_SECRET = "4bd0a51eac2133386e60f4c5e1a78ea9c364e542399bc1865e679f509e93f72e"
 
-SPREAD_THRESHOLD = 2.0     # спред ≥ 2%
-CHECK_INTERVAL = 10         # інтервал перевірки
+TRADE_AMOUNT_USD = 5         # малий обсяг
+SPREAD_THRESHOLD = 2.0       # мінімальний спред %
+CHECK_INTERVAL = 10          # інтервал перевірки
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
@@ -27,13 +28,10 @@ app = Flask(__name__)
 gate = ccxt.gateio({
     "apiKey": GATE_API_KEY,
     "secret": GATE_API_SECRET,
-    "options": {"defaultType": "swap"}  # ф'ючерси USDT
+    "options": {"defaultType": "swap"}  # futures (USDT-margined)
 })
 
-# -------------------------
-# Тримати активні позиції, щоб не дублювати
-# -------------------------
-active_positions = {}  # ключ = символ, значення = "BUY" або "SELL"
+active_positions = {}  # ключ = символ, значення = "BUY"/"SELL"
 
 # -------------------------
 # Перевірка чи пара існує на Gate Futures
@@ -44,11 +42,11 @@ def is_pair_available(symbol):
         markets = gate.load_markets()
         return pair in markets
     except Exception as e:
-        print(f"{datetime.now()} | Помилка завантаження ринків:", e)
+        print(f"{datetime.now()} | ❌ Помилка завантаження ринків:", e)
         return False
 
 # -------------------------
-# Отримання топ токенів з Dexscreener
+# Отримання токенів з Dexscreener (Ethereum)
 # -------------------------
 def get_top_tokens(limit=10):
     try:
@@ -56,12 +54,14 @@ def get_top_tokens(limit=10):
         data = resp.json()
         tokens = []
         for pair in data.get("pairs", [])[:limit]:
-            symbol = pair["baseToken"]["symbol"] + "/USDT"
-            dex_price = float(pair["priceUsd"])
-            tokens.append((symbol, dex_price))
+            base = pair.get("baseToken", {})
+            if "symbol" in base and "priceUsd" in pair:
+                symbol = base["symbol"].upper() + "/USDT"
+                dex_price = float(pair["priceUsd"])
+                tokens.append((symbol, dex_price))
         return tokens
     except Exception as e:
-        print(f"{datetime.now()} | Помилка отримання топ токенів:", e)
+        print(f"{datetime.now()} | ❌ Помилка отримання топ токенів:", e)
         return []
 
 # -------------------------
@@ -70,12 +70,20 @@ def get_top_tokens(limit=10):
 def open_gate_position(symbol, side):
     pair = symbol.replace("/", "/USDT:USDT")
     if not is_pair_available(symbol):
-        print(f"{datetime.now()} | Пара {pair} відсутня на Gate Futures, пропускаємо")
+        print(f"{datetime.now()} | ⚠️ Пара {pair} відсутня на Gate Futures, пропускаємо")
         return None, None
     if symbol in active_positions:
-        print(f"{datetime.now()} | Позиція по {symbol} вже відкрита, пропускаємо")
+        print(f"{datetime.now()} | ⚠️ Позиція по {symbol} вже відкрита, пропускаємо")
         return None, None
+
     try:
+        # перевірка балансу
+        balance = gate.fetch_balance()
+        usdt_available = balance['total'].get('USDT', 0)
+        if usdt_available < TRADE_AMOUNT_USD:
+            print(f"{datetime.now()} | ❌ Недостатньо USDT для торгівлі ({usdt_available})")
+            return None, None
+
         ticker = gate.fetch_ticker(pair)
         gate_price = ticker['last']
         amount = TRADE_AMOUNT_USD / gate_price
@@ -87,10 +95,12 @@ def open_gate_position(symbol, side):
             amount=amount
         )
         active_positions[symbol] = side
-        bot.send_message(CHAT_ID, f"{datetime.now()} | ✅ Відкрито {side} {amount:.4f} {symbol} за Gate ціною {gate_price:.4f}")
+        msg = f"✅ Відкрито {side} {amount:.4f} {symbol}\nЦіна Gate: {gate_price:.4f}"
+        print(f"{datetime.now()} | {msg}")
+        bot.send_message(CHAT_ID, msg)
         return amount, gate_price
     except Exception as e:
-        print(f"{datetime.now()} | Помилка відкриття позиції:", e)
+        print(f"{datetime.now()} | ❌ Помилка відкриття позиції:", e)
         return None, None
 
 # -------------------------
@@ -99,7 +109,7 @@ def open_gate_position(symbol, side):
 def close_gate_position(symbol, side, amount, dex_price):
     pair = symbol.replace("/", "/USDT:USDT")
     if not is_pair_available(symbol):
-        print(f"{datetime.now()} | Пара {pair} відсутня на Gate Futures, не можемо закрити")
+        print(f"{datetime.now()} | ⚠️ Пара {pair} відсутня на Gate Futures, не можемо закрити")
         return
     try:
         close_side = "SELL" if side == "BUY" else "BUY"
@@ -111,11 +121,13 @@ def close_gate_position(symbol, side, amount, dex_price):
             price=dex_price,
             params={"reduceOnly": True}
         )
-        bot.send_message(CHAT_ID, f"{datetime.now()} | 🎯 Лімітний ордер на закриття {close_side} {amount:.4f} {symbol} за DEX ціною {dex_price:.4f}")
+        msg = f"🎯 Лімітний ордер {close_side} {amount:.4f} {symbol}\nЦіна DEX: {dex_price:.4f}"
+        print(f"{datetime.now()} | {msg}")
+        bot.send_message(CHAT_ID, msg)
         if symbol in active_positions:
-            del active_positions[symbol]  # видаляємо позицію зі списку активних
+            del active_positions[symbol]
     except Exception as e:
-        print(f"{datetime.now()} | Помилка закриття позиції:", e)
+        print(f"{datetime.now()} | ❌ Помилка закриття позиції:", e)
 
 # -------------------------
 # Арбітраж по одному токені
@@ -130,7 +142,8 @@ def arbitrage(symbol, dex_price):
         gate_price = gate_ticker['last']
         spread = (dex_price - gate_price) / gate_price * 100
 
-        print(f"{datetime.now()} | {symbol} | DEX: {dex_price:.4f} | Gate: {gate_price:.4f} | Spread: {spread:.2f}%")
+        log = f"{symbol} | DEX: {dex_price:.4f} | Gate: {gate_price:.4f} | Spread: {spread:.2f}%"
+        print(f"{datetime.now()} | {log}")
 
         if spread >= SPREAD_THRESHOLD:
             amount, _ = open_gate_position(symbol, "BUY")
@@ -141,7 +154,7 @@ def arbitrage(symbol, dex_price):
             if amount:
                 close_gate_position(symbol, "SELL", amount, dex_price)
     except Exception as e:
-        print(f"{datetime.now()} | Помилка арбітражу:", e)
+        print(f"{datetime.now()} | ❌ Помилка арбітражу:", e)
 
 # -------------------------
 # Основний цикл арбітражу
