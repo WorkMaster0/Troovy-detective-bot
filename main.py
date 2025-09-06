@@ -4,7 +4,6 @@ from flask import Flask, request
 from datetime import datetime
 import threading
 import time
-import os
 
 # -------------------------
 # Налаштування
@@ -17,10 +16,9 @@ N_CANDLES = 30
 FAST_EMA = 10
 SLOW_EMA = 30
 
-# !!! ТВОЯ СТАЦІОНАРНА HTTPS-АДРЕСА (ngrok / VPS / домен)
-# наприклад: https://yourdomain.com
-WEBHOOK_HOST = "https://yourdomain.com"  
-WEBHOOK_PATH = f"/{API_KEY_TELEGRAM}"
+# Твоя адреса Render
+WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
+WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
