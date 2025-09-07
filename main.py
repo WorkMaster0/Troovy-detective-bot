@@ -710,22 +710,24 @@ def check_market():
             
             usdt_pairs = [
                 d for d in data 
-                if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 5_000_000
+                if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 1_000_000  # Зменшимо мінімальний об'єм
             ]
             
+            # Сортуємо за об'ємом та зміною ціни
             sorted_symbols = sorted(
                 usdt_pairs,
-                key=lambda x: abs(float(x["priceChangePercent"])),
+                key=lambda x: (float(x["quoteVolume"]), abs(float(x["priceChangePercent"]))),
                 reverse=True
             )
             
-            top_symbols = [s["symbol"] for s in sorted_symbols[:25]]  # Зменшимо до 25 для швидкості
-            logger.info(f"Аналізуємо {len(top_symbols)} монет: {top_symbols[:3]}...")
+            # Беремо топ-100+ монет
+            top_symbols = [s["symbol"] for s in sorted_symbols[:120]]  # 120 монет
+            logger.info(f"Аналізуємо {len(top_symbols)} монет: {top_symbols[:5]}...")
             
             signals_found = 0
             
             # 1. Перевірка основних сигналів (breakout, pre-top)
-            for symbol in top_symbols:
+            for i, symbol in enumerate(top_symbols):
                 try:
                     signal_data = analyze_symbol(symbol)
                     
@@ -740,22 +742,78 @@ def check_market():
                         if send_signal_message(symbol, best_signal):
                             signals_found += 1
                             logger.info(f"Знайдено сигнал: {symbol} {best_signal['type']}")
-                            
-                    time.sleep(0.3)  # Затримка між монетами
                     
+                    # Затримка тільки кожні 10 монет, щоб прискорити
+                    if i % 10 == 0:
+                        time.sleep(0.2)
+                        
                 except Exception as e:
                     logger.error(f"Помилка обробки {symbol}: {e}")
                     continue
             
             # 2. ПЕРЕВІРКА ЗОЛОТИХ ХРЕСТІВ - кожні 15 хвилин
             if check_counter % 3 == 0:  # 3 * 5хв = 15хв
-                logger.info("=== ПЕРЕВІРКА ЗОЛОТИХ ХРЕСТІВ ===")
-                crosses = find_golden_crosses()
+                logger.info("=== ПЕРЕВІРКА ЗОЛОТИХ ХРЕСТІВ (топ-50) ===")
+                
+                # Для хрестів беремо топ-50 за об'ємом
+                top_50_symbols = [s["symbol"] for s in sorted_symbols[:50]]
+                crosses = []
+                
+                for symbol in top_50_symbols:
+                    try:
+                        df = get_klines(symbol, interval="1h", limit=100)
+                        if not df or len(df["c"]) < 50:
+                            continue
+                        
+                        closes = np.array(df["c"], dtype=float)
+                        
+                        # Розраховуємо EMA20 та EMA50
+                        ema20 = calculate_ema(closes, 20)
+                        ema50 = calculate_ema(closes, 50)
+                        
+                        if ema20 is None or ema50 is None:
+                            continue
+                        
+                        # Для порівняння потрібні попередні значення
+                        df_prev = get_klines(symbol, interval="1h", limit=101)
+                        if not df_prev or len(df_prev["c"]) < 51:
+                            continue
+                        
+                        closes_prev = np.array(df_prev["c"], dtype=float)
+                        ema20_prev = calculate_ema(closes_prev[:-1], 20)  # Попереднє значення
+                        ema50_prev = calculate_ema(closes_prev[:-1], 50)  # Попереднє значення
+                        
+                        if ema20_prev is None or ema50_prev is None:
+                            continue
+                        
+                        # Перевірка золотого хреста
+                        golden_cross = ema20_prev <= ema50_prev and ema20 > ema50
+                        
+                        # Перевірка смертельного хреста
+                        death_cross = ema20_prev >= ema50_prev and ema20 < ema50
+                        
+                        if golden_cross or death_cross:
+                            crossover_strength = abs((ema20 - ema50) / ema50 * 100)
+                            
+                            crosses.append({
+                                "symbol": symbol,
+                                "type": "GOLDEN" if golden_cross else "DEATH",
+                                "ema20": ema20,
+                                "ema50": ema50,
+                                "price": closes[-1],
+                                "crossover_strength": crossover_strength,
+                                "timestamp": datetime.now()
+                            })
+                            logger.info(f"Знайдено хрест: {symbol} {crosses[-1]['type']}")
+                            
+                    except Exception as e:
+                        logger.error(f"Помилка аналізу хреста {symbol}: {e}")
+                        continue
                 
                 if crosses:
                     for cross in crosses:
-                        # Надсилаємо тільки сильні сигнали (>1%)
-                        if cross["crossover_strength"] > 1.0:
+                        # Надсилаємо тільки сильні сигнали (>0.5%)
+                        if cross["crossover_strength"] > 0.5:
                             emoji = "🟢" if cross["type"] == "GOLDEN" else "🔴"
                             msg = (
                                 f"{emoji} <b>{cross['symbol']}</b>\n"
@@ -772,10 +830,17 @@ def check_market():
             
             # 3. ПЕРЕВІРКА ВОЛАТИЛЬНОСТІ - кожні 20 хвилин
             if check_counter % 4 == 0:  # 4 * 5хв = 20хв
-                logger.info("=== ПЕРЕВІРКА ВОЛАТИЛЬНОСТІ ===")
+                logger.info("=== ПЕРЕВІРКА ВОЛАТИЛЬНОСТІ (топ-30) ===")
                 volatility_signals = []
                 
-                for symbol in top_symbols[:10]:  # Перевіряємо тільки топ-10
+                # Для волатильності беремо топ-30 найактивніших
+                top_30_symbols = [s["symbol"] for s in sorted(
+                    usdt_pairs, 
+                    key=lambda x: abs(float(x["priceChangePercent"])), 
+                    reverse=True
+                )[:30]]
+                
+                for symbol in top_30_symbols:
                     try:
                         prediction = predict_volatility_spikes(symbol)
                         if prediction and prediction["volatility_spike_predicted"]:
@@ -783,10 +848,12 @@ def check_market():
                             logger.info(f"Знайдено волатильність: {symbol}")
                     except Exception as e:
                         logger.error(f"Помилка волатильності {symbol}: {e}")
-                    time.sleep(0.2)
                 
                 if volatility_signals:
-                    for signal in volatility_signals[:3]:  # Макс 3 сигнали
+                    # Сортуємо за силою волатильності
+                    volatility_signals.sort(key=lambda x: x["volatility_ratio"], reverse=True)
+                    
+                    for signal in volatility_signals[:3]:  # Макс 3 найсильніші сигнали
                         msg = (
                             f"⚡ <b>{signal['symbol']}</b> - сплеск волатильності!\n"
                             f"💰 Ціна: {signal['price']:.4f}\n"
@@ -797,7 +864,7 @@ def check_market():
                         
                         bot.send_message(CHAT_ID, msg, parse_mode="HTML")
             
-            logger.info(f"Цикл {check_counter} завершено. Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
+            logger.info(f"Цикл {check_counter} завершено. Аналіз {len(top_symbols)} монет, знайдено {signals_found} сигналів. Очікування 5 хвилин...")
             time.sleep(300)  # 5 хвилин
             
         except Exception as e:
