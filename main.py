@@ -314,111 +314,6 @@ def status_handler(message):
     )
     bot.send_message(message.chat.id, status_text, parse_mode="HTML")
 
-# -------------------------
-# Основна логіка
-# -------------------------
-def check_market():
-    """Постійна перевірка ринку"""
-    logger.info("Запуск Smart Auto перевірки ринку...")
-    
-    while True:
-        try:
-            url = "https://api.binance.com/api/v3/ticker/24hr"
-            data = requests.get(url, timeout=10).json()
-            
-            usdt_pairs = [
-                d for d in data 
-                if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 5_000_000
-            ]
-            
-            sorted_symbols = sorted(
-                usdt_pairs,
-                key=lambda x: abs(float(x["priceChangePercent"])),
-                reverse=True
-            )
-            
-            top_symbols = [s["symbol"] for s in sorted_symbols[:30]]
-            logger.info(f"Аналізуємо {len(top_symbols)} монет")
-            
-            signals_found = 0
-            
-            for symbol in top_symbols:
-                try:
-                    signal_data = analyze_symbol(symbol)
-                    
-                    if signal_data:
-                        best_signal = max(signal_data, key=lambda x: abs(x["diff_pct"]))
-                        
-                        df = get_klines(symbol, interval="1h", limit=2)
-                        if df and len(df["c"]) > 0:
-                            best_signal["current_price"] = df["c"][-1]
-                        
-                        if send_signal_message(symbol, best_signal):
-                            signals_found += 1
-                            
-                    time.sleep(0.5)
-                    
-                except Exception as e:
-                    logger.error(f"Помилка обробки {symbol}: {e}")
-                    continue
-            
-            logger.info(f"Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
-            time.sleep(300)
-            
-        except Exception as e:
-            logger.error(f"Критична помилка: {e}")
-            time.sleep(60)
-
-# -------------------------
-# Flask та Webhook
-# -------------------------
-@app.route(WEBHOOK_PATH, methods=['POST'])
-def webhook():
-    try:
-        json_str = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_str)
-        bot.process_new_updates([update])
-    except Exception as e:
-        logger.error(f"Помилка webhook: {e}")
-    return 'OK', 200
-
-@app.route('/')
-def home():
-    return 'Smart Auto Bot is running!', 200
-
-@app.route('/status')
-def web_status():
-    return {
-        'status': 'active',
-        'last_signals': len(last_signals),
-        'timestamp': datetime.now().isoformat()
-    }, 200
-
-def setup_webhook():
-    try:
-        url = f'https://api.telegram.org/bot{API_KEY_TELEGRAM}/setWebhook'
-        response = requests.post(url, data={'url': WEBHOOK_URL}, timeout=10)
-        logger.info(f'Webhook setup: {response.json()}')
-    except Exception as e:
-        logger.error(f'Помилка налаштування webhook: {e}')
-
-# -------------------------
-# Запуск
-# -------------------------
-if __name__ == '__main__':
-    logger.info('Запуск Smart Auto Bot...')
-    
-    setup_webhook()
-    
-    market_thread = threading.Thread(target=check_market, daemon=True)
-    market_thread.start()
-    logger.info('Потік перевірки ринку запущено')
-    
-    try:
-        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
-    except Exception as e:
-        logger.error(f'Помилка запуску Flask: {e}')
-
 # ==================== НОВІ КОМАНДИ ====================
 @bot.message_handler(commands=['whale_activity'])
 def whale_activity_handler(message):
@@ -680,3 +575,108 @@ def smart_money_handler(message):
         
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
+# -------------------------
+# Основна логіка
+# -------------------------
+def check_market():
+    """Постійна перевірка ринку"""
+    logger.info("Запуск Smart Auto перевірки ринку...")
+    
+    while True:
+        try:
+            url = "https://api.binance.com/api/v3/ticker/24hr"
+            data = requests.get(url, timeout=10).json()
+            
+            usdt_pairs = [
+                d for d in data 
+                if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 5_000_000
+            ]
+            
+            sorted_symbols = sorted(
+                usdt_pairs,
+                key=lambda x: abs(float(x["priceChangePercent"])),
+                reverse=True
+            )
+            
+            top_symbols = [s["symbol"] for s in sorted_symbols[:30]]
+            logger.info(f"Аналізуємо {len(top_symbols)} монет")
+            
+            signals_found = 0
+            
+            for symbol in top_symbols:
+                try:
+                    signal_data = analyze_symbol(symbol)
+                    
+                    if signal_data:
+                        best_signal = max(signal_data, key=lambda x: abs(x["diff_pct"]))
+                        
+                        df = get_klines(symbol, interval="1h", limit=2)
+                        if df and len(df["c"]) > 0:
+                            best_signal["current_price"] = df["c"][-1]
+                        
+                        if send_signal_message(symbol, best_signal):
+                            signals_found += 1
+                            
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    logger.error(f"Помилка обробки {symbol}: {e}")
+                    continue
+            
+            logger.info(f"Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
+            time.sleep(300)
+            
+        except Exception as e:
+            logger.error(f"Критична помилка: {e}")
+            time.sleep(60)
+
+# -------------------------
+# Flask та Webhook
+# -------------------------
+@app.route(WEBHOOK_PATH, methods=['POST'])
+def webhook():
+    try:
+        json_str = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+    except Exception as e:
+        logger.error(f"Помилка webhook: {e}")
+    return 'OK', 200
+
+@app.route('/')
+def home():
+    return 'Smart Auto Bot is running!', 200
+
+@app.route('/status')
+def web_status():
+    return {
+        'status': 'active',
+        'last_signals': len(last_signals),
+        'timestamp': datetime.now().isoformat()
+    }, 200
+
+def setup_webhook():
+    try:
+        url = f'https://api.telegram.org/bot{API_KEY_TELEGRAM}/setWebhook'
+        response = requests.post(url, data={'url': WEBHOOK_URL}, timeout=10)
+        logger.info(f'Webhook setup: {response.json()}')
+    except Exception as e:
+        logger.error(f'Помилка налаштування webhook: {e}')
+
+# -------------------------
+# Запуск
+# -------------------------
+if __name__ == '__main__':
+    logger.info('Запуск Smart Auto Bot...')
+    
+    setup_webhook()
+    
+    market_thread = threading.Thread(target=check_market, daemon=True)
+    market_thread.start()
+    logger.info('Потік перевірки ринку запущено')
+    
+    try:
+        app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    except Exception as e:
+        logger.error(f'Помилка запуску Flask: {e}')
