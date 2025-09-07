@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import os
 import logging
+from scipy.signal import argrelextrema
 
 # Налаштування логування
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,230 +20,258 @@ logger = logging.getLogger(__name__)
 # -------------------------
 API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
 CHAT_ID = "6053907025"
-TIMEFRAMES = ["15m", "1h", "4h"]
-N_CANDLES = 50  # Зменшено для швидшої обробки
-FAST_EMA = 12
-SLOW_EMA = 26
-RSI_PERIOD = 14
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-
-# Додаткові налаштування
-MIN_VOLUME = 2_000_000  # Зменшено для більше монет
-MIN_PRICE_CHANGE = 1.5  # Зменшено
-MIN_CONFIDENCE_FOR_SIGNAL = 0.55  # Зменшено для тесту
-MIN_CONFIDENCE_FOR_HISTORY = 0.5
-
 WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
-
-BINANCE_API_URLS = [
-    "https://api.binance.com",
-    "https://api1.binance.com"
-]
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
 last_signals = {}
-last_status = {}
-performance_stats = {}
 signal_history = []
 
-SIGNALS_HISTORY_FILE = "signals_history.json"
-data_cache = {}
-CACHE_DURATION = 30
-
 # -------------------------
-# Спрощені функції
+# Допоміжні функції
 # -------------------------
-def load_signals_history():
-    global signal_history
-    try:
-        if os.path.exists(SIGNALS_HISTORY_FILE):
-            with open(SIGNALS_HISTORY_FILE, "r") as f:
-                signal_history = json.load(f)
-    except Exception as e:
-        logger.error(f"Помилка завантаження історії: {e}")
-
-def save_signals_history():
-    try:
-        with open(SIGNALS_HISTORY_FILE, "w") as f:
-            json.dump(signal_history, f, indent=2)
-    except Exception as e:
-        logger.error(f"Помилка збереження історії: {e}")
-
-def get_top_symbols():
-    try:
-        url = "https://api.binance.com/api/v3/ticker/24hr"
-        data = requests.get(url, timeout=10).json()
-        usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
-        
-        filtered_pairs = [
-            x for x in usdt_pairs 
-            if float(x["quoteVolume"]) >= MIN_VOLUME
-        ]
-        
-        sorted_pairs = sorted(filtered_pairs, key=lambda x: float(x["quoteVolume"]), reverse=True)
-        return [x["symbol"] for x in sorted_pairs[:10]]  # Тільки 10 монет
-    except Exception as e:
-        logger.error(f"Помилка отримання топ монет: {e}")
-        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-
-def get_historical_data(symbol, interval, limit=50):
-    cache_key = f"{symbol}_{interval}"
-    current_time = time.time()
-    
-    if cache_key in data_cache:
-        data, timestamp = data_cache[cache_key]
-        if current_time - timestamp < CACHE_DURATION:
-            return data
-    
+def get_klines(symbol, interval="1h", limit=200):
+    """Отримання даних з Binance"""
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         response = requests.get(url, timeout=10)
         data = response.json()
-        ohlc = []
-        for d in data:
-            ohlc.append({
-                "time": datetime.fromtimestamp(d[0] / 1000),
-                "open": float(d[1]),
-                "high": float(d[2]),
-                "low": float(d[3]),
-                "close": float(d[4]),
-                "volume": float(d[5])
-            })
         
-        data_cache[cache_key] = (ohlc, current_time)
-        return ohlc
+        # Конвертуємо в словник з окремими массивами
+        result = {
+            "t": [item[0] for item in data],  # timestamp
+            "o": [float(item[1]) for item in data],  # open
+            "h": [float(item[2]) for item in data],  # high
+            "l": [float(item[3]) for item in data],  # low
+            "c": [float(item[4]) for item in data],  # close
+            "v": [float(item[5]) for item in data]   # volume
+        }
+        return result
     except Exception as e:
         logger.error(f"Помилка отримання даних для {symbol}: {e}")
-        return []
-
-def calculate_ema(prices, period):
-    if len(prices) < period:
         return None
-    return prices[-1]  # Спрощено для тесту
 
-def calculate_rsi(prices, period):
-    if len(prices) < period + 1:
-        return 50  # Нейтральне значення
-    return 50  # Спрощено
+def find_support_resistance(prices, window=20, delta=0.005):
+    """Знаходження рівнів підтримки та опору"""
+    if len(prices) < window * 2:
+        return []
+    
+    # Знаходимо локальні максимуми та мінімуми
+    local_max = argrelextrema(prices, np.greater, order=window)[0]
+    local_min = argrelextrema(prices, np.less, order=window)[0]
+    
+    levels = []
+    
+    # Додаємо максимуми (опір)
+    for i in local_max:
+        levels.append(prices[i])
+    
+    # Додаємо мінімуми (підтримка)
+    for i in local_min:
+        levels.append(prices[i])
+    
+    # Фільтруємо дублікати та близькі рівні
+    levels = sorted(levels)
+    filtered_levels = []
+    
+    for level in levels:
+        if not filtered_levels:
+            filtered_levels.append(level)
+        else:
+            # Перевіряємо чи рівень не надто близький до попереднього
+            if abs(level - filtered_levels[-1]) / filtered_levels[-1] > delta:
+                filtered_levels.append(level)
+    
+    return filtered_levels
 
-def calculate_indicators(ohlc):
-    closes = [c["close"] for c in ohlc]
-    return {
-        "fast_ema": calculate_ema(closes, FAST_EMA),
-        "slow_ema": calculate_ema(closes, SLOW_EMA),
-        "rsi": calculate_rsi(closes, RSI_PERIOD),
-        "macd_histogram": 0,  # Спрощено
-        "volume_ratio": 1.0
-    }
-
-def analyze_phase(ohlc):
-    if len(ohlc) < 10:
-        return "HOLD", 0, 0.1, {}, False
-    
-    indicators = calculate_indicators(ohlc)
-    current_price = ohlc[-1]["close"]
-    prev_price = ohlc[-2]["close"] if len(ohlc) >= 2 else current_price
-    
-    # Простий аналіз тренду
-    price_change = ((current_price - prev_price) / prev_price) * 100
-    
-    if price_change > 1.0:
-        return "BUY", abs(price_change), 0.6, indicators, True
-    elif price_change < -1.0:
-        return "SELL", abs(price_change), 0.6, indicators, True
-    else:
-        return "HOLD", 0, 0.1, indicators, False
-
-def send_signal(symbol, signal, price, volatility, confidence, indicators, timeframe_confirmation):
-    global last_signals
-    
-    if signal == "HOLD":
-        return
-        
-    current_time = datetime.now()
-    if symbol in last_signals:
-        last_time = last_signals[symbol]["time"]
-        if (current_time - last_time).total_seconds() < 3600:
-            return
-    
-    # Прості розрахунки TP/SL
-    if signal == "BUY":
-        tp = round(price * 1.02, 4)  # +2%
-        sl = round(price * 0.98, 4)  # -2%
-    else:
-        tp = round(price * 0.98, 4)  # -2%
-        sl = round(price * 1.02, 4)  # +2%
-    
-    signal_data = {
-        "symbol": symbol,
-        "signal": signal,
-        "price": price,
-        "tp": tp,
-        "sl": sl,
-        "confidence": confidence,
-        "time": current_time
-    }
-    
-    last_signals[symbol] = signal_data
-    
-    # Надсилання повідомлення
-    emoji = "🚀" if signal == "BUY" else "🔻"
-    msg = (
-        f"{emoji} *{symbol}* | {signal}\n"
-        f"💰 Ціна: `{price}`\n"
-        f"🎯 TP: `{tp}`\n"
-        f"🛑 SL: `{sl}`\n"
-        f"📈 Впевненість: {confidence*100:.1f}%\n"
-        f"⏰ {current_time.strftime('%H:%M:%S')}"
-    )
-    
+def analyze_symbol(symbol):
+    """Аналіз монети на основі S/R та pre-top"""
     try:
-        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
-        logger.info(f"Надіслано сигнал: {symbol} {signal}")
+        # Отримуємо дані для 1h та 4h таймфреймів
+        df_1h = get_klines(symbol, interval="1h", limit=200)
+        df_4h = get_klines(symbol, interval="4h", limit=100)
+        
+        if not df_1h or not df_4h or len(df_1h["c"]) < 50:
+            return None
+        
+        closes_1h = np.array(df_1h["c"], dtype=float)
+        closes_4h = np.array(df_4h["c"], dtype=float)
+        volumes_1h = np.array(df_1h["v"], dtype=float)
+        
+        # Знаходимо рівні S/R для обох таймфреймів
+        sr_levels_1h = find_support_resistance(closes_1h, window=15, delta=0.005)
+        sr_levels_4h = find_support_resistance(closes_4h, window=10, delta=0.005)
+        
+        # Об'єднуємо рівні з обох таймфреймів
+        all_sr_levels = sorted(set(sr_levels_1h + sr_levels_4h))
+        
+        last_price = closes_1h[-1]
+        signals = []
+        
+        # Аналіз пробоїв рівнів
+        for lvl in all_sr_levels:
+            diff = last_price - lvl
+            diff_pct = (diff / lvl) * 100
+            
+            # Перевірка пробою вверх (LONG)
+            if last_price > lvl * 1.01 and abs(diff_pct) < 50:  # Фільтр від сміття
+                signals.append({
+                    "type": "LONG",
+                    "level": lvl,
+                    "diff": diff,
+                    "diff_pct": diff_pct,
+                    "timeframe": "1h/4h"
+                })
+                break
+            
+            # Перевірка пробою вниз (SHORT)
+            elif last_price < lvl * 0.99 and abs(diff_pct) < 50:
+                signals.append({
+                    "type": "SHORT", 
+                    "level": lvl,
+                    "diff": diff,
+                    "diff_pct": diff_pct,
+                    "timeframe": "1h/4h"
+                })
+                break
+        
+        # Перевірка pre-top / pump сигналів
+        impulse_4h = (closes_4h[-1] - closes_4h[-4]) / closes_4h[-4] if len(closes_4h) >= 4 else 0
+        impulse_1h = (closes_1h[-1] - closes_1h[-6]) / closes_1h[-6] if len(closes_1h) >= 6 else 0
+        
+        vol_spike = volumes_1h[-1] > 2.0 * np.mean(volumes_1h[-20:]) if len(volumes_1h) >= 20 else False
+        
+        # Знаходимо найближчий опір зверху
+        nearest_resistance = min([lvl for lvl in all_sr_levels if lvl > last_price], default=None)
+        
+        if nearest_resistance and (impulse_4h > 0.08 or impulse_1h > 0.05) and vol_spike:
+            diff_to_res = nearest_resistance - last_price
+            diff_pct_to_res = (diff_to_res / last_price) * 100
+            
+            if diff_pct_to_res < 10:  # Не надто далеко від опору
+                signals.append({
+                    "type": "PRE_TOP",
+                    "level": nearest_resistance,
+                    "diff": diff_to_res,
+                    "diff_pct": diff_pct_to_res,
+                    "impulse": max(impulse_4h, impulse_1h),
+                    "timeframe": "1h/4h"
+                })
+        
+        return signals if signals else None
+        
     except Exception as e:
-        logger.error(f"Помилка відправки: {e}")
+        logger.error(f"Помилка аналізу {symbol}: {e}")
+        return None
+
+def send_signal_message(symbol, signal_data):
+    """Надсилання сигналу в Telegram"""
+    try:
+        current_time = datetime.now()
+        
+        if symbol in last_signals:
+            last_time = last_signals[symbol]
+            if (current_time - last_time).total_seconds() < 3600:  # 1 година між сигналами
+                return False
+        
+        last_signals[symbol] = current_time
+        
+        if signal_data["type"] == "LONG":
+            emoji = "🚀"
+            title = "LONG breakout"
+            desc = f"ціна пробила опір {signal_data['level']:.4f}"
+        elif signal_data["type"] == "SHORT":
+            emoji = "⚡" 
+            title = "SHORT breakout"
+            desc = f"ціна пробила підтримку {signal_data['level']:.4f}"
+        else:  # PRE_TOP
+            emoji = "⚠️"
+            title = "Pre-top detected"
+            desc = f"можливий short біля {signal_data['level']:.4f}"
+        
+        msg = (
+            f"{emoji} <b>{symbol}</b>\n"
+            f"{title}: {desc}\n"
+            f"📊 Ринкова: {signal_data.get('current_price', 0):.4f} | "
+            f"Відрив: {signal_data['diff']:+.4f} ({signal_data['diff_pct']:+.2f}%)\n"
+        )
+        
+        if signal_data["type"] == "PRE_TOP":
+            msg += f"📈 Імпульс: {signal_data['impulse']*100:.1f}%\n"
+        
+        msg += f"⏰ {current_time.strftime('%H:%M:%S')}"
+        
+        bot.send_message(CHAT_ID, msg, parse_mode="HTML")
+        logger.info(f"Надіслано сигнал для {symbol}: {signal_data['type']}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Помилка відправки сигналу {symbol}: {e}")
+        return False
 
 # -------------------------
-# Основна функція перевірки
+# Основна функція перевірки ринку
 # -------------------------
 def check_market():
-    logger.info("Запуск перевірки ринку...")
+    """Постійна перевірка ринку на сигнали"""
+    logger.info("Запуск Smart Auto перевірки ринку...")
     
     while True:
         try:
-            symbols = get_top_symbols()
-            logger.info(f"Перевіряємо {len(symbols)} монет: {symbols}")
+            # Отримуємо топ монет за обсягом
+            url = "https://api.binance.com/api/v3/ticker/24hr"
+            data = requests.get(url, timeout=10).json()
             
-            for symbol in symbols:
+            # Фільтруємо USDT пари з хорошим обсягом
+            usdt_pairs = [
+                d for d in data 
+                if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 5_000_000
+            ]
+            
+            # Сортуємо за зміною ціни (найактивніші)
+            sorted_symbols = sorted(
+                usdt_pairs,
+                key=lambda x: abs(float(x["priceChangePercent"])),
+                reverse=True
+            )
+            
+            top_symbols = [s["symbol"] for s in sorted_symbols[:30]]  # Топ 30 монет
+            logger.info(f"Аналізуємо {len(top_symbols)} монет: {top_symbols[:5]}...")
+            
+            signals_found = 0
+            
+            # Аналізуємо кожну монету
+            for symbol in top_symbols:
                 try:
-                    for tf in TIMEFRAMES:
-                        ohlc = get_historical_data(symbol, tf, N_CANDLES)
-                        if not ohlc:
-                            continue
-                            
-                        signal, volatility, confidence, indicators, is_strong = analyze_phase(ohlc)
+                    signal_data = analyze_symbol(symbol)
+                    
+                    if signal_data:
+                        # Беремо найсильніший сигнал для цієї монети
+                        best_signal = max(signal_data, key=lambda x: abs(x["diff_pct"]))
                         
-                        if signal != "HOLD" and confidence >= MIN_CONFIDENCE_FOR_SIGNAL:
-                            send_signal(symbol, signal, ohlc[-1]["close"], volatility, confidence, indicators, 1)
-                            break  # Тільки один сигнал на монету
+                        # Додаємо поточну ціну
+                        df = get_klines(symbol, interval="1h", limit=2)
+                        if df and len(df["c"]) > 0:
+                            best_signal["current_price"] = df["c"][-1]
+                        
+                        # Надсилаємо сигнал
+                        if send_signal_message(symbol, best_signal):
+                            signals_found += 1
                             
-                    time.sleep(1)  # Затримка між монетами
+                    time.sleep(0.5)  # Невелика затримка між запитами
                     
                 except Exception as e:
-                    logger.error(f"Помилка перевірки {symbol}: {e}")
+                    logger.error(f"Помилка обробки {symbol}: {e}")
                     continue
             
-            logger.info(f"Перевірка завершена. Очікування 30 секунд...")
-            time.sleep(30)  # Чекаємо 30 секунд
+            logger.info(f"Перевірка завершена. Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
+            time.sleep(300)  # Чекаємо 5 хвилин між перевірками
             
         except Exception as e:
-            logger.error(f"Критична помилка: {e}")
+            logger.error(f"Критична помилка перевірки ринку: {e}")
             time.sleep(60)  # Чекаємо хвилину при помилці
 
 # -------------------------
@@ -260,13 +289,13 @@ def webhook():
 
 @app.route('/')
 def home():
-    return "Bot is running!", 200
+    return "Smart Auto Bot is running!", 200
 
 @app.route('/status')
 def status():
     return {
-        "last_signals": len(last_signals),
         "status": "active",
+        "last_signals_count": len(last_signals),
         "timestamp": datetime.now().isoformat()
     }, 200
 
@@ -279,13 +308,84 @@ def setup_webhook():
         logger.error(f"Помилка налаштування webhook: {e}")
 
 # -------------------------
+# Команди для Telegram
+# -------------------------
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    help_text = (
+        "🤖 Smart Auto Breakout Bot\n\n"
+        "Цей бот автоматично шукає:\n"
+        "🚀 Breakout сигнали (пробої рівнів)\n"
+        "⚠️ Pre-top сигнали (перед вершиною)\n\n"
+        "Сигнали надсилаються автоматично кожні 5 хвилин\n"
+        "Аналіз топ-30 найактивніших монет"
+    )
+    bot.send_message(message.chat.id, help_text)
+
+@bot.message_handler(commands=['scan_now'])
+def scan_now_handler(message):
+    """Ручне сканування"""
+    try:
+        bot.send_message(message.chat.id, "🔍 Запускаю сканування...")
+        
+        # Отримуємо топ монет
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        usdt_pairs = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 5_000_000
+        ]
+        
+        sorted_symbols = sorted(
+            usdt_pairs,
+            key=lambda x: abs(float(x["priceChangePercent"])),
+            reverse=True
+        )
+        
+        top_symbols = [s["symbol"] for s in sorted_symbols[:15]]  # Тільки 15 для швидкості
+        
+        signals_found = 0
+        results = []
+        
+        for symbol in top_symbols:
+            signal_data = analyze_symbol(symbol)
+            if signal_data:
+                best_signal = max(signal_data, key=lambda x: abs(x["diff_pct"]))
+                df = get_klines(symbol, interval="1h", limit=2)
+                if df and len(df["c"]) > 0:
+                    best_signal["current_price"] = df["c"][-1]
+                
+                if best_signal["type"] == "LONG":
+                    emoji = "🚀"
+                    desc = f"пробив опір {best_signal['level']:.4f}"
+                elif best_signal["type"] == "SHORT":
+                    emoji = "⚡"
+                    desc = f"пробив підтримку {best_signal['level']:.4f}"
+                else:
+                    emoji = "⚠️"
+                    desc = f"pre-top біля {best_signal['level']:.4f}"
+                
+                results.append(
+                    f"{emoji} {symbol}: {desc} "
+                    f"({best_signal['diff_pct']:+.1f}%)"
+                )
+                signals_found += 1
+        
+        if results:
+            response = "🔍 Результати сканування:\n\n" + "\n".join(results)
+            bot.send_message(message.chat.id, response)
+        else:
+            bot.send_message(message.chat.id, "ℹ️ Жодних сигналів не знайдено.")
+            
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка сканування: {e}")
+
+# -------------------------
 # Запуск
 # -------------------------
 if __name__ == "__main__":
-    logger.info("Запуск бота...")
-    
-    # Завантажуємо дані
-    load_signals_history()
+    logger.info("Запуск Smart Auto Bot...")
     
     # Налаштовуємо webhook
     setup_webhook()
