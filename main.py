@@ -22,11 +22,11 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 GATE_API_KEY = os.getenv("GATE_API_KEY")
 GATE_API_SECRET = os.getenv("GATE_API_SECRET")
 
-TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", 50))
+TRADE_AMOUNT_USD = float(os.getenv("TRADE_AMOUNT_USD", 10))
 SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", 1.0))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 LEVERAGE = int(os.getenv("LEVERAGE", 20))
-MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 1))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 5))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 10.0))
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
