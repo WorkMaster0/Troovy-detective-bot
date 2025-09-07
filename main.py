@@ -579,10 +579,12 @@ def update_performance_stats(symbol, signal, price):
 # -------------------------
 def check_market():
     global last_status
+    print(f"{datetime.now()} - Функція check_market() запущена")
+    
     while True:
         try:
             symbols = get_top_symbols()
-            print(f"{datetime.now()} - Перевірка {len(symbols)} монет...")
+            print(f"{datetime.now()} - Перевірка {len(symbols)} монет: {symbols}")
             
             for symbol in symbols:
                 signals = []
@@ -802,5 +804,10 @@ if __name__ == "__main__":
     load_performance_stats()
     load_signals_history()
     setup_webhook()
-    threading.Thread(target=check_market, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    
+    # Запускаємо перевірку ринку в окремому потоці ПЕРЕД запуском Flask
+    market_thread = threading.Thread(target=check_market, daemon=True)
+    market_thread.start()
+    
+    print(f"{datetime.now()} - Бот запущено. Перевірка ринку активована.")
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
