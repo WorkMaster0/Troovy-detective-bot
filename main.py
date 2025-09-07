@@ -621,8 +621,29 @@ def check_market():
     """Постійна перевірка ринку"""
     logger.info("Запуск Smart Auto перевірки ринку...")
     
+    # Лічильник ітерацій для різних типів перевірок
+    iteration_count = 0
+    
     while True:
         try:
+            iteration_count += 1
+            
+            # Кожні 3 ітерації (15 хвилин) перевіряємо золоті хрести
+            if iteration_count % 3 == 0:
+                logger.info("Перевіряємо золоті хрести...")
+                check_golden_crosses()
+            
+            # Кожні 6 ітерацій (30 хвилин) перевіряємо китівську активність
+            if iteration_count % 6 == 0:
+                logger.info("Перевіряємо китівську активність...")
+                check_whale_activity_auto()
+            
+            # Кожні 12 ітерацій (60 хвилин) перевіряємо маніпуляції
+            if iteration_count % 12 == 0:
+                logger.info("Перевіряємо можливі маніпуляції...")
+                check_market_manipulation_auto()
+            
+            # Основна перевірка ринку (кожні 5 хвилин)
             url = "https://api.binance.com/api/v3/ticker/24hr"
             data = requests.get(url, timeout=10).json()
             
@@ -638,7 +659,7 @@ def check_market():
             )
             
             top_symbols = [s["symbol"] for s in sorted_symbols[:30]]
-            logger.info(f"Аналізуємо {len(top_symbols)} монет")
+            logger.info(f"Аналізуємо {len(top_symbols)} монет: {top_symbols[:5]}...")
             
             signals_found = 0
             
@@ -656,18 +677,18 @@ def check_market():
                         if send_signal_message(symbol, best_signal):
                             signals_found += 1
                             
-                    time.sleep(0.5)
+                    time.sleep(0.5)  # Затримка між монетами
                     
                 except Exception as e:
                     logger.error(f"Помилка обробки {symbol}: {e}")
                     continue
             
             logger.info(f"Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
-            time.sleep(300)
+            time.sleep(300)  # 5 хвилин між перевірками
             
         except Exception as e:
             logger.error(f"Критична помилка: {e}")
-            time.sleep(60)
+            time.sleep(60)  # 1 хвилина при помилці
 
 # -------------------------
 # Flask та Webhook
