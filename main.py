@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import os
 from threading import Lock
+import logging
 
 # -------------------------
 # Налаштування
@@ -36,6 +37,9 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
+
+# Налаштування логування
+logging.basicConfig(level=logging.INFO)
 
 # Блокування для потокобезпечного доступу
 data_lock = Lock()
@@ -660,21 +664,38 @@ def check_market():
 # -------------------------
 # Вебхук Telegram з додатковими командами
 # -------------------------
-@app.route(WEBHOOK_PATH, methods=["POST"])
+@app.route('/')
+def index():
+    return 'Bot is running!', 200
+
+@app.route(WEBHOOK_PATH, methods=['POST'])
 def webhook():
-    global last_status, performance_stats
-    json_str = request.get_data().decode("utf-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return ''
+    else:
+        return 'Invalid content type', 403
 
-    message_obj = update.message or update.edited_message
-    if not message_obj:
-        return "!", 200
+# Обробник команд
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    help_msg = (
+        "📖 *Доступні команди:*\n\n"
+        "/status SYMBOL - стан монети на різних таймфреймах\n"
+        "/top - топ монет за волатильністю\n"
+        "/last - останні сигнали\n"
+        "/performance - статистика продуктивності сигналів\n"
+        "/history SYMBOL - історія сигналів для монети\n"
+        "/help - довідка по командам"
+    )
+    bot.send_message(message.chat.id, help_msg, parse_mode="Markdown")
 
-    text = message_obj.text.strip()
-
-    if text.startswith("/status"):
-        args = text.split()
+@bot.message_handler(commands=['status'])
+def handle_status(message):
+    try:
+        args = message.text.split()
         if len(args) == 2:
             symbol = args[1].upper()
             if symbol in last_status:
@@ -697,22 +718,32 @@ def webhook():
                     out += f"Сигнали: {stats['total_signals']} (✅{stats['successful_signals']} | ❌{stats['total_signals'] - stats['successful_signals']})\n"
                     out += f"BUY/SELL: {stats['buy_signals']}/{stats['sell_signals']}"
                 
-                bot.send_message(message_obj.chat.id, out, parse_mode="Markdown")
+                bot.send_message(message.chat.id, out, parse_mode="Markdown")
             else:
-                bot.send_message(message_obj.chat.id, f"❌ Немає даних для {symbol}")
+                bot.send_message(message.chat.id, f"❌ Немає даних для {symbol}")
         else:
-            bot.send_message(message_obj.chat.id, "Використання: /status SYMBOL")
+            bot.send_message(message.chat.id, "Використання: /status SYMBOL")
+    except Exception as e:
+        logging.error(f"Error in status command: {e}")
+        bot.send_message(message.chat.id, "❌ Помилка обробки команди")
 
-    elif text.startswith("/top"):
+@bot.message_handler(commands=['top'])
+def handle_top(message):
+    try:
         symbols = get_top_symbols()[:10]
         msg = "🔥 *Топ-10 монет за волатильністю та обсягом:*\n\n"
         for i, symbol in enumerate(symbols, 1):
             msg += f"{i}. {symbol}\n"
-        bot.send_message(message_obj.chat.id, msg, parse_mode="Markdown")
+        bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Error in top command: {e}")
+        bot.send_message(message.chat.id, "❌ Помилка обробки команди")
 
-    elif text.startswith("/last"):
+@bot.message_handler(commands=['last'])
+def handle_last(message):
+    try:
         if not last_signals:
-            bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
+            bot.send_message(message.chat.id, "❌ Немає надісланих сигналів")
         else:
             msg = "📝 *Останні сигнали:*\n\n"
             with data_lock:
@@ -729,11 +760,16 @@ def webhook():
                     f"Ціна: {info['price']} | Впевненість: {info['confidence']*100:.1f}%\n"
                     f"TP: {info['tp']} (+{tp_percent}%) | SL: {info['sl']} ({sl_percent}%)\n\n"
                 )
-            bot.send_message(message_obj.chat.id, msg, parse_mode="Markdown")
-            
-    elif text.startswith("/performance"):
+            bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Error in last command: {e}")
+        bot.send_message(message.chat.id, "❌ Помилка обробки команди")
+
+@bot.message_handler(commands=['performance'])
+def handle_performance(message):
+    try:
         if not performance_stats:
-            bot.send_message(message_obj.chat.id, "❌ Немає даних про продуктивність")
+            bot.send_message(message.chat.id, "❌ Немає даних про продуктивність")
         else:
             with data_lock:
                 sorted_stats = sorted(
@@ -749,10 +785,15 @@ def webhook():
                         f"*{symbol}:* {stats.get('profitability', 0):.1f}% "
                         f"({stats.get('successful_signals', 0)}/{stats.get('total_signals', 0)})\n"
                     )
-            bot.send_message(message_obj.chat.id, msg, parse_mode="Markdown")
-            
-    elif text.startswith("/history"):
-        args = text.split()
+            bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Error in performance command: {e}")
+        bot.send_message(message.chat.id, "❌ Помилка обробки команди")
+
+@bot.message_handler(commands=['history'])
+def handle_history(message):
+    try:
+        args = message.text.split()
         if len(args) == 2:
             symbol = args[1].upper()
             successful, unsuccessful, success_rate, avg_profit = analyze_signal_performance(symbol, 0)
@@ -768,23 +809,12 @@ def webhook():
             else:
                 msg = f"❌ Немає даних про історію сигналів для {symbol}"
                 
-            bot.send_message(message_obj.chat.id, msg, parse_mode="Markdown")
+            bot.send_message(message.chat.id, msg, parse_mode="Markdown")
         else:
-            bot.send_message(message_obj.chat.id, "Використання: /history SYMBOL")
-            
-    elif text.startswith("/help"):
-        help_msg = (
-            "📖 *Доступні команди:*\n\n"
-            "/status SYMBOL - стан монети на різних таймфреймах\n"
-            "/top - топ монет за волатильністю\n"
-            "/last - останні сигнали\n"
-            "/performance - статистика продуктивності сигналів\n"
-            "/history SYMBOL - історія сигналів для монети\n"
-            "/help - довідка по командам"
-        )
-        bot.send_message(message_obj.chat.id, help_msg, parse_mode="Markdown")
-
-    return "!", 200
+            bot.send_message(message.chat.id, "Використання: /history SYMBOL")
+    except Exception as e:
+        logging.error(f"Error in history command: {e}")
+        bot.send_message(message.chat.id, "❌ Помилка обробки команди")
 
 # -------------------------
 # Встановлення Webhook
@@ -793,7 +823,16 @@ def setup_webhook():
     try:
         url = f"https://api.telegram.org/bot{API_KEY_TELEGRAM}/setWebhook"
         response = requests.post(url, data={"url": WEBHOOK_URL}, timeout=10)
-        print("Webhook setup:", response.json())
+        result = response.json()
+        print("Webhook setup:", result)
+        
+        # Перевірка статусу вебхука
+        if result.get('ok'):
+            webhook_info = bot.get_webhook_info()
+            print(f"Webhook info: {webhook_info}")
+        else:
+            print(f"Webhook setup failed: {result.get('description')}")
+            
     except Exception as e:
         print(f"Помилка налаштування webhook: {e}")
 
@@ -810,4 +849,4 @@ if __name__ == "__main__":
     market_thread.start()
     
     print(f"{datetime.now()} - Бот запущено. Перевірка ринку активована.")
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=10000, debug=False, use_reloader=False)
