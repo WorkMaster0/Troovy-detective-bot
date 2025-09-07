@@ -637,6 +637,40 @@ def golden_crosses_handler(message):
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Помилка: {e}")
 
+@bot.message_handler(commands=['rocket_scan'])
+def rocket_scan_handler(message):
+    """Сканування для мгновенних пампів"""
+    try:
+        bot.send_message(message.chat.id, "🚀 Сканую для мгновенних пампів...")
+        
+        rockets = find_rocket_pumps()
+        
+        if not rockets:
+            bot.send_message(message.chat.id, "ℹ️ Мгновенних пампів не знайдено")
+            return
+        
+        # Сортуємо за об'ємом
+        rockets.sort(key=lambda x: x["volume_ratio"], reverse=True)
+        
+        response = "🚀 <b>МГНОВЕННІ ПАМП КАНДИДАТИ:</b>\n\n"
+        
+        for i, rocket in enumerate(rockets[:5], 1):  # Топ-5
+            response += (
+                f"{i}. <b>{rocket['symbol']}</b>\n"
+                f"   📈 +{rocket['price_change_5m']:.1f}% за 5m\n"
+                f"   🔊 Об'єм: x{rocket['volume_ratio']:.1f}\n"
+                f"   💰 Ціна: {rocket['current_price']:.6f}\n"
+                f"   ⚡ Шанс пампу: ВИСОКИЙ\n\n"
+            )
+        
+        response += "⚠️ <b>УВАГА:</b> Це екстремально ризикові активи!\n"
+        response += "Можлива втрата всіх коштів за хвилини!"
+        
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
 @bot.message_handler(commands=['smart_money'])
 def smart_money_handler(message):
     """Індикатори Smart Money"""
