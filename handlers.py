@@ -345,23 +345,34 @@ def predict_volatility_spikes(symbol):
         highs = np.array(df["h"], dtype=float)
         lows = np.array(df["l"], dtype=float)
         
-        # Розрахунок волатильності (ATR)
-        tr = np.maximum(highs[-1] - lows[-1], 
-                       np.abs(highs[-1] - closes[-2]), 
-                       np.abs(lows[-1] - closes[-2]))
-        atr = np.mean([np.maximum(highs[i] - lows[i], 
-                                np.abs(highs[i] - closes[i-1]), 
-                                np.abs(lows[i] - closes[i-1])) 
-                      for i in range(1, len(closes))])
+        # Розрахунок True Range (виправлена версія)
+        tr_values = []
+        for i in range(1, len(closes)):
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - closes[i-1])
+            lc = abs(lows[i] - closes[i-1])
+            tr = max(hl, hc, lc)  # Використовуємо Python max замість np.maximum
+            tr_values.append(tr)
         
-        # Аналіз паттернів волатильності
+        # ATR (Average True Range)
+        atr = np.mean(tr_values[-14:]) if len(tr_values) >= 14 else np.mean(tr_values) if tr_values else 0
+        
+        # Поточний True Range
+        current_tr = 0
+        if len(closes) >= 2:
+            hl_current = highs[-1] - lows[-1]
+            hc_current = abs(highs[-1] - closes[-2])
+            lc_current = abs(lows[-1] - closes[-2])
+            current_tr = max(hl_current, hc_current, lc_current)
+        
+        # Аналіз волатильності через стандартне відхилення
         returns = np.diff(np.log(closes))
         current_volatility = np.std(returns[-20:]) if len(returns) >= 20 else 0
         avg_volatility = np.std(returns[-100:]) if len(returns) >= 100 else 0
         
         # Предикція сплеску
         volatility_ratio = current_volatility / avg_volatility if avg_volatility > 0 else 1
-        volatility_spike_predicted = volatility_ratio < 0.7 and tr > atr * 1.5
+        volatility_spike_predicted = volatility_ratio < 0.7 and current_tr > atr * 1.5
         
         return {
             "symbol": symbol,
@@ -370,7 +381,7 @@ def predict_volatility_spikes(symbol):
             "avg_volatility": avg_volatility,
             "volatility_ratio": volatility_ratio,
             "atr": atr,
-            "true_range": tr,
+            "true_range": current_tr,
             "price": closes[-1]
         }
         
