@@ -418,3 +418,265 @@ if __name__ == '__main__':
         app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
     except Exception as e:
         logger.error(f'Помилка запуску Flask: {e}')
+
+# ==================== НОВІ КОМАНДИ ====================
+@bot.message_handler(commands=['whale_activity'])
+def whale_activity_handler(message):
+    """Детекція китівської активності"""
+    try:
+        bot.send_message(message.chat.id, "🐋 Шукаю китівську активність...")
+        
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        usdt_pairs = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 8_000_000
+        ]
+        
+        top_symbols = [s["symbol"] for s in sorted(usdt_pairs, 
+                     key=lambda x: float(x["priceChangePercent"]), 
+                     reverse=True)[:15]]
+        
+        whale_signals = []
+        for symbol in top_symbols:
+            activity = detect_whale_activity(symbol)
+            if activity and activity["whale_detected"]:
+                whale_signals.append(activity)
+            time.sleep(0.3)
+        
+        if not whale_signals:
+            bot.send_message(message.chat.id, "ℹ️ Китівська активність не виявлена")
+            return
+        
+        response = "🐋 <b>Китівська активність виявлена:</b>\n\n"
+        for i, signal in enumerate(whale_signals[:5], 1):
+            response += (
+                f"{i}. <b>{signal['symbol']}</b>\n"
+                f"   💰 Ціна: {signal['price']:.4f}\n"
+                f"   🔊 Об'єм: x{signal['volume_ratio']:.1f}\n"
+                f"   📊 Z-score: {signal['z_score']:.2f}\n\n"
+            )
+        
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
+@bot.message_handler(commands=['liquidity_zones'])
+def liquidity_zones_handler(message):
+    """Аналіз ліквідних зон"""
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.send_message(message.chat.id, "ℹ️ Використання: /liquidity_zones SYMBOL")
+            return
+        
+        symbol = args[1].upper()
+        if not symbol.endswith('USDT'):
+            symbol += 'USDT'
+        
+        bot.send_message(message.chat.id, f"💧 Аналізую ліквідні зони для {symbol}...")
+        
+        analysis = calculate_liquidity_zones(symbol)
+        
+        if not analysis:
+            bot.send_message(message.chat.id, f"❌ Не вдалося проаналізувати {symbol}")
+            return
+        
+        response = (
+            f"💧 <b>Ліквідні зони для {symbol}</b>\n"
+            f"💰 Поточна ціна: {analysis['current_price']:.4f}\n\n"
+            f"🔥 <b>Топ ліквідні зони:</b>\n"
+        )
+        
+        for i, zone in enumerate(analysis['liquidity_zones'][:3], 1):
+            response += (
+                f"{i}. Зона: {zone['center']:.4f}\n"
+                f"   📊 Об'єм: {zone['total_volume']:.0f}\n"
+                f"   📈 Діапазон: {zone['min_price']:.4f} - {zone['max_price']:.4f}\n"
+                f"   🎯 Щільність: {zone['density']} свічок\n\n"
+            )
+        
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
+@bot.message_handler(commands=['volatility_prediction'])
+def volatility_prediction_handler(message):
+    """Предикція волатильності"""
+    try:
+        bot.send_message(message.chat.id, "📊 Аналізую волатильність...")
+        
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        usdt_pairs = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 5_000_000
+        ]
+        
+        top_symbols = [s["symbol"] for s in sorted(usdt_pairs,
+                     key=lambda x: abs(float(x["priceChangePercent"])),
+                     reverse=True)[:10]]
+        
+        volatility_signals = []
+        for symbol in top_symbols:
+            prediction = predict_volatility_spikes(symbol)
+            if prediction and prediction["volatility_spike_predicted"]:
+                volatility_signals.append(prediction)
+            time.sleep(0.3)
+        
+        if not volatility_signals:
+            bot.send_message(message.chat.id, "ℹ️ Сплески волатильності не прогнозуються")
+            return
+        
+        response = "⚡ <b>Прогноз сплесків волатильності:</b>\n\n"
+        for i, signal in enumerate(volatility_signals[:5], 1):
+            response += (
+                f"{i}. <b>{signal['symbol']}</b>\n"
+                f"   💰 Ціна: {signal['price']:.4f}\n"
+                f"   📊 Волатильність: {signal['current_volatility']*100:.2f}%\n"
+                f"   📈 Відношення: x{signal['volatility_ratio']:.2f}\n\n"
+            )
+        
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
+@bot.message_handler(commands=['market_manipulation'])
+def market_manipulation_handler(message):
+    """Детекція маніпуляцій ринком"""
+    try:
+        bot.send_message(message.chat.id, "🔍 Шукаю ознаки маніпуляцій...")
+        
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        usdt_pairs = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 3_000_000 and
+            abs(float(d["priceChangePercent"])) > 8.0
+        ]
+        
+        top_symbols = [s["symbol"] for s in usdt_pairs[:8]]
+        
+        manipulation_signals = []
+        for symbol in top_symbols:
+            analysis = detect_market_manipulation(symbol)
+            if analysis and analysis["manipulation_detected"]:
+                manipulation_signals.append(analysis)
+            time.sleep(0.3)
+        
+        if not manipulation_signals:
+            bot.send_message(message.chat.id, "✅ Ознак маніпуляцій не виявлено")
+            return
+        
+        response = "⚠️ <b>Виявлено можливі маніпуляції:</b>\n\n"
+        for i, signal in enumerate(manipulation_signals, 1):
+            response += (
+                f"{i}. <b>{signal['symbol']}</b>\n"
+                f"   🎯 Score: {signal['manipulation_score']}/4\n"
+                f"   📊 Кореляція: {signal['correlation']:.2f}\n"
+                f"   📈 Body ratio: {signal['avg_body_ratio']:.2f}\n\n"
+            )
+        
+        response += "🔒 <i>Будьте обережні з цими активами</i>"
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
+@bot.message_handler(commands=['golden_crosses'])
+def golden_crosses_handler(message):
+    """Пошук золотих/смертельних хрестів"""
+    try:
+        bot.send_message(message.chat.id, "📈 Шукаю хрести...")
+        
+        crosses = find_golden_crosses()
+        
+        if not crosses:
+            bot.send_message(message.chat.id, "ℹ️ Хрестів не знайдено")
+            return
+        
+        response = "📊 <b>Знайдені хрести:</b>\n\n"
+        
+        golden_crosses = [c for c in crosses if c["type"] == "GOLDEN"]
+        death_crosses = [c for c in crosses if c["type"] == "DEATH"]
+        
+        if golden_crosses:
+            response += "🟢 <b>Золоті хрести:</b>\n"
+            for cross in golden_crosses[:3]:
+                response += (
+                    f"• {cross['symbol']} - {cross['crossover_strength']:.2f}%\n"
+                    f"  EMA20: {cross['ema20']:.4f}, EMA50: {cross['ema50']:.4f}\n"
+                )
+            response += "\n"
+        
+        if death_crosses:
+            response += "🔴 <b>Смертельні хрести:</b>\n"
+            for cross in death_crosses[:3]:
+                response += (
+                    f"• {cross['symbol']} - {cross['crossover_strength']:.2f}%\n"
+                    f"  EMA20: {cross['ema20']:.4f}, EMA50: {cross['ema50']:.4f}\n"
+                )
+        
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
+
+@bot.message_handler(commands=['smart_money'])
+def smart_money_handler(message):
+    """Індикатори Smart Money"""
+    try:
+        args = message.text.split()
+        if len(args) < 2:
+            bot.send_message(message.chat.id, "ℹ️ Використання: /smart_money SYMBOL")
+            return
+        
+        symbol = args[1].upper()
+        if not symbol.endswith('USDT'):
+            symbol += 'USDT'
+        
+        bot.send_message(message.chat.id, f"🧠 Аналізую Smart Money для {symbol}...")
+        
+        analysis = get_smart_money_indicators(symbol)
+        
+        if not analysis:
+            bot.send_message(message.chat.id, f"❌ Не вдалося проаналізувати {symbol}")
+            return
+        
+        # Емодзі для дивергенції
+        divergence_emoji = {
+            "BULLISH": "🟢",
+            "BEARISH": "🔴", 
+            "HIDDEN_BULLISH": "🟡",
+            "HIDDEN_BEARISH": "🟠",
+            "NEUTRAL": "⚪"
+        }
+        
+        response = (
+            f"🧠 <b>Smart Money аналіз для {symbol}</b>\n\n"
+            f"💰 Ціна: {analysis['current_price']:.4f}\n"
+            f"📊 Volume Delta: {analysis['volume_delta']:+.3f}\n"
+            f"📈 Buy Pressure: {analysis['buy_pressure']*100:.1f}%\n"
+            f"🎯 Дивергенція: {divergence_emoji.get(analysis['divergence'], '⚪')} {analysis['divergence']}\n"
+            f"📉 Зміна ціни: {analysis['price_change']:+.2f}%\n"
+            f"📊 Зміна об'єму: {analysis['volume_change']:+.2f}%\n\n"
+        )
+        
+        # Інтерпретація
+        if analysis['volume_delta'] > 0.1:
+            response += "🟢 Сильний покупний тиск\n"
+        elif analysis['volume_delta'] < -0.1:
+            response += "🔴 Сильний продажний тиск\n"
+        else:
+            response += "⚪ Баланс сил\n"
+        
+        bot.send_message(message.chat.id, response, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Помилка: {e}")
