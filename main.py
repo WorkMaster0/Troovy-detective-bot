@@ -7,7 +7,7 @@ import time
 import json
 import pandas as pd
 import numpy as np
-from talib import abstract
+import os
 
 # -------------------------
 # Налаштування
@@ -15,7 +15,7 @@ from talib import abstract
 API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
 CHAT_ID = "6053907025"
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
-N_CANDLES = 50  # Збільшено для кращого аналізу
+N_CANDLES = 50
 FAST_EMA = 10
 SLOW_EMA = 30
 RSI_PERIOD = 14
@@ -24,9 +24,9 @@ MACD_SLOW = 26
 MACD_SIGNAL = 9
 
 # Додаткові налаштування
-MIN_VOLUME = 1_000_000  # Мінімальний обсяг торгів
-MIN_PRICE_CHANGE = 2.0  # Мінімальний відсоток зміни ціни для фільтрації
-CONFIRMATION_THRESHOLD = 0.75  # 75% таймфреймів мають підтверджувати сигнал
+MIN_VOLUME = 1_000_000
+MIN_PRICE_CHANGE = 2.0
+CONFIRMATION_THRESHOLD = 0.75
 
 WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
@@ -35,9 +35,43 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
-last_signals = {}   # останні сигнали по монетах
-last_status = {}    # останній стан по монетах
-performance_stats = {}  # статистика продуктивності сигналів
+last_signals = {}
+last_status = {}
+performance_stats = {}
+signal_history = []  # Історія всіх сигналів
+
+# Файл для збереження історії сигналів
+SIGNALS_HISTORY_FILE = "signals_history.json"
+
+# -------------------------
+# Завантаження та збереження історії сигналів
+# -------------------------
+def load_signals_history():
+    global signal_history
+    try:
+        if os.path.exists(SIGNALS_HISTORY_FILE):
+            with open(SIGNALS_HISTORY_FILE, "r") as f:
+                signal_history = json.load(f)
+                # Конвертуємо строки часу назад в datetime
+                for signal in signal_history:
+                    signal["time"] = datetime.fromisoformat(signal["time"])
+    except Exception as e:
+        print(f"Помилка завантаження історії сигналів: {e}")
+        signal_history = []
+
+def save_signals_history():
+    try:
+        # Конвертуємо datetime в строки для JSON
+        history_to_save = []
+        for signal in signal_history:
+            signal_copy = signal.copy()
+            signal_copy["time"] = signal["time"].isoformat()
+            history_to_save.append(signal_copy)
+            
+        with open(SIGNALS_HISTORY_FILE, "w") as f:
+            json.dump(history_to_save, f, indent=2)
+    except Exception as e:
+        print(f"Помилка збереження історії сигналів: {e}")
 
 # -------------------------
 # Удосконалений пошук топ монет
@@ -48,41 +82,37 @@ def get_top_symbols(min_volume=MIN_VOLUME, min_price_change=MIN_PRICE_CHANGE):
         data = requests.get(url, timeout=10).json()
         usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
         
-        # Фільтрація за обсягом та зміною ціни
         filtered_pairs = [
             x for x in usdt_pairs 
             if float(x["quoteVolume"]) >= min_volume and 
             abs(float(x["priceChangePercent"])) >= min_price_change
         ]
         
-        # Сортування за комбінацією обсягу та волатильності
         sorted_pairs = sorted(
             filtered_pairs, 
             key=lambda x: (float(x["quoteVolume"]) * abs(float(x["priceChangePercent"]))), 
             reverse=True
         )
-        return [x["symbol"] for x in sorted_pairs[:20]]  # Обмежуємо до 20 монет
+        return [x["symbol"] for x in sorted_pairs[:20]]
     except Exception as e:
         print(f"Помилка отримання топ монет: {e}")
-        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]  # Резервний список
+        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 # -------------------------
 # Історичні дані з кешуванням
 # -------------------------
 data_cache = {}
-CACHE_DURATION = 30  # секунди
+CACHE_DURATION = 30
 
 def get_historical_data(symbol, interval, limit=100):
     cache_key = f"{symbol}_{interval}"
     current_time = time.time()
     
-    # Перевірка кешу
     if cache_key in data_cache:
         data, timestamp = data_cache[cache_key]
         if current_time - timestamp < CACHE_DURATION:
             return data
     
-    # Отримання нових даних
     try:
         url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
         response = requests.get(url, timeout=10)
@@ -100,7 +130,6 @@ def get_historical_data(symbol, interval, limit=100):
                 "volume": float(d[5])
             })
         
-        # Оновлення кешу
         data_cache[cache_key] = (ohlc, current_time)
         return ohlc
     except Exception as e:
@@ -108,8 +137,110 @@ def get_historical_data(symbol, interval, limit=100):
         return []
 
 # -------------------------
-# Розширені технічні індикатори
+# Власна реалізація технічних індикаторів (без TA-Lib)
 # -------------------------
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    
+    # Спочатку обчислюємо SMA як початкове значення EMA
+    sma = sum(prices[:period]) / period
+    ema = [sma]
+    
+    # Множник для EMA
+    k = 2 / (period + 1)
+    
+    # Обчислюємо EMA для решти значень
+    for price in prices[period:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+    
+    return ema[-1] if ema else None
+
+def calculate_rsi(prices, period):
+    if len(prices) < period + 1:
+        return None
+        
+    gains = []
+    losses = []
+    
+    # Обчислюємо зміни цін
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        gains.append(change if change > 0 else 0)
+        losses.append(-change if change < 0 else 0)
+    
+    # Середній зиск та середній збиток
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    
+    if avg_loss == 0:
+        return 100
+    
+    # Перше значення RS та RSI
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    # Обчислюємо решту значень RSI
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        
+        if avg_loss == 0:
+            rsi = 100
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+def calculate_macd(prices, fast_period, slow_period, signal_period):
+    if len(prices) < slow_period + signal_period:
+        return None, None, None
+        
+    # Обчислюємо EMA для швидкого та повільного періодів
+    ema_fast = calculate_ema(prices, fast_period)
+    ema_slow = calculate_ema(prices, slow_period)
+    
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+        
+    # Лінія MACD
+    macd_line = ema_fast - ema_slow
+    
+    # Сигнальна лінія (EMA від MACD)
+    # Для цього нам потрібна історія MACD значень, але ми маємо лише останнє
+    # Спрощено, використовуємо останні signal_period значень цін для обчислення сигналу
+    if len(prices) >= signal_period:
+        macd_signal = calculate_ema(prices[-signal_period:], signal_period)
+    else:
+        macd_signal = None
+        
+    macd_histogram = macd_line - macd_signal if macd_signal is not None else None
+    
+    return macd_line, macd_signal, macd_histogram
+
+def calculate_atr(highs, lows, closes, period):
+    if len(highs) < period + 1 or len(lows) < period + 1 or len(closes) < period + 1:
+        return None
+        
+    # Обчислюємо True Range
+    tr_values = []
+    for i in range(1, len(highs)):
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i-1])
+        lc = abs(lows[i] - closes[i-1])
+        tr = max(hl, hc, lc)
+        tr_values.append(tr)
+    
+    # Обчислюємо ATR
+    atr = sum(tr_values[:period]) / period
+    
+    # Обчислюємо решту значень ATR
+    for i in range(period, len(tr_values)):
+        atr = (atr * (period - 1) + tr_values[i]) / period
+    
+    return atr
+
 def calculate_indicators(ohlc):
     closes = np.array([c["close"] for c in ohlc], dtype=float)
     highs = np.array([c["high"] for c in ohlc], dtype=float)
@@ -126,12 +257,12 @@ def calculate_indicators(ohlc):
     # MACD
     macd, macd_signal, macd_histogram = calculate_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     
-    # Волатильність (ATR)
+    # ATR
     atr = calculate_atr(highs, lows, closes, 14)
     
     # Обсяги
-    volume_avg = np.mean(volumes[-5:])  # Середній обсяг за останні 5 періодів
-    volume_current = volumes[-1]
+    volume_avg = np.mean(volumes[-5:]) if len(volumes) >= 5 else np.mean(volumes)
+    volume_current = volumes[-1] if len(volumes) > 0 else 0
     
     return {
         "fast_ema": fast_ema,
@@ -146,51 +277,49 @@ def calculate_indicators(ohlc):
         "volume_ratio": volume_current / volume_avg if volume_avg > 0 else 1
     }
 
-def calculate_ema(prices, period):
-    if len(prices) < period:
-        return None
-    weights = np.exp(np.linspace(-1., 0., period))
-    weights /= weights.sum()
-    return np.convolve(prices, weights, mode='valid')[-1]
-
-def calculate_rsi(prices, period):
-    if len(prices) < period + 1:
-        return None
-        
-    deltas = np.diff(prices)
-    seed = deltas[:period+1]
-    up = seed[seed >= 0].sum() / period
-    down = -seed[seed < 0].sum() / period
+# -------------------------
+# Аналіз результатів минулих сигналів
+# -------------------------
+def analyze_signal_performance(symbol, current_price):
+    # Фільтруємо сигнали для цієї монети
+    symbol_signals = [s for s in signal_history if s["symbol"] == symbol]
     
-    if down == 0:
-        return 100
-    rs = up / down
-    return 100 - (100 / (1 + rs))
-
-def calculate_macd(prices, fast_period, slow_period, signal_period):
-    if len(prices) < slow_period + signal_period:
-        return None, None, None
-        
-    ema_fast = calculate_ema(prices, fast_period)
-    ema_slow = calculate_ema(prices, slow_period)
+    if not symbol_signals:
+        return 0, 0, 0
     
-    if ema_fast is None or ema_slow is None:
-        return None, None, None
-        
-    macd_line = ema_fast - ema_slow
-    macd_signal = calculate_ema(prices[-signal_period:], signal_period) if len(prices) >= signal_period else None
-    macd_histogram = macd_line - macd_signal if macd_signal is not None else None
+    successful = 0
+    unsuccessful = 0
+    total_profit = 0
     
-    return macd_line, macd_signal, macd_histogram
-
-def calculate_atr(highs, lows, closes, period):
-    if len(highs) < period + 1:
-        return None
+    for signal in symbol_signals:
+        # Перевіряємо тільки завершені сигнали (старші за 4 години)
+        if (datetime.now() - signal["time"]).total_seconds() < 4 * 3600:
+            continue
+            
+        price_change = ((current_price - signal["price"]) / signal["price"]) * 100
         
-    tr = np.maximum(highs[-1] - lows[-1], 
-                   np.maximum(abs(highs[-1] - closes[-2]), 
-                             abs(lows[-1] - closes[-2])))
-    return tr
+        if signal["signal"] == "BUY":
+            # Для BUY сигналів позитивна зміна - успіх
+            if price_change > 0:
+                successful += 1
+                total_profit += price_change
+            else:
+                unsuccessful += 1
+                total_profit += price_change
+        else:  # SELL сигнали
+            # Для SELL сигналів негативна зміна - успіх
+            if price_change < 0:
+                successful += 1
+                total_profit += price_change
+            else:
+                unsuccessful += 1
+                total_profit += price_change
+    
+    total_signals = successful + unsuccessful
+    success_rate = (successful / total_signals * 100) if total_signals > 0 else 0
+    avg_profit = (total_profit / total_signals) if total_signals > 0 else 0
+    
+    return successful, unsuccessful, success_rate, avg_profit
 
 # -------------------------
 # Удосконалений аналіз сигналів
@@ -203,38 +332,29 @@ def analyze_phase(ohlc):
     highs = [c["high"] for c in ohlc]
     lows = [c["low"] for c in ohlc]
     
-    # Розрахунок індикаторів
     indicators = calculate_indicators(ohlc)
     
-    # Базові сигнали
     trend_up = closes[-2] < closes[-1]
     trend_down = closes[-2] > closes[-1]
     
-    # Сигнали EMA
     ema_bullish = indicators["fast_ema"] > indicators["slow_ema"] if indicators["fast_ema"] and indicators["slow_ema"] else False
     ema_bearish = indicators["fast_ema"] < indicators["slow_ema"] if indicators["fast_ema"] and indicators["slow_ema"] else False
     
-    # Сигнали RSI
     rsi = indicators["rsi"]
     rsi_overbought = rsi > 70 if rsi else False
     rsi_oversold = rsi < 30 if rsi else False
     
-    # Сигнали MACD
     macd_bullish = indicators["macd_histogram"] > 0 if indicators["macd_histogram"] is not None else False
     macd_bearish = indicators["macd_histogram"] < 0 if indicators["macd_histogram"] is not None else False
     
-    # Аналіз обсягів
     volume_spike = indicators["volume_ratio"] > 1.5 if indicators["volume_ratio"] else False
     
-    # Оцінка сигналів
     buy_signals = sum([ema_bullish, not rsi_overbought, macd_bullish, trend_up, volume_spike])
     sell_signals = sum([ema_bearish, not rsi_oversold, macd_bearish, trend_down, volume_spike])
     
-    # Визначення волатильності через ATR
     volatility = indicators["atr"] or (max(highs[-10:]) - min(lows[-10:])) / 2
     
-    # Рішення
-    confidence = abs(buy_signals - sell_signals) / 5  # 5 - кількість сигналів
+    confidence = abs(buy_signals - sell_signals) / 5
     
     if buy_signals > sell_signals and buy_signals >= 3:
         return "BUY", volatility, confidence, indicators, True
@@ -244,34 +364,35 @@ def analyze_phase(ohlc):
         return "HOLD", volatility, confidence, indicators, False
 
 # -------------------------
-# Відправка сигналу з покращеним форматуванням
+# Відправка сигналу з аналізом історії
 # -------------------------
 def send_signal(symbol, signal, price, volatility, confidence, indicators, timeframe_confirmation):
-    global last_signals
+    global last_signals, signal_history
     
     if signal == "HOLD":
         return
         
-    # Уникаємо дублювання сигналів
     current_time = datetime.now()
     if symbol in last_signals:
         last_signal_time = last_signals[symbol]["time"]
-        if (current_time - last_signal_time).total_seconds() < 3600:  # 1 година
+        if (current_time - last_signal_time).total_seconds() < 3600:
             if last_signals[symbol]["signal"] == signal:
-                return  # Пропускаємо повторний сигнал
+                return
     
-    # Розрахунок TP/SL на основі ATR
     atr_multiplier_tp = 1.5 if confidence > 0.7 else 1.0
     atr_multiplier_sl = 1.0 if confidence > 0.7 else 0.7
     
     tp = round(price + volatility * atr_multiplier_tp if signal == "BUY" else price - volatility * atr_multiplier_tp, 4)
     sl = round(price - volatility * atr_multiplier_sl if signal == "BUY" else price + volatility * atr_multiplier_sl, 4)
     
-    # Ризик-менеджмент (не більше 2% втрат на угоду)
     risk_percentage = 0.02
     position_size = risk_percentage / ((abs(price - sl)) / price) if price != sl else 0
     
-    last_signals[symbol] = {
+    # Аналізуємо результати минулих сигналів
+    successful, unsuccessful, success_rate, avg_profit = analyze_signal_performance(symbol, price)
+    
+    signal_data = {
+        "symbol": symbol,
         "signal": signal,
         "price": price,
         "tp": tp,
@@ -283,14 +404,31 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
         "position_size": position_size
     }
     
+    last_signals[symbol] = signal_data
+    
+    # Додаємо сигнал до історії
+    signal_history.append(signal_data)
+    
+    # Обмежуємо історію до останніх 1000 сигналів
+    if len(signal_history) > 1000:
+        signal_history = signal_history[-1000:]
+    
+    # Зберігаємо історію
+    save_signals_history()
+    
     # Формування повідомлення
     emoji = "🚀" if signal == "BUY" else "🔻"
     rsi_status = f"RSI: {indicators['rsi']:.1f}" if indicators['rsi'] else "RSI: N/A"
-    macd_status = f"MACD: {'↑' if indicators['macd_histogram'] > 0 else '↓'}" if indicators['macd_histogram'] is not None else "MACD: N/A"
+    macd_status = f"MACD: {'↑' if indicators.get('macd_histogram', 0) > 0 else '↓'}" if indicators.get('macd_histogram') is not None else "MACD: N/A"
     
     note = "✅ Високе підтвердження" if confidence > 0.7 else "⚠️ Помірне підтвердження"
     if timeframe_confirmation < len(TIMEFRAMES) * CONFIRMATION_THRESHOLD:
         note = f"⚠️ Лише {timeframe_confirmation}/{len(TIMEFRAMES)} ТФ"
+    
+    # Додаємо інформацію про минулі сигнали
+    history_info = ""
+    if successful + unsuccessful > 0:
+        history_info = f"📊 Історія: ✅{successful} | ❌{unsuccessful} | Успішність: {success_rate:.1f}% | Сер.прибуток: {avg_profit:.2f}%"
     
     msg = (
         f"{emoji} *{symbol}* | {signal}\n"
@@ -299,22 +437,22 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
         f"📊 {rsi_status} | {macd_status} | Обсяг: x{indicators['volume_ratio']:.1f}\n"
         f"📈 Впевненість: {confidence*100:.1f}%\n"
         f"💼 Розмір позиції: {position_size*100:.1f}% балансу\n"
+        f"{history_info}\n"
         f"_{note}_"
     )
     
     try:
         bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
         
-        # Логування сигналу
         with open("signals.log", "a", encoding="utf-8") as f:
             log_msg = (
                 f"{current_time} | {symbol} | {signal} | {price} | "
                 f"TP: {tp} | SL: {sl} | Confidence: {confidence:.2f} | "
-                f"RSI: {indicators['rsi'] or 'N/A'} | Volume: x{indicators['volume_ratio']:.1f}\n"
+                f"RSI: {indicators.get('rsi', 'N/A')} | Volume: x{indicators.get('volume_ratio', 0):.1f} | "
+                f"History: {successful}/{unsuccessful} ({success_rate:.1f}%)\n"
             )
             f.write(log_msg)
             
-        # Оновлення статистики
         update_performance_stats(symbol, signal, price)
             
     except Exception as e:
@@ -345,7 +483,6 @@ def update_performance_stats(symbol, signal, price):
     else:
         stats["sell_signals"] += 1
         
-    # Оновлення прибутковості (спрощено)
     if stats["last_signal"] and stats["last_price"]:
         price_change = (price - stats["last_price"]) / stats["last_price"] * 100
         
@@ -358,7 +495,6 @@ def update_performance_stats(symbol, signal, price):
     stats["last_signal"] = signal
     stats["last_price"] = price
     
-    # Збереження статистики
     with open("performance_stats.json", "w") as f:
         json.dump(performance_stats, f)
 
@@ -394,15 +530,12 @@ def check_market():
                 if not signals:
                     continue
                 
-                # Агрегація сигналів з різних таймфреймів
                 buy_count = signals.count("BUY")
                 sell_count = signals.count("SELL")
                 total_tfs = len(signals)
                 
-                # Середня впевненість
                 avg_confidence = sum(confidences) / total_tfs if total_tfs > 0 else 0
                 
-                # Визначення фінального сигналу
                 final_signal = "HOLD"
                 timeframe_confirmation = 0
                 
@@ -413,9 +546,7 @@ def check_market():
                     final_signal = "SELL"
                     timeframe_confirmation = sell_count
                 
-                # Відправка сигналу, якщо є підтвердження
                 if final_signal != "HOLD":
-                    # Використовуємо ціну з найбільшого таймфрейму для кращої точності
                     price = last_prices[-1] if last_prices else 0
                     max_volatility = max(volatilities) if volatilities else 0
                     
@@ -425,11 +556,10 @@ def check_market():
                         price, 
                         max_volatility, 
                         avg_confidence,
-                        all_indicators[-1],  # Індикатори з найбільшого TF
+                        all_indicators[-1],
                         timeframe_confirmation
                     )
                 
-                # Оновлення статусу
                 last_status[symbol] = {
                     "signals": signals,
                     "confidences": confidences,
@@ -439,14 +569,14 @@ def check_market():
                     "timestamp": datetime.now()
                 }
                 
-                time.sleep(0.2)  # Невелика затримка між монетами
+                time.sleep(0.2)
 
         except Exception as e:
             print(f"{datetime.now()} - Помилка: {e}")
             with open("errors.log", "a") as f:
                 f.write(f"{datetime.now()} - {e}\n")
         
-        time.sleep(30)  # Перевіряємо кожні 30 секунд
+        time.sleep(30)
 
 # -------------------------
 # Вебхук Telegram з додатковими командами
@@ -481,7 +611,6 @@ def webhook():
                     out += f"*{tf}:* {sig} (впевненість: {conf*100:.1f}%)\n"
                     out += f"Ціна: {price} | Волатильність: {vol:.4f}\n\n"
                 
-                # Додаємо статистику продуктивності
                 if symbol in performance_stats:
                     stats = performance_stats[symbol]
                     out += f"📈 *Статистика продуктивності:*\n"
@@ -507,7 +636,7 @@ def webhook():
             bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
         else:
             msg = "📝 *Останні сигнали:*\n\n"
-            for sym, info in list(last_signals.items())[-5:]:  # Останні 5 сигналів
+            for sym, info in list(last_signals.items())[-5:]:
                 time_diff = (datetime.now() - info["time"]).total_seconds() / 60
                 note = "✅ Високе" if info["confidence"] > 0.7 else "⚠️ Помірне"
                 msg += (
@@ -521,21 +650,41 @@ def webhook():
         if not performance_stats:
             bot.send_message(message_obj.chat.id, "❌ Немає даних про продуктивність")
         else:
-            # Сортуємо за прибутковістю
             sorted_stats = sorted(
                 performance_stats.items(), 
                 key=lambda x: x[1]["profitability"], 
                 reverse=True
-            )[:10]  # Топ-10
+            )[:10]
             
             msg = "🏆 *Топ-10 монет за прибутковістю:*\n\n"
             for symbol, stats in sorted_stats:
-                if stats["total_signals"] > 0:  # Показуємо тільки монети з сигналами
+                if stats["total_signals"] > 0:
                     msg += (
                         f"*{symbol}:* {stats['profitability']:.1f}% "
                         f"({stats['successful_signals']}/{stats['total_signals']})\n"
                     )
             bot.send_message(message_obj.chat.id, msg, parse_mode="Markdown")
+            
+    elif text.startswith("/history"):
+        args = text.split()
+        if len(args) == 2:
+            symbol = args[1].upper()
+            successful, unsuccessful, success_rate, avg_profit = analyze_signal_performance(symbol, 0)
+            
+            if successful + unsuccessful > 0:
+                msg = (
+                    f"📊 *Історія сигналів для {symbol}:*\n\n"
+                    f"✅ Успішних: {successful}\n"
+                    f"❌ Неуспішних: {unsuccessful}\n"
+                    f"📈 Успішність: {success_rate:.1f}%\n"
+                    f"💰 Середній прибуток: {avg_profit:.2f}%"
+                )
+            else:
+                msg = f"❌ Немає даних про історію сигналів для {symbol}"
+                
+            bot.send_message(message_obj.chat.id, msg, parse_mode="Markdown")
+        else:
+            bot.send_message(message_obj.chat.id, "Використання: /history SYMBOL")
             
     elif text.startswith("/help"):
         help_msg = (
@@ -544,6 +693,7 @@ def webhook():
             "/top - топ монет за волатильністю\n"
             "/last - останні сигнали\n"
             "/performance - статистика продуктивності сигналів\n"
+            "/history SYMBOL - історія сигналів для монети\n"
             "/help - довідка по командам"
         )
         bot.send_message(message_obj.chat.id, help_msg, parse_mode="Markdown")
@@ -580,6 +730,7 @@ def load_performance_stats():
 # -------------------------
 if __name__ == "__main__":
     load_performance_stats()
+    load_signals_history()
     setup_webhook()
     threading.Thread(target=check_market, daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
