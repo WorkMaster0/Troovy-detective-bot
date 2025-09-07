@@ -6,7 +6,7 @@ from datetime import datetime
 import threading
 import time
 import logging
-from handlers import *
+from handlers.py import *
 
 # Налаштування логування
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
