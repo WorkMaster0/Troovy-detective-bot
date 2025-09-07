@@ -8,6 +8,7 @@ import json
 import pandas as pd
 import numpy as np
 import os
+from threading import Lock
 
 # -------------------------
 # Налаштування
@@ -27,6 +28,7 @@ MACD_SIGNAL = 9
 MIN_VOLUME = 1_000_000
 MIN_PRICE_CHANGE = 2.0
 CONFIRMATION_THRESHOLD = 0.75
+MIN_CONFIDENCE = 0.4  # Мінімальна впевненість 40%
 
 WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
@@ -35,6 +37,8 @@ WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
+# Блокування для потокобезпечного доступу
+data_lock = Lock()
 last_signals = {}
 last_status = {}
 performance_stats = {}
@@ -42,39 +46,78 @@ signal_history = []  # Історія всіх сигналів
 
 # Файл для збереження історії сигналів
 SIGNALS_HISTORY_FILE = "signals_history.json"
+PERFORMANCE_STATS_FILE = "performance_stats.json"
 
 # -------------------------
-# Завантаження та збереження історії сигналів
+# Завантаження та збереження даних
 # -------------------------
 def load_signals_history():
     global signal_history
     try:
         if os.path.exists(SIGNALS_HISTORY_FILE):
             with open(SIGNALS_HISTORY_FILE, "r") as f:
-                signal_history = json.load(f)
+                data = json.load(f)
                 # Конвертуємо строки часу назад в datetime
-                for signal in signal_history:
+                for signal in data:
                     if isinstance(signal["time"], str):
                         signal["time"] = datetime.fromisoformat(signal["time"])
+                signal_history = data
     except Exception as e:
         print(f"Помилка завантаження історії сигналів: {e}")
         signal_history = []
 
 def save_signals_history():
     try:
-        # Конвертуємо datetime в строки для JSON
-        history_to_save = []
-        for signal in signal_history:
-            signal_copy = signal.copy()
-            # Перевіряємо, чи time є datetime об'єктом
-            if isinstance(signal_copy["time"], datetime):
-                signal_copy["time"] = signal_copy["time"].isoformat()
-            history_to_save.append(signal_copy)
+        with data_lock:
+            # Конвертуємо datetime в строки для JSON
+            history_to_save = []
+            for signal in signal_history:
+                signal_copy = signal.copy()
+                if isinstance(signal_copy["time"], datetime):
+                    signal_copy["time"] = signal_copy["time"].isoformat()
+                # Конвертуємо numpy types до стандартних Python типів
+                for key, value in signal_copy.items():
+                    if isinstance(value, (np.float32, np.float64)):
+                        signal_copy[key] = float(value)
+                    elif isinstance(value, (np.int32, np.int64)):
+                        signal_copy[key] = int(value)
+                history_to_save.append(signal_copy)
             
-        with open(SIGNALS_HISTORY_FILE, "w") as f:
-            json.dump(history_to_save, f, indent=2)
+            with open(SIGNALS_HISTORY_FILE, "w") as f:
+                json.dump(history_to_save, f, indent=2)
     except Exception as e:
         print(f"Помилка збереження історії сигналів: {e}")
+
+def load_performance_stats():
+    global performance_stats
+    try:
+        if os.path.exists(PERFORMANCE_STATS_FILE):
+            with open(PERFORMANCE_STATS_FILE, "r") as f:
+                performance_stats = json.load(f)
+    except Exception as e:
+        print(f"Помилка завантаження статистики: {e}")
+        performance_stats = {}
+
+def save_performance_stats():
+    try:
+        with data_lock:
+            # Конвертуємо numpy types до стандартних Python типів
+            stats_to_save = {}
+            for symbol, stats in performance_stats.items():
+                cleaned_stats = {}
+                for key, value in stats.items():
+                    if isinstance(value, (np.float32, np.float64)):
+                        cleaned_stats[key] = float(value)
+                    elif isinstance(value, (np.int32, np.int64)):
+                        cleaned_stats[key] = int(value)
+                    else:
+                        cleaned_stats[key] = value
+                stats_to_save[symbol] = cleaned_stats
+            
+            with open(PERFORMANCE_STATS_FILE, "w") as f:
+                json.dump(stats_to_save, f, indent=2)
+    except Exception as e:
+        print(f"Помилка збереження статистики: {e}")
 
 # -------------------------
 # Удосконалений пошук топ монет
@@ -253,6 +296,9 @@ def calculate_atr(highs, lows, closes, period):
     return atr
 
 def calculate_indicators(ohlc):
+    if len(ohlc) < SLOW_EMA:
+        return {}
+        
     closes = np.array([c["close"] for c in ohlc], dtype=float)
     highs = np.array([c["high"] for c in ohlc], dtype=float)
     lows = np.array([c["low"] for c in ohlc], dtype=float)
@@ -348,22 +394,27 @@ def analyze_phase(ohlc):
     trend_up = closes[-2] < closes[-1] if len(closes) >= 2 else False
     trend_down = closes[-2] > closes[-1] if len(closes) >= 2 else False
     
-    ema_bullish = indicators["fast_ema"] > indicators["slow_ema"] if indicators["fast_ema"] is not None and indicators["slow_ema"] is not None else False
-    ema_bearish = indicators["fast_ema"] < indicators["slow_ema"] if indicators["fast_ema"] is not None and indicators["slow_ema"] is not None else False
+    ema_bullish = indicators.get("fast_ema", 0) > indicators.get("slow_ema", 0) if indicators.get("fast_ema") is not None and indicators.get("slow_ema") is not None else False
+    ema_bearish = indicators.get("fast_ema", 0) < indicators.get("slow_ema", 0) if indicators.get("fast_ema") is not None and indicators.get("slow_ema") is not None else False
     
-    rsi = indicators["rsi"]
+    rsi = indicators.get("rsi")
     rsi_overbought = rsi > 70 if rsi is not None else False
     rsi_oversold = rsi < 30 if rsi is not None else False
     
-    macd_bullish = indicators["macd_histogram"] > 0 if indicators["macd_histogram"] is not None else False
-    macd_bearish = indicators["macd_histogram"] < 0 if indicators["macd_histogram"] is not None else False
+    macd_bullish = indicators.get("macd_histogram", 0) > 0 if indicators.get("macd_histogram") is not None else False
+    macd_bearish = indicators.get("macd_histogram", 0) < 0 if indicators.get("macd_histogram") is not None else False
     
-    volume_spike = indicators["volume_ratio"] > 1.5 if indicators["volume_ratio"] is not None else False
+    volume_spike = indicators.get("volume_ratio", 0) > 1.5 if indicators.get("volume_ratio") is not None else False
     
     buy_signals = sum([ema_bullish, not rsi_overbought, macd_bullish, trend_up, volume_spike])
     sell_signals = sum([ema_bearish, not rsi_oversold, macd_bearish, trend_down, volume_spike])
     
-    volatility = indicators["atr"] or (max(highs[-10:]) - min(lows[-10:])) / 2 if len(highs) >= 10 and len(lows) >= 10 else 0
+    # Безпечний розрахунок волатильності
+    volatility = 0
+    if indicators.get("atr") is not None:
+        volatility = indicators["atr"]
+    elif len(highs) >= 10 and len(lows) >= 10:
+        volatility = (max(highs[-10:]) - min(lows[-10:])) / 2
     
     confidence = abs(buy_signals - sell_signals) / 5
     
@@ -380,6 +431,11 @@ def analyze_phase(ohlc):
 def send_signal(symbol, signal, price, volatility, confidence, indicators, timeframe_confirmation):
     global last_signals, signal_history
     
+    # Фільтр мінімальної впевненості 40%
+    if confidence < MIN_CONFIDENCE:
+        print(f"Пропускаємо {symbol} - впевненість {confidence*100:.1f}% < {MIN_CONFIDENCE*100}%")
+        return
+        
     if signal == "HOLD":
         return
         
@@ -402,11 +458,11 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
         sl = round(price + volatility * atr_multiplier_sl, 4)
     
     # Розрахунок відсотків до TP/SL
-    tp_percent = round(((tp - price) / price) * 100, 2)
-    sl_percent = round(((sl - price) / price) * 100, 2)
+    tp_percent = round(((tp - price) / price) * 100, 2) if price != 0 else 0
+    sl_percent = round(((sl - price) / price) * 100, 2) if price != 0 else 0
     
     risk_percentage = 0.02
-    position_size = risk_percentage / ((abs(price - sl)) / price) if price != sl else 0
+    position_size = risk_percentage / ((abs(price - sl)) / price) if price != sl and price != 0 else 0
     
     # Аналізуємо результати минулих сигналів
     successful, unsuccessful, success_rate, avg_profit = analyze_signal_performance(symbol, price)
@@ -424,17 +480,18 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
         "position_size": position_size
     }
     
-    last_signals[symbol] = signal_data
-    
-    # Додаємо сигнал до історії
-    signal_history.append(signal_data)
-    
-    # Обмежуємо історію до останніх 1000 сигналів
-    if len(signal_history) > 1000:
-        signal_history = signal_history[-1000:]
-    
-    # Зберігаємо історію
-    save_signals_history()
+    with data_lock:
+        last_signals[symbol] = signal_data
+        
+        # Додаємо сигнал до історії
+        signal_history.append(signal_data)
+        
+        # Обмежуємо історію до останніх 1000 сигналів
+        if len(signal_history) > 1000:
+            signal_history = signal_history[-1000:]
+        
+        # Зберігаємо історію
+        save_signals_history()
     
     # Формування повідомлення
     emoji = "🚀" if signal == "BUY" else "🔻"
@@ -483,39 +540,39 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
 # Статистика продуктивності сигналів
 # -------------------------
 def update_performance_stats(symbol, signal, price):
-    if symbol not in performance_stats:
-        performance_stats[symbol] = {
-            "buy_signals": 0,
-            "sell_signals": 0,
-            "last_signal": signal,
-            "last_price": price,
-            "profitability": 0,
-            "total_signals": 0,
-            "successful_signals": 0
-        }
-    
-    stats = performance_stats[symbol]
-    stats["total_signals"] += 1
-    
-    if signal == "BUY":
-        stats["buy_signals"] += 1
-    else:
-        stats["sell_signals"] += 1
+    with data_lock:
+        if symbol not in performance_stats:
+            performance_stats[symbol] = {
+                "buy_signals": 0,
+                "sell_signals": 0,
+                "last_signal": signal,
+                "last_price": price,
+                "profitability": 0,
+                "total_signals": 0,
+                "successful_signals": 0
+            }
         
-    if stats["last_signal"] and stats["last_price"]:
-        price_change = (price - stats["last_price"]) / stats["last_price"] * 100
+        stats = performance_stats[symbol]
+        stats["total_signals"] += 1
         
-        if (stats["last_signal"] == "BUY" and price_change > 0) or \
-           (stats["last_signal"] == "SELL" and price_change < 0):
-            stats["successful_signals"] += 1
+        if signal == "BUY":
+            stats["buy_signals"] += 1
+        else:
+            stats["sell_signals"] += 1
             
-        stats["profitability"] = stats["successful_signals"] / stats["total_signals"] * 100 if stats["total_signals"] > 0 else 0
+        if stats["last_signal"] and stats["last_price"]:
+            price_change = (price - stats["last_price"]) / stats["last_price"] * 100
+            
+            if (stats["last_signal"] == "BUY" and price_change > 0) or \
+               (stats["last_signal"] == "SELL" and price_change < 0):
+                stats["successful_signals"] += 1
+                
+            stats["profitability"] = stats["successful_signals"] / stats["total_signals"] * 100 if stats["total_signals"] > 0 else 0
+            
+        stats["last_signal"] = signal
+        stats["last_price"] = price
         
-    stats["last_signal"] = signal
-    stats["last_price"] = price
-    
-    with open("performance_stats.json", "w") as f:
-        json.dump(performance_stats, f)
+        save_performance_stats()
 
 # -------------------------
 # Перевірка ринку
@@ -579,14 +636,15 @@ def check_market():
                         timeframe_confirmation
                     )
                 
-                last_status[symbol] = {
-                    "signals": signals,
-                    "confidences": confidences,
-                    "timeframes": TIMEFRAMES[:len(signals)],
-                    "last_prices": last_prices,
-                    "volatilities": volatilities,
-                    "timestamp": datetime.now()
-                }
+                with data_lock:
+                    last_status[symbol] = {
+                        "signals": signals,
+                        "confidences": confidences,
+                        "timeframes": TIMEFRAMES[:len(signals)],
+                        "last_prices": last_prices,
+                        "volatilities": volatilities,
+                        "timestamp": datetime.now()
+                    }
                 
                 time.sleep(0.2)
 
@@ -655,12 +713,14 @@ def webhook():
             bot.send_message(message_obj.chat.id, "❌ Немає надісланих сигналів")
         else:
             msg = "📝 *Останні сигнали:*\n\n"
-            for sym, info in list(last_signals.items())[-5:]:
+            with data_lock:
+                recent_signals = list(last_signals.items())[-5:]
+            for sym, info in recent_signals:
                 time_diff = (datetime.now() - info["time"]).total_seconds() / 60
                 note = "✅ Високе" if info["confidence"] > 0.7 else "⚠️ Помірне"
                 # Розрахунок відсотків для останніх сигналів
-                tp_percent = round(((info["tp"] - info["price"]) / info["price"]) * 100, 2)
-                sl_percent = round(((info["sl"] - info["price"]) / info["price"]) * 100, 2)
+                tp_percent = round(((info["tp"] - info["price"]) / info["price"]) * 100, 2) if info["price"] != 0 else 0
+                sl_percent = round(((info["sl"] - info["price"]) / info["price"]) * 100, 2) if info["price"] != 0 else 0
                 
                 msg += (
                     f"*{sym}:* {info['signal']} ({time_diff:.1f} хв тому)\n"
@@ -673,11 +733,12 @@ def webhook():
         if not performance_stats:
             bot.send_message(message_obj.chat.id, "❌ Немає даних про продуктивність")
         else:
-            sorted_stats = sorted(
-                performance_stats.items(), 
-                key=lambda x: x[1].get("profitability", 0), 
-                reverse=True
-            )[:10]
+            with data_lock:
+                sorted_stats = sorted(
+                    performance_stats.items(), 
+                    key=lambda x: x[1].get("profitability", 0), 
+                    reverse=True
+                )[:10]
             
             msg = "🏆 *Топ-10 монет за прибутковістю:*\n\n"
             for symbol, stats in sorted_stats:
@@ -733,20 +794,6 @@ def setup_webhook():
         print("Webhook setup:", response.json())
     except Exception as e:
         print(f"Помилка налаштування webhook: {e}")
-
-# -------------------------
-# Завантаження статистики при запуску
-# -------------------------
-def load_performance_stats():
-    global performance_stats
-    try:
-        with open("performance_stats.json", "r") as f:
-            performance_stats = json.load(f)
-    except FileNotFoundError:
-        performance_stats = {}
-    except Exception as e:
-        print(f"Помилка завантаження статистики: {e}")
-        performance_stats = {}
 
 # -------------------------
 # Запуск
