@@ -10,12 +10,17 @@ import numpy as np
 import os
 from threading import Lock
 import logging
+from dotenv import load_dotenv
+
+# Завантажуємо змінні середовища
+load_dotenv()
 
 # -------------------------
-# Налаштування
+# Налаштування з змінних середовища
 # -------------------------
-API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
-CHAT_ID = "6053907025"
+API_KEY_TELEGRAM = os.getenv('TELEGRAM_API_KEY', "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI")
+CHAT_ID = int(os.getenv('TELEGRAM_CHAT_ID', "6053907025"))  # Конвертуємо в число
+
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 N_CANDLES = 50
 FAST_EMA = 10
@@ -31,7 +36,7 @@ MIN_PRICE_CHANGE = 2.0
 CONFIRMATION_THRESHOLD = 0.75
 MIN_CONFIDENCE = 0.4  # Мінімальна впевненість 40%
 
-WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
+WEBHOOK_HOST = os.getenv('WEBHOOK_HOST', "https://troovy-detective-bot-1-4on4.onrender.com")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
@@ -39,7 +44,7 @@ bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
 # Налаштування логування
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Блокування для потокобезпечного доступу
 data_lock = Lock()
@@ -51,6 +56,33 @@ signal_history = []  # Історія всіх сигналів
 # Файл для збереження історії сигналів
 SIGNALS_HISTORY_FILE = "signals_history.json"
 PERFORMANCE_STATS_FILE = "performance_stats.json"
+
+# -------------------------
+# Перевірка налаштувань
+# -------------------------
+def check_config():
+    """Перевіряє коректність налаштувань"""
+    logging.info("Перевірка конфігурації...")
+    
+    if not API_KEY_TELEGRAM or API_KEY_TELEGRAM == "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI":
+        logging.warning("Використовується стандартний API_KEY_TELEGRAM. Перевірте змінну середовища TELEGRAM_API_KEY")
+    
+    if CHAT_ID == 6053907025:
+        logging.warning("Використовується стандартний CHAT_ID. Перевірте змінну середовища TELEGRAM_CHAT_ID")
+    
+    logging.info(f"API_KEY_TELEGRAM: {'Встановлено' if API_KEY_TELEGRAM else 'Відсутній'}")
+    logging.info(f"CHAT_ID: {CHAT_ID}")
+    logging.info(f"WEBHOOK_HOST: {WEBHOOK_HOST}")
+
+def check_bot_token():
+    """Перевіряє валідність токену бота"""
+    try:
+        bot_info = bot.get_me()
+        logging.info(f"Бот успішно підключений: {bot_info.first_name} (@{bot_info.username})")
+        return True
+    except Exception as e:
+        logging.error(f"Помилка підключення бота: {e}")
+        return False
 
 # -------------------------
 # Завантаження та збереження даних
@@ -66,8 +98,9 @@ def load_signals_history():
                     if isinstance(signal["time"], str):
                         signal["time"] = datetime.fromisoformat(signal["time"])
                 signal_history = data
+                logging.info(f"Завантажено {len(signal_history)} сигналів з історії")
     except Exception as e:
-        print(f"Помилка завантаження історії сигналів: {e}")
+        logging.error(f"Помилка завантаження історії сигналів: {e}")
         signal_history = []
 
 def save_signals_history():
@@ -89,8 +122,9 @@ def save_signals_history():
             
             with open(SIGNALS_HISTORY_FILE, "w") as f:
                 json.dump(history_to_save, f, indent=2)
+            logging.info(f"Збережено {len(history_to_save)} сигналів в історію")
     except Exception as e:
-        print(f"Помилка збереження історії сигналів: {e}")
+        logging.error(f"Помилка збереження історії сигналів: {e}")
 
 def load_performance_stats():
     global performance_stats
@@ -98,8 +132,9 @@ def load_performance_stats():
         if os.path.exists(PERFORMANCE_STATS_FILE):
             with open(PERFORMANCE_STATS_FILE, "r") as f:
                 performance_stats = json.load(f)
+            logging.info(f"Завантажено статистику для {len(performance_stats)} монет")
     except Exception as e:
-        print(f"Помилка завантаження статистики: {e}")
+        logging.error(f"Помилка завантаження статистики: {e}")
         performance_stats = {}
 
 def save_performance_stats():
@@ -120,8 +155,9 @@ def save_performance_stats():
             
             with open(PERFORMANCE_STATS_FILE, "w") as f:
                 json.dump(stats_to_save, f, indent=2)
+            logging.info(f"Збережено статистику для {len(stats_to_save)} монет")
     except Exception as e:
-        print(f"Помилка збереження статистики: {e}")
+        logging.error(f"Помилка збереження статистики: {e}")
 
 # -------------------------
 # Удосконалений пошук топ монет
@@ -129,7 +165,14 @@ def save_performance_stats():
 def get_top_symbols(min_volume=MIN_VOLUME, min_price_change=MIN_PRICE_CHANGE):
     url = "https://api.binance.com/api/v3/ticker/24hr"
     try:
-        data = requests.get(url, timeout=10).json()
+        response = requests.get(url, timeout=10)
+        logging.info(f"Binance API статус: {response.status_code}")
+        
+        if response.status_code != 200:
+            logging.error(f"Помилка Binance API: {response.text}")
+            return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+            
+        data = response.json()
         usdt_pairs = [x for x in data if x["symbol"].endswith("USDT")]
         
         filtered_pairs = [
@@ -143,9 +186,11 @@ def get_top_symbols(min_volume=MIN_VOLUME, min_price_change=MIN_PRICE_CHANGE):
             key=lambda x: (float(x["quoteVolume"]) * abs(float(x["priceChangePercent"]))), 
             reverse=True
         )
-        return [x["symbol"] for x in sorted_pairs[:20]]
+        top_symbols = [x["symbol"] for x in sorted_pairs[:20]]
+        logging.info(f"Знайдено {len(top_symbols)} топ монет")
+        return top_symbols
     except Exception as e:
-        print(f"Помилка отримання топ монет: {e}")
+        logging.error(f"Помилка отримання топ монет: {e}")
         return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 # -------------------------
@@ -181,9 +226,10 @@ def get_historical_data(symbol, interval, limit=100):
             })
         
         data_cache[cache_key] = (ohlc, current_time)
+        logging.debug(f"Отримано дані для {symbol} {interval}: {len(ohlc)} candles")
         return ohlc
     except Exception as e:
-        print(f"Помилка отримання даних для {symbol}: {e}")
+        logging.error(f"Помилка отримання даних для {symbol}: {e}")
         return []
 
 # -------------------------
@@ -437,7 +483,7 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     
     # Фільтр мінімальної впевненості 40%
     if confidence < MIN_CONFIDENCE:
-        print(f"Пропускаємо {symbol} - впевненість {confidence*100:.1f}% < {MIN_CONFIDENCE*100}%")
+        logging.info(f"Пропускаємо {symbol} - впевненість {confidence*100:.1f}% < {MIN_CONFIDENCE*100}%")
         return
         
     if signal == "HOLD":
@@ -448,6 +494,7 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
         last_signal_time = last_signals[symbol]["time"]
         if (current_time - last_signal_time).total_seconds() < 3600:
             if last_signals[symbol]["signal"] == signal:
+                logging.info(f"Пропускаємо {symbol} - сигнал вже був відправлений менше години тому")
                 return
     
     atr_multiplier_tp = 1.5 if confidence > 0.7 else 1.0
@@ -522,7 +569,9 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     )
     
     try:
-        bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+        logging.info(f"Спроба відправки сигналу для {symbol}: {signal} по ціні {price}")
+        sent_message = bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
+        logging.info(f"Повідомлення успішно відправлено: ID {sent_message.message_id}")
         
         with open("signals.log", "a", encoding="utf-8") as f:
             log_msg = (
@@ -536,7 +585,7 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
         update_performance_stats(symbol, signal, price)
             
     except Exception as e:
-        print(f"Помилка відправки повідомлення: {e}")
+        logging.error(f"Помилка відправки повідомлення: {e}")
         with open("errors.log", "a") as f:
             f.write(f"{datetime.now()} - Помилка відправки: {e}\n")
 
@@ -583,14 +632,15 @@ def update_performance_stats(symbol, signal, price):
 # -------------------------
 def check_market():
     global last_status
-    print(f"{datetime.now()} - Функція check_market() запущена")
+    logging.info("Функція check_market() запущена")
     
     while True:
         try:
             symbols = get_top_symbols()
-            print(f"{datetime.now()} - Перевірка {len(symbols)} монет: {symbols}")
+            logging.info(f"Перевірка {len(symbols)} монет: {symbols}")
             
             for symbol in symbols:
+                logging.debug(f"Аналіз {symbol}")
                 signals = []
                 volatilities = []
                 confidences = []
@@ -600,6 +650,7 @@ def check_market():
                 for tf in TIMEFRAMES:
                     ohlc = get_historical_data(symbol, tf, N_CANDLES)
                     if not ohlc or len(ohlc) < N_CANDLES:
+                        logging.warning(f"Недостатньо даних для {symbol} на {tf} таймфреймі")
                         continue
                         
                     signal, volatility, confidence, indicators, is_strong = analyze_phase(ohlc)
@@ -610,6 +661,7 @@ def check_market():
                     last_prices.append(ohlc[-1]["close"])
                 
                 if not signals:
+                    logging.info(f"Немає сигналів для {symbol}")
                     continue
                 
                 buy_count = signals.count("BUY")
@@ -632,6 +684,8 @@ def check_market():
                     price = last_prices[-1] if last_prices else 0
                     max_volatility = max(volatilities) if volatilities else 0
                     
+                    logging.info(f"Знайдено сигнал {final_signal} для {symbol} з впевненістю {avg_confidence:.2f}")
+                    
                     send_signal(
                         symbol, 
                         final_signal, 
@@ -641,6 +695,8 @@ def check_market():
                         all_indicators[-1],
                         timeframe_confirmation
                     )
+                else:
+                    logging.debug(f"Немає сильного сигналу для {symbol}: BUY={buy_count}, SELL={sell_count}")
                 
                 with data_lock:
                     last_status[symbol] = {
@@ -655,10 +711,11 @@ def check_market():
                 time.sleep(0.2)
 
         except Exception as e:
-            print(f"{datetime.now()} - Помилка: {e}")
+            logging.error(f"Помилка в check_market: {e}")
             with open("errors.log", "a") as f:
                 f.write(f"{datetime.now()} - {e}\n")
         
+        logging.info("Очікування 30 секунд перед наступною перевіркою...")
         time.sleep(30)
 
 # -------------------------
