@@ -446,6 +446,70 @@ def detect_market_manipulation(symbol):
         logger.error(f"Помилка детекції маніпуляцій для {symbol}: {e}")
         return None
 
+def find_rocket_pumps():
+    """Пошук монет для мгновенних пампів (як MYX, SOMI)"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        # Фільтруємо перспективні монети
+        potential_pumps = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") 
+            and 500_000 < float(d["quoteVolume"]) < 5_000_000  # Середній об'єм
+            and abs(float(d["priceChangePercent"])) < 10  # Ще не полетіли
+            and not d["symbol"].startswith(('BTC', 'ETH', 'BNB'))  # Не мейджори
+        ]
+        
+        rocket_signals = []
+        
+        for coin in potential_pumps[:50]:  # Перевіряємо топ-50
+            symbol = coin["symbol"]
+            
+            try:
+                # Аналізуємо 5m таймфрейм для швидких змін
+                df = get_klines(symbol, interval="5m", limit=50)
+                if not df or len(df["c"]) < 20:
+                    continue
+                
+                closes = np.array(df["c"], dtype=float)
+                volumes = np.array(df["v"], dtype=float)
+                
+                # Критерії для "ракети":
+                current_volume = volumes[-1]
+                avg_volume = np.mean(volumes[-20:])
+                volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+                
+                price_change_5m = ((closes[-1] - closes[-2]) / closes[-2]) * 100 if len(closes) >= 2 else 0
+                price_change_15m = ((closes[-1] - closes[-4]) / closes[-4]) * 100 if len(closes) >= 4 else 0
+                
+                # Сильні сигнали для пампу
+                is_rocket = (
+                    volume_ratio > 3.0 and  # Об'єм виріс в 3+ рази
+                    price_change_5m > 2.0 and  # +2% за 5 хвилин
+                    price_change_15m < 5.0 and  # Ще не напамповано
+                    current_volume > 10000  # Мінімальний абсолютний об'єм
+                )
+                
+                if is_rocket:
+                    rocket_signals.append({
+                        "symbol": symbol,
+                        "volume_ratio": volume_ratio,
+                        "price_change_5m": price_change_5m,
+                        "current_price": closes[-1],
+                        "current_volume": current_volume,
+                        "timestamp": datetime.now()
+                    })
+                    
+            except Exception as e:
+                continue
+        
+        return rocket_signals
+        
+    except Exception as e:
+        logger.error(f"Помилка пошуку ракет: {e}")
+        return []
+
 def find_golden_crosses():
     """Пошук хрестів за зміною ціни - НАЙКРАЩА ВЕРСІЯ"""
     try:
