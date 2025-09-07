@@ -150,30 +150,27 @@ def check_golden_crosses():
         crosses = find_golden_crosses()
         
         if not crosses:
+            logger.info("Золотих хрестів не знайдено")
             return
         
-        # Групуємо по типах
-        golden = [c for c in crosses if c["type"] == "GOLDEN"]
-        death = [c for c in crosses if c["type"] == "DEATH"]
-        
-        # Надсилаємо сповіщення тільки про сильні сигнали
+        # Фільтруємо тільки сильні сигнали
         strong_signals = [c for c in crosses if c["crossover_strength"] > 0.5]
         
         for signal in strong_signals:
-            emoji = "🟢" if signal["type"] == "GOLDEN" else "🔴"
-            msg = (
-                f"{emoji} <b>{signal['symbol']}</b>\n"
-                f"{'Золотий' if signal['type'] == 'GOLDEN' else 'Смертельний'} хрест\n"
-                f"💰 Ціна: {signal['price']:.4f}\n"
-                f"📈 EMA20: {signal['ema20']:.4f}\n"
-                f"📉 EMA50: {signal['ema50']:.4f}\n"
-                f"⚡ Сила: {signal['crossover_strength']:.2f}%\n"
-                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-            )
-            
             # Перевіряємо, чи не надсилали вже сигнал для цієї монети
             if signal['symbol'] not in last_signals or \
-               (datetime.now() - last_signals[signal['symbol']]).total_seconds() > 3600:
+               (datetime.now() - last_signals[signal['symbol']]).total_seconds() > 10800:  # 3 години
+                
+                emoji = "🟢" if signal["type"] == "GOLDEN" else "🔴"
+                msg = (
+                    f"{emoji} <b>{signal['symbol']}</b>\n"
+                    f"{'Золотий' if signal['type'] == 'GOLDEN' else 'Смертельний'} хрест\n"
+                    f"💰 Ціна: {signal['price']:.4f}\n"
+                    f"📈 EMA20: {signal['ema20']:.4f}\n"
+                    f"📉 EMA50: {signal['ema50']:.4f}\n"
+                    f"⚡ Сила: {signal['crossover_strength']:.2f}%\n"
+                    f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                )
                 
                 bot.send_message(CHAT_ID, msg, parse_mode="HTML")
                 last_signals[signal['symbol']] = datetime.now()
@@ -181,6 +178,85 @@ def check_golden_crosses():
                 
     except Exception as e:
         logger.error(f"Помилка перевірки хрестів: {e}")
+
+def check_whale_activity_auto():
+    """Автоматична перевірка китівської активності"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        usdt_pairs = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 8_000_000
+        ]
+        
+        top_symbols = [s["symbol"] for s in sorted(usdt_pairs, 
+                         key=lambda x: float(x["priceChangePercent"]), 
+                         reverse=True)[:10]]
+        
+        whale_signals = []
+        for symbol in top_symbols:
+            activity = detect_whale_activity(symbol)
+            if activity and activity["whale_detected"]:
+                whale_signals.append(activity)
+            time.sleep(0.3)
+        
+        if not whale_signals:
+            return
+        
+        for signal in whale_signals[:3]:  # Максимум 3 сигнали
+            msg = (
+                f"🐋 <b>{signal['symbol']}</b> - китівська активність!\n"
+                f"💰 Ціна: {signal['price']:.4f}\n"
+                f"🔊 Об'єм: x{signal['volume_ratio']:.1f} від середнього\n"
+                f"📊 Поточний об'єм: {signal['current_volume']:.0f}\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
+            
+            bot.send_message(CHAT_ID, msg, parse_mode="HTML")
+            logger.info(f"Надіслано сигнал китів: {signal['symbol']}")
+                
+    except Exception as e:
+        logger.error(f"Помилка перевірки китів: {e}")
+
+def check_market_manipulation_auto():
+    """Автоматична перевірка маніпуляцій"""
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr"
+        data = requests.get(url, timeout=10).json()
+        
+        usdt_pairs = [
+            d for d in data 
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 3_000_000 and
+            abs(float(d["priceChangePercent"])) > 8.0
+        ]
+        
+        top_symbols = [s["symbol"] for s in usdt_pairs[:5]]
+        
+        manipulation_signals = []
+        for symbol in top_symbols:
+            analysis = detect_market_manipulation(symbol)
+            if analysis and analysis["manipulation_detected"]:
+                manipulation_signals.append(analysis)
+            time.sleep(0.3)
+        
+        if not manipulation_signals:
+            return
+        
+        for signal in manipulation_signals:
+            msg = (
+                f"⚠️ <b>{signal['symbol']}</b> - можлива маніпуляція!\n"
+                f"🎯 Score: {signal['manipulation_score']}/4\n"
+                f"📊 Кореляція: {signal['correlation']:.2f}\n"
+                f"🔒 Будьте обережні з цим активом\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
+            
+            bot.send_message(CHAT_ID, msg, parse_mode="HTML")
+            logger.info(f"Надіслано сигнал маніпуляції: {signal['symbol']}")
+                
+    except Exception as e:
+        logger.error(f"Помилка перевірки маніпуляцій: {e}")
 
 # -------------------------
 # Команди Telegram
