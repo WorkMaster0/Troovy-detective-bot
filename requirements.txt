@@ -11,3 +11,4 @@ asyncio
 python-dotenv
 beautifulsoup4
 lxml
+scipy
