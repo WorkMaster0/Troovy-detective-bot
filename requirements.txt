@@ -12,4 +12,4 @@ python-dotenv
 beautifulsoup4
 lxml
 scipy
-sclearn
+sklearn
