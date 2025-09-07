@@ -697,29 +697,14 @@ def check_market():
     """Постійна перевірка ринку"""
     logger.info("Запуск Smart Auto перевірки ринку...")
     
-    # Лічильник ітерацій для різних типів перевірок
-    iteration_count = 0
+    # Лічильник для різних типів перевірок
+    check_counter = 0
     
     while True:
         try:
-            iteration_count += 1
+            check_counter += 1
             
-            # Кожні 3 ітерації (15 хвилин) перевіряємо золоті хрести
-            if iteration_count % 3 == 0:
-                logger.info("Перевіряємо золоті хрести...")
-                check_golden_crosses()
-            
-            # Кожні 6 ітерацій (30 хвилин) перевіряємо китівську активність
-            if iteration_count % 6 == 0:
-                logger.info("Перевіряємо китівську активність...")
-                check_whale_activity_auto()
-            
-            # Кожні 12 ітерацій (60 хвилин) перевіряємо маніпуляції
-            if iteration_count % 12 == 0:
-                logger.info("Перевіряємо можливі маніпуляції...")
-                check_market_manipulation_auto()
-            
-            # Основна перевірка ринку (кожні 5 хвилин)
+            # ОСНОВНА ПЕРЕВІРКА - кожні 5 хвилин
             url = "https://api.binance.com/api/v3/ticker/24hr"
             data = requests.get(url, timeout=10).json()
             
@@ -734,11 +719,12 @@ def check_market():
                 reverse=True
             )
             
-            top_symbols = [s["symbol"] for s in sorted_symbols[:30]]
-            logger.info(f"Аналізуємо {len(top_symbols)} монет: {top_symbols[:5]}...")
+            top_symbols = [s["symbol"] for s in sorted_symbols[:25]]  # Зменшимо до 25 для швидкості
+            logger.info(f"Аналізуємо {len(top_symbols)} монет: {top_symbols[:3]}...")
             
             signals_found = 0
             
+            # 1. Перевірка основних сигналів (breakout, pre-top)
             for symbol in top_symbols:
                 try:
                     signal_data = analyze_symbol(symbol)
@@ -746,25 +732,77 @@ def check_market():
                     if signal_data:
                         best_signal = max(signal_data, key=lambda x: abs(x["diff_pct"]))
                         
+                        # Додаємо поточну ціну
                         df = get_klines(symbol, interval="1h", limit=2)
                         if df and len(df["c"]) > 0:
                             best_signal["current_price"] = df["c"][-1]
                         
                         if send_signal_message(symbol, best_signal):
                             signals_found += 1
+                            logger.info(f"Знайдено сигнал: {symbol} {best_signal['type']}")
                             
-                    time.sleep(0.5)  # Затримка між монетами
+                    time.sleep(0.3)  # Затримка між монетами
                     
                 except Exception as e:
                     logger.error(f"Помилка обробки {symbol}: {e}")
                     continue
             
-            logger.info(f"Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
-            time.sleep(300)  # 5 хвилин між перевірками
+            # 2. ПЕРЕВІРКА ЗОЛОТИХ ХРЕСТІВ - кожні 15 хвилин
+            if check_counter % 3 == 0:  # 3 * 5хв = 15хв
+                logger.info("=== ПЕРЕВІРКА ЗОЛОТИХ ХРЕСТІВ ===")
+                crosses = find_golden_crosses()
+                
+                if crosses:
+                    for cross in crosses:
+                        # Надсилаємо тільки сильні сигнали (>1%)
+                        if cross["crossover_strength"] > 1.0:
+                            emoji = "🟢" if cross["type"] == "GOLDEN" else "🔴"
+                            msg = (
+                                f"{emoji} <b>{cross['symbol']}</b>\n"
+                                f"{'Золотий' if cross['type'] == 'GOLDEN' else 'Смертельний'} хрест\n"
+                                f"💰 Ціна: {cross['price']:.4f}\n"
+                                f"📈 EMA20: {cross['ema20']:.4f}\n"
+                                f"📉 EMA50: {cross['ema50']:.4f}\n"
+                                f"⚡ Сила: {cross['crossover_strength']:.2f}%\n"
+                                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                            )
+                            
+                            bot.send_message(CHAT_ID, msg, parse_mode="HTML")
+                            logger.info(f"Надіслано хрест: {cross['symbol']}")
+            
+            # 3. ПЕРЕВІРКА ВОЛАТИЛЬНОСТІ - кожні 20 хвилин
+            if check_counter % 4 == 0:  # 4 * 5хв = 20хв
+                logger.info("=== ПЕРЕВІРКА ВОЛАТИЛЬНОСТІ ===")
+                volatility_signals = []
+                
+                for symbol in top_symbols[:10]:  # Перевіряємо тільки топ-10
+                    try:
+                        prediction = predict_volatility_spikes(symbol)
+                        if prediction and prediction["volatility_spike_predicted"]:
+                            volatility_signals.append(prediction)
+                            logger.info(f"Знайдено волатильність: {symbol}")
+                    except Exception as e:
+                        logger.error(f"Помилка волатильності {symbol}: {e}")
+                    time.sleep(0.2)
+                
+                if volatility_signals:
+                    for signal in volatility_signals[:3]:  # Макс 3 сигнали
+                        msg = (
+                            f"⚡ <b>{signal['symbol']}</b> - сплеск волатильності!\n"
+                            f"💰 Ціна: {signal['price']:.4f}\n"
+                            f"📊 Поточна волатильність: {signal['current_volatility']*100:.2f}%\n"
+                            f"📈 Відношення до середньої: x{signal['volatility_ratio']:.2f}\n"
+                            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+                        )
+                        
+                        bot.send_message(CHAT_ID, msg, parse_mode="HTML")
+            
+            logger.info(f"Цикл {check_counter} завершено. Знайдено {signals_found} сигналів. Очікування 5 хвилин...")
+            time.sleep(300)  # 5 хвилин
             
         except Exception as e:
             logger.error(f"Критична помилка: {e}")
-            time.sleep(60)  # 1 хвилина при помилці
+            time.sleep(60)
 
 # -------------------------
 # Flask та Webhook
