@@ -160,8 +160,24 @@ def calculate_futures_amount(symbol: str, price: float) -> float:
     try:
         market = exchanges['gate'].market(symbol + '/USDT:USDT')
         contract_size = float(market['contractSize'])
+        
+        if price <= 0 or contract_size <= 0:
+            return 0
+            
+        # Розраховуємо кількість контрактів
         amount = (TRADE_AMOUNT_USD * LEVERAGE) / (price * contract_size)
-        return round(amount, market['precision']['amount'])
+        
+        # Отримуємо precision та конвертуємо в int
+        precision = int(market['precision']['amount'])
+        
+        # Перевіряємо мінімальну кількість
+        min_amount = float(market['limits']['amount']['min'])
+        if amount < min_amount:
+            print(f"{datetime.now()} | ⚠️ Кількість {amount} менша за мінімум {min_amount} для {symbol}")
+            return 0
+            
+        return round(amount, precision)
+        
     except Exception as e:
         print(f"{datetime.now()} | ❌ Помилка розрахунку кількості {symbol}: {e}")
         return 0
@@ -181,6 +197,14 @@ def execute_futures_trade(symbol: str, gate_price: float, binance_price: float, 
         # Розраховуємо кількість
         amount = calculate_futures_amount(symbol, gate_price)
         if amount <= 0:
+            print(f"{datetime.now()} | ⚠️ Нульова кількість для {symbol}")
+            return
+        
+        # Додаткова перевірка мінімальної кількості
+        market = exchanges['gate'].market(futures_symbol)
+        min_amount = float(market['limits']['amount']['min'])
+        if amount < min_amount:
+            print(f"{datetime.now()} | ⚠️ Кількість {amount} менша за мінімум {min_amount} для {symbol}")
             return
         
         if spread > 0:  # Binance ціна вища - купуємо на Gate
@@ -205,7 +229,7 @@ def execute_futures_trade(symbol: str, gate_price: float, binance_price: float, 
         msg = f"🎯 {side} {symbol}\n"
         msg += f"💰 Ціна: ${gate_price:.4f}\n"
         msg += f"📊 Spread: {abs(spread):.2f}%\n"
-        msg += f"📦 Кількість: {amount:.4f}\n"
+        msg += f"📦 Кількість: {amount:.6f}\n"
         msg += f"⚖️ Плече: {LEVERAGE}x\n"
         msg += f"🆔 Order: {order['id']}"
         
