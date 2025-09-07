@@ -8,14 +8,14 @@ import time
 # -------------------------
 # Налаштування
 # -------------------------
-API_KEY_TELEGRAM = "YOUR_TELEGRAM_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+API_KEY_TELEGRAM = "8051222216:AAFORHEn1IjWllQyPp8W_1OY3gVxcBNVvZI"
+CHAT_ID = "6053907025"
 TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 N_CANDLES = 30
 FAST_EMA = 10
 SLOW_EMA = 30
 
-WEBHOOK_HOST = "https://your-app-name.onrender.com"
+WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
