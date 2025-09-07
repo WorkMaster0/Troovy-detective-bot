@@ -447,85 +447,91 @@ def detect_market_manipulation(symbol):
         return None
 
 def find_golden_crosses():
-    """Пошук золотих/смертельних хрестів у топ монет"""
+    """Пошук хрестів за зміною ціни - НАЙКРАЩА ВЕРСІЯ"""
     try:
         url = "https://api.binance.com/api/v3/ticker/24hr"
         data = requests.get(url, timeout=10).json()
         
         usdt_pairs = [
             d for d in data 
-            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 10_000_000
+            if d["symbol"].endswith("USDT") 
+            and float(d["quoteVolume"]) > 1_000_000  # Мінімальний об'єм
+            and not d["symbol"].startswith('BUSD')   # Виключаємо стейблкоїни
         ]
         
-        # Беремо топ-15 за зміною ціни
+        # ✅ Сортуємо за ЗМІНОЮ ЦІНИ (найважливіше!)
         sorted_symbols = sorted(
             usdt_pairs,
-            key=lambda x: abs(float(x["priceChangePercent"])),
+            key=lambda x: abs(float(x["priceChangePercent"])),  # Абсолютна зміна
             reverse=True
         )
         
-        top_symbols = [s["symbol"] for s in sorted_symbols[:15]]
+        # Беремо топ-30 найволатильніших монет
+        top_symbols = [s["symbol"] for s in sorted_symbols[:30]]
+        
         golden_crosses = []
         
         for symbol in top_symbols:
             try:
-                df = get_klines(symbol, interval="1h", limit=100)  # Змінив на 1h для кращого виявлення
-                if not df or len(df["c"]) < 50:
+                # Використовуємо 4h таймфрейм для кращого виявлення
+                df = get_klines(symbol, interval="4h", limit=50)
+                if not df or len(df["c"]) < 30:
                     continue
                 
                 closes = np.array(df["c"], dtype=float)
                 
-                # Розраховуємо EMA20 та EMA50
-                ema20_values = []
-                ema50_values = []
+                # Спрощений розрахунок EMA
+                def calculate_simple_ema(prices, period):
+                    if len(prices) < period:
+                        return None
+                    alpha = 2 / (period + 1)
+                    ema = prices[0]
+                    for price in prices[1:]:
+                        ema = alpha * price + (1 - alpha) * ema
+                    return ema
                 
-                for i in range(len(closes)):
-                    # EMA20 потребує мінімум 20 точок
-                    if i >= 19:
-                        ema20 = calculate_ema(closes[:i+1], 20)
-                        ema20_values.append(ema20)
-                    
-                    # EMA50 потребує мінімум 50 точок
-                    if i >= 49:
-                        ema50 = calculate_ema(closes[:i+1], 50)
-                        ema50_values.append(ema50)
+                # EMA для поточного і попереднього періоду
+                current_ema20 = calculate_simple_ema(closes, 20)
+                current_ema50 = calculate_simple_ema(closes, 50)
                 
-                # Перевіряємо, чи маємо достатньо даних для порівняння
-                if len(ema20_values) < 2 or len(ema50_values) < 2:
+                # Для попереднього періоду беремо дані без останньої свічки
+                prev_ema20 = calculate_simple_ema(closes[:-1], 20) if len(closes) > 20 else None
+                prev_ema50 = calculate_simple_ema(closes[:-1], 50) if len(closes) > 50 else None
+                
+                if None in [current_ema20, current_ema50, prev_ema20, prev_ema50]:
                     continue
                 
-                # Беремо останні 2 значення для порівняння
-                current_ema20 = ema20_values[-1]
-                current_ema50 = ema50_values[-1]
-                prev_ema20 = ema20_values[-2]
-                prev_ema50 = ema50_values[-2]
+                # Визначаємо тип хреста
+                price_diff_percent = abs((current_ema20 - current_ema50) / current_ema50 * 100)
                 
-                # Перевірка золотого хреста (EMA20 перетинає EMA50 знизу вверх)
-                golden_cross = prev_ema20 <= prev_ema50 and current_ema20 > current_ema50
-                
-                # Перевірка смертельного хреста (EMA20 перетинає EMA50 зверху вниз)
-                death_cross = prev_ema20 >= prev_ema50 and current_ema20 < current_ema50
-                
-                if golden_cross or death_cross:
-                    crossover_strength = abs((current_ema20 - current_ema50) / current_ema50 * 100)
-                    
+                # Золотий хрест
+                if prev_ema20 < prev_ema50 and current_ema20 > current_ema50:
                     golden_crosses.append({
                         "symbol": symbol,
-                        "type": "GOLDEN" if golden_cross else "DEATH",
+                        "type": "GOLDEN",
                         "ema20": current_ema20,
                         "ema50": current_ema50,
                         "price": closes[-1],
-                        "crossover_strength": crossover_strength,
-                        "timestamp": datetime.now()
+                        "crossover_strength": price_diff_percent
                     })
-                    logger.info(f"Знайдено хрест: {symbol} {golden_crosses[-1]['type']}")
+                
+                # Смертельний хрест
+                elif prev_ema20 > prev_ema50 and current_ema20 < current_ema50:
+                    golden_crosses.append({
+                        "symbol": symbol, 
+                        "type": "DEATH",
+                        "ema20": current_ema20,
+                        "ema50": current_ema50,
+                        "price": closes[-1],
+                        "crossover_strength": price_diff_percent
+                    })
                 
             except Exception as e:
-                logger.error(f"Помилка аналізу {symbol}: {e}")
                 continue
         
-        logger.info(f"Знайдено {len(golden_crosses)} хрестів")
-        return golden_crosses
+        # Сортуємо за силою хреста
+        golden_crosses.sort(key=lambda x: x["crossover_strength"], reverse=True)
+        return golden_crosses[:10]  # Топ-10 найсильніших
         
     except Exception as e:
         logger.error(f"Помилка пошуку хрестів: {e}")
