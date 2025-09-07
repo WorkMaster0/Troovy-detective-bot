@@ -11,7 +11,7 @@ import math
 from typing import List, Tuple, Dict
 
 # -------------------------
-# Налаштування
+# Налаштування через environment variables
 # -------------------------
 API_KEY_TELEGRAM = os.getenv("API_KEY_TELEGRAM")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -27,6 +27,7 @@ SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", 1.0))
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
 LEVERAGE = int(os.getenv("LEVERAGE", 20))
 MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", 1))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", 10.0))
 
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
@@ -47,20 +48,78 @@ except Exception as e:
 active_positions = {}
 trade_history = []
 profit_loss = 0.0
+token_blacklist = set()
 
 # -------------------------
-# СПРАВЖНІЙ АРБІТРАЖ: Ф'ЮЧЕРСИ vs СПОТ
+# WEBHOOK ТА FLASK ФУНКЦІЇ
 # -------------------------
-def get_gateio_futures_prices(symbols: List[str] = None) -> Dict[str, float]:
-    """Отримання цін ф'ючерсів з Gate.io"""
+@app.route(WEBHOOK_PATH, methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return 'OK', 200
+    return 'Bad Request', 400
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return {
+        'status': 'healthy', 
+        'timestamp': datetime.now().isoformat(),
+        'positions': len(active_positions),
+        'balance': get_balance()
+    }
+
+@app.route('/stats', methods=['GET'])
+def stats():
+    return {
+        'total_trades': len(trade_history),
+        'active_positions': len(active_positions),
+        'profit_loss': profit_loss,
+        'blacklisted_tokens': len(token_blacklist)
+    }
+
+def setup_webhook():
+    """Налаштування вебхука для Telegram"""
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=WEBHOOK_URL)
+        print(f"{datetime.now()} | ✅ Вебхук налаштовано: {WEBHOOK_URL}")
+    except Exception as e:
+        print(f"{datetime.now()} | ❌ Помилка налаштування вебхука: {e}")
+
+# -------------------------
+# ФУНКЦІЇ ДЛЯ РОБОТИ З БІРЖЕЮ
+# -------------------------
+def get_balance() -> float:
+    """Отримання балансу"""
+    try:
+        balance = exchange.fetch_balance()
+        return balance['USDT']['total']
+    except Exception as e:
+        print(f"{datetime.now()} | ❌ Помилка отримання балансу: {e}")
+        return 0
+
+def get_positions():
+    """Отримання позицій з біржі"""
+    try:
+        positions = exchange.fetch_positions()
+        return [p for p in positions if p['contracts'] > 0]
+    except Exception as e:
+        print(f"{datetime.now()} | ❌ Помилка отримання позицій: {e}")
+        return []
+
+def get_futures_prices(symbols: List[str] = None) -> Dict[str, float]:
+    """Отримання цін ф'ючерсів"""
     prices = {}
     if not exchange:
         return prices
         
     try:
         if not symbols:
-            # Топ-20 ліквідних пар
-            symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'DOT', 'LINK', 'MATIC', 'DOGE',
+            symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'DOT', 'LINK', 'MATIC', 'DOGE', 
                       'BNB', 'ATOM', 'LTC', 'OP', 'ARB', 'FIL', 'APT', 'NEAR', 'ALGO', 'XLM']
         
         for symbol in symbols:
@@ -68,54 +127,68 @@ def get_gateio_futures_prices(symbols: List[str] = None) -> Dict[str, float]:
                 ticker = exchange.fetch_ticker(f"{symbol}/USDT:USDT")
                 if ticker and ticker['last'] and ticker['last'] > 0:
                     prices[symbol] = ticker['last']
-            except:
+            except Exception as e:
+                print(f"{datetime.now()} | ⚠️ Помилка ціни {symbol}: {e}")
                 continue
                 
     except Exception as e:
-        print(f"{datetime.now()} | ❌ Помилка отримання ф'ючерсних цін: {e}")
+        print(f"{datetime.now()} | ❌ Помилка отримання цін: {e}")
     
     return prices
 
-def get_gateio_spot_prices(symbols: List[str] = None) -> Dict[str, float]:
-    """Отримання спотових цін з Gate.io (для арбітражу)"""
+def get_spot_prices(symbols: List[str] = None) -> Dict[str, float]:
+    """Отримання спотових цін через CoinGecko"""
     prices = {}
     
     try:
-        # Використовуємо CoinGecko для спотових цін
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        if symbols:
-            ids = ",".join([f"{s.lower()}" for s in symbols if s != 'USDT'])
-        else:
-            ids = "bitcoin,ethereum,solana,ripple,cardano,avalanche-2,polkadot,chainlink,polygon,dogecoin"
+        if not symbols:
+            symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'DOT', 'LINK', 'MATIC', 'DOGE']
         
-        params = {
-            "ids": ids,
-            "vs_currencies": "usd"
+        # Конвертуємо символи в CoinGecko format
+        coin_map = {
+            'BTC': 'bitcoin', 'ETH': 'ethereum', 'SOL': 'solana', 
+            'XRP': 'ripple', 'ADA': 'cardano', 'AVAX': 'avalanche-2',
+            'DOT': 'polkadot', 'LINK': 'chainlink', 'MATIC': 'polygon',
+            'DOGE': 'dogecoin', 'BNB': 'binancecoin', 'ATOM': 'cosmos',
+            'LTC': 'litecoin', 'OP': 'optimism', 'ARB': 'arbitrum'
         }
         
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            for coin_id, price_data in data.items():
-                symbol = coin_id.upper().replace("-", "")
-                if symbol == "AVALANCHE2":
-                    symbol = "AVAX"
-                prices[symbol] = price_data['usd']
+        coin_ids = []
+        for symbol in symbols:
+            if symbol in coin_map:
+                coin_ids.append(coin_map[symbol])
+        
+        if coin_ids:
+            url = "https://api.coingecko.com/api/v3/simple/price"
+            params = {
+                "ids": ",".join(coin_ids),
+                "vs_currencies": "usd"
+            }
+            
+            response = requests.get(url, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                for coin_id, price_data in data.items():
+                    # Знаходимо символ по coin_id
+                    for sym, cid in coin_map.items():
+                        if cid == coin_id:
+                            prices[sym] = price_data['usd']
+                            break
                 
     except Exception as e:
         print(f"{datetime.now()} | ❌ Помилка отримання спотових цін: {e}")
     
     return prices
 
-def calculate_real_spread(futures_price: float, spot_price: float) -> float:
-    """Розрахунок реального спреду між ф'ючерсами і спотом"""
+# -------------------------
+# АРБІТРАЖНА ЛОГІКА
+# -------------------------
+def calculate_spread(futures_price: float, spot_price: float) -> float:
+    """Розрахунок спреду"""
     if not futures_price or not spot_price or spot_price == 0:
         return 0
     return ((futures_price - spot_price) / spot_price) * 100
 
-# -------------------------
-# ТОРГОВА ЛОГІКА
-# -------------------------
 def calculate_futures_amount(symbol: str, price: float) -> float:
     """Розрахунок кількості контрактів"""
     try:
@@ -128,7 +201,6 @@ def calculate_futures_amount(symbol: str, price: float) -> float:
         amount = (TRADE_AMOUNT_USD * LEVERAGE) / (price * contract_size)
         precision = int(market['precision']['amount'])
         
-        # Перевірка мінімальної кількості
         min_amount = float(market['limits']['amount']['min'])
         if amount < min_amount:
             print(f"{datetime.now()} | ⚠️ Кількість {amount} менша за мінімум {min_amount}")
@@ -140,8 +212,8 @@ def calculate_futures_amount(symbol: str, price: float) -> float:
         print(f"{datetime.now()} | ❌ Помилка розрахунку кількості {symbol}: {e}")
         return 0
 
-def execute_trade_based_on_premium(symbol: str, futures_price: float, spot_price: float, spread: float):
-    """Торгівля на основі премії ф'ючерсів"""
+def execute_arbitrage_trade(symbol: str, futures_price: float, spot_price: float, spread: float):
+    """Виконання арбітражної торгівлі"""
     try:
         if len(active_positions) >= MAX_POSITIONS:
             return
@@ -155,16 +227,16 @@ def execute_trade_based_on_premium(symbol: str, futures_price: float, spot_price
         # Встановлюємо плече
         exchange.set_leverage(LEVERAGE, futures_symbol)
         
-        if spread > 0:  # Ф'ючерси дорожчі (премія) - продаємо
+        if spread > 0:  # Ф'ючерси дорожчі - продаємо
             order = exchange.create_market_sell_order(futures_symbol, amount)
             side = "SHORT"
-            reason = "Ф'ючерси дорожчі за спот"
-        else:  # Ф'ючерси дешевші (дисконт) - купуємо
+            reason = "Премія ф'ючерсів"
+        else:  # Ф'ючерси дешевші - купуємо
             order = exchange.create_market_buy_order(futures_symbol, amount)
-            side = "LONG"  
-            reason = "Ф'ючерси дешевші за спот"
+            side = "LONG"
+            reason = "Дисконт ф'ючерсів"
         
-        # Зберігаємо інформацію
+        # Зберігаємо інформацію про trade
         trade_info = {
             'symbol': symbol,
             'side': side,
@@ -195,36 +267,32 @@ def execute_trade_based_on_premium(symbol: str, futures_price: float, spot_price
         error_msg = f"❌ ПОМИЛКА торгівлі {symbol}: {e}"
         bot.send_message(CHAT_ID, error_msg)
         print(f"{datetime.now()} | {error_msg}")
+        token_blacklist.add(symbol)
 
-# -------------------------
-# ПОШУК РЕАЛЬНИХ АРБІТРАЖНИХ МОЖЛИВОСТЕЙ
-# -------------------------
-def find_real_arbitrage_opportunities():
-    """Пошук реальних арбітражних можливостей"""
+def find_arbitrage_opportunities():
+    """Пошук арбітражних можливостей"""
     opportunities = []
     
     try:
-        # Топ-15 ліквідних токенів
-        top_symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'DOT', 'LINK', 'MATIC', 'DOGE', 'BNB', 'ATOM', 'LTC', 'OP', 'ARB']
+        symbols = ['BTC', 'ETH', 'SOL', 'XRP', 'ADA', 'AVAX', 'DOT', 'LINK', 'MATIC', 'DOGE']
         
-        # Отримуємо ціни
-        futures_prices = get_gateio_futures_prices(top_symbols)
-        spot_prices = get_gateio_spot_prices(top_symbols)
+        futures_prices = get_futures_prices(symbols)
+        spot_prices = get_spot_prices(symbols)
         
-        for symbol in top_symbols:
-            if symbol in active_positions:
+        for symbol in symbols:
+            if symbol in active_positions or symbol in token_blacklist:
                 continue
                 
             futures_price = futures_prices.get(symbol)
             spot_price = spot_prices.get(symbol)
             
-            if not futures_price or not spot_price or spot_price == 0:
+            if not futures_price or not spot_price:
                 continue
                 
-            spread = calculate_real_spread(futures_price, spot_price)
+            spread = calculate_spread(futures_price, spot_price)
             
-            # Шукаємо реальні арбітражі (1-10% спред)
-            if abs(spread) >= SPREAD_THRESHOLD and abs(spread) <= 10.0:
+            # Реальні спреди (1-10%)
+            if abs(spread) >= SPREAD_THRESHOLD and abs(spread) <= MAX_SPREAD:
                 opportunities.append((symbol, futures_price, spot_price, spread))
     
     except Exception as e:
@@ -233,7 +301,7 @@ def find_real_arbitrage_opportunities():
     return opportunities
 
 # -------------------------
-# МОНІТОРИНГ ТА ЗАКРИТТЯ
+# МОНІТОРИНГ ТА УПРАВЛІННЯ
 # -------------------------
 def monitor_positions():
     """Моніторинг позицій"""
@@ -246,14 +314,13 @@ def monitor_positions():
                     current_price = ticker['last']
                     entry_price = position['futures_price']
                     
-                    # Розраховуємо PnL
                     if position['side'] == 'LONG':
                         pnl_percent = ((current_price - entry_price) / entry_price) * 100 * LEVERAGE
                     else:
                         pnl_percent = ((entry_price - current_price) / entry_price) * 100 * LEVERAGE
                     
-                    # Закриття при досягненні цілі
-                    if abs(pnl_percent) >= 3.0:  # 3% прибуток/збиток
+                    # Закриття при ±3%
+                    if abs(pnl_percent) >= 3.0:
                         close_position(symbol, current_price, pnl_percent)
                         
                 except Exception as e:
@@ -276,7 +343,6 @@ def close_position(symbol: str, current_price: float, pnl_percent: float):
         else:
             order = exchange.create_market_buy_order(futures_symbol, position['amount'])
         
-        # Оновлюємо PnL
         global profit_loss
         profit_loss += (pnl_percent / 100) * TRADE_AMOUNT_USD
         
@@ -301,9 +367,8 @@ def close_position(symbol: str, current_price: float, pnl_percent: float):
 # -------------------------
 def start_arbitrage_bot():
     """Головний цикл бота"""
-    bot.send_message(CHAT_ID, "🚀 Запущено РЕАЛЬНИЙ арбітражний бот!")
+    bot.send_message(CHAT_ID, "🚀 Арбітражний бот запущено з усіма функціями!")
     
-    # Запуск моніторингу
     monitor_thread = threading.Thread(target=monitor_positions, daemon=True)
     monitor_thread.start()
     
@@ -312,18 +377,17 @@ def start_arbitrage_bot():
         cycle += 1
         
         try:
-            balance = exchange.fetch_balance()['USDT']['total'] if exchange else 0
+            balance = get_balance()
             print(f"{datetime.now()} | 🔄 Цикл {cycle} | Баланс: ${balance:.2f}")
             
-            # Пошук можливостей
-            opportunities = find_real_arbitrage_opportunities()
+            opportunities = find_arbitrage_opportunities()
             
             if opportunities:
-                print(f"{datetime.now()} | 📊 Знайдено {len(opportunities)} реальних арбітражів")
+                print(f"{datetime.now()} | 📊 Знайдено {len(opportunities)} арбітражів")
                 
                 for symbol, futures_price, spot_price, spread in opportunities:
                     if len(active_positions) < MAX_POSITIONS:
-                        execute_trade_based_on_premium(symbol, futures_price, spot_price, spread)
+                        execute_arbitrage_trade(symbol, futures_price, spot_price, spread)
                         time.sleep(2)
             
             time.sleep(CHECK_INTERVAL)
@@ -333,53 +397,169 @@ def start_arbitrage_bot():
             time.sleep(60)
 
 # -------------------------
-# TELEGRAM КОМАНДИ
+# TELEGRAM КОМАНДИ (ПОВНИЙ НАБІР)
 # -------------------------
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "🤖 Реальний арбітражний бот активовано!")
+    welcome_msg = """
+🤖 *Повнофункціональний Арбітражний Бот*
+
+*Доступні команди:*
+/status - Статус системи
+/balance - Баланс та позиції
+/positions - Деталі позицій
+/arbitrage - Пошук арбітражу
+/profit - Статистика прибутку
+/trades - Історія угод
+/blacklist - Чорний список
+/health - Стан здоров'я
+/help - Допомога
+
+*Налаштування:*
+• Спред: {}%
+• Плече: {}x
+• Сума: ${}
+• Макс. позицій: {}
+    """.format(SPREAD_THRESHOLD, LEVERAGE, TRADE_AMOUNT_USD, MAX_POSITIONS)
+    
+    bot.reply_to(message, welcome_msg, parse_mode='Markdown')
 
 @bot.message_handler(commands=['status'])
 def show_status(message):
-    if not exchange:
-        bot.reply_to(message, "❌ Біржа не підключена")
+    balance = get_balance()
+    exchange_positions = get_positions()
+    
+    msg = f"📊 *Статус Системи*\n\n"
+    msg += f"💰 *Баланс:* ${balance:.2f}\n"
+    msg += f"📈 *Активні позиції:* {len(active_positions)}\n"
+    msg += f"📉 *Позиції на біржі:* {len(exchange_positions)}\n"
+    msg += f"⚫ *Чорний список:* {len(token_blacklist)}\n"
+    msg += f"💵 *Загальний PnL:* ${profit_loss:.2f}\n"
+    msg += f"🔄 *Всього угод:* {len(trade_history)}"
+    
+    bot.reply_to(message, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['balance'])
+def show_balance(message):
+    balance = get_balance()
+    msg = f"💳 *Баланс:* ${balance:.2f}\n"
+    msg += f"📊 *Активні позиції:* {len(active_positions)}/{MAX_POSITIONS}"
+    bot.reply_to(message, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['positions'])
+def show_positions(message):
+    if not active_positions:
+        bot.reply_to(message, "📭 Немає активних позицій")
         return
-        
-    balance = exchange.fetch_balance()['USDT']['total']
-    msg = f"💰 Баланс: ${balance:.2f}\n"
-    msg += f"📊 Позицій: {len(active_positions)}\n"
-    msg += f"📈 PnL: ${profit_loss:.2f}"
-    bot.reply_to(message, msg)
+    
+    msg = "📋 *Активні позиції:*\n\n"
+    for symbol, position in active_positions.items():
+        msg += f"• {symbol} {position['side']}\n"
+        msg += f"  Ціна: ${position['futures_price']:.6f}\n"
+        msg += f"  Спред: {position['spread']:.2f}%\n"
+        msg += f"  Час: {position['timestamp'].strftime('%H:%M:%S')}\n\n"
+    
+    bot.reply_to(message, msg, parse_mode='Markdown')
 
 @bot.message_handler(commands=['arbitrage'])
 def find_arbitrage_cmd(message):
-    opportunities = find_real_arbitrage_opportunities()
+    opportunities = find_arbitrage_opportunities()
     
     if opportunities:
-        msg = "🎯 Реальні арбітражі:\n\n"
+        msg = "🎯 *Знайдені арбітражі:*\n\n"
         for symbol, futures, spot, spread in opportunities:
-            msg += f"• {symbol}: {spread:+.2f}%\n"
-            msg += f"  Futures: ${futures:.6f}\n"
-            msg += f"  Spot: ${spot:.6f}\n\n"
+            direction = "📈" if spread > 0 else "📉"
+            msg += f"{direction} *{symbol}:* {spread:+.2f}%\n"
+            msg += f"   Futures: ${futures:.6f}\n"
+            msg += f"   Spot: ${spot:.6f}\n\n"
     else:
-        msg = "🔍 Арбітражі не знайдені"
+        msg = "🔍 *Арбітражі не знайдені*"
     
-    bot.reply_to(message, msg)
+    bot.reply_to(message, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['profit'])
+def show_profit(message):
+    msg = f"📈 *Статистика прибутку*\n\n"
+    msg += f"💵 *Загальний PnL:* ${profit_loss:.2f}\n"
+    msg += f"🔄 *Всього угод:* {len(trade_history)}\n"
+    msg += f"✅ *Активних позицій:* {len(active_positions)}\n"
+    msg += f"❌ *Чорний список:* {len(token_blacklist)}"
+    
+    if trade_history:
+        profitable = sum(1 for t in trade_history if 'spread' in t and t['spread'] > 0)
+        msg += f"\n📊 *Успішні угоди:* {profitable}/{len(trade_history)}"
+    
+    bot.reply_to(message, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['trades'])
+def show_trades(message):
+    if not trade_history:
+        bot.reply_to(message, "📭 Немає історії угод")
+        return
+    
+    msg = "📜 *Останні 5 угод:*\n\n"
+    for trade in trade_history[-5:]:
+        msg += f"• {trade['symbol']} {trade['side']}\n"
+        msg += f"  Спред: {trade.get('spread', 0):.2f}%\n"
+        msg += f"  Час: {trade['timestamp'].strftime('%H:%M')}\n\n"
+    
+    bot.reply_to(message, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['blacklist'])
+def show_blacklist(message):
+    if token_blacklist:
+        msg = "⚫ *Чорний список:*\n\n"
+        for token in list(token_blacklist)[:10]:
+            msg += f"• {token}\n"
+    else:
+        msg = "✅ *Чорний список порожній*"
+    
+    bot.reply_to(message, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['health'])
+def show_health(message):
+    health = health_check()
+    bot.reply_to(message, f"❤️ *Стан здоров'я:* {health['status']}\n🕐 *Час:* {health['timestamp']}")
+
+@bot.message_handler(commands=['help'])
+def show_help(message):
+    help_msg = """
+🆘 *Довідка по командам*
+
+*/start* - Запуск бота
+*/status* - Статус системи
+*/balance* - Баланс
+*/positions* - Активні позиції
+*/arbitrage* - Пошук арбітражу
+*/profit* - Статистика прибутку
+*/trades* - Історія угод
+*/blacklist* - Чорний список
+*/health* - Стан здоров'я
+*/help* - Ця довідка
+    """
+    
+    bot.reply_to(message, help_msg, parse_mode='Markdown')
 
 # -------------------------
-# ЗАПУСК
+# ЗАПУСК СИСТЕМИ
 # -------------------------
 if __name__ == "__main__":
-    print(f"{datetime.now()} | 🚀 Запуск реального арбітражного бота...")
+    print(f"{datetime.now()} | 🚀 Запуск повнофункціонального арбітражного бота...")
     
-    if not all([API_KEY_TELEGRAM, CHAT_ID, GATE_API_KEY, GATE_API_SECRET]):
+    # Перевірка ключів
+    required_keys = [API_KEY_TELEGRAM, CHAT_ID, GATE_API_KEY, GATE_API_SECRET]
+    if not all(required_keys):
         print(f"{datetime.now()} | ❌ Відсутні обов'язкові ключі!")
         exit(1)
+    
+    # Налаштування вебхука
+    setup_webhook()
     
     # Запуск бота
     bot_thread = threading.Thread(target=start_arbitrage_bot, daemon=True)
     bot_thread.start()
     
-    # Запуск Telegram
-    bot.remove_webhook()
-    bot.polling(none_stop=True)
+    print(f"{datetime.now()} | ✅ Бот запущено. Вебхук: {WEBHOOK_URL}")
+    
+    # Запуск Flask
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
