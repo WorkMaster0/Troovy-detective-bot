@@ -204,7 +204,7 @@ def analyze_pump_potential(symbol):
         logger.error(f"Помилка аналізу пампу для {symbol}: {e}")
         return None
 
-def get_top_pump_candidates(limit=10):
+def get_top_pump_candidates(limit=15):
     """Отримання топ кандидатів для пампу"""
     try:
         url = "https://api.binance.com/api/v3/ticker/24hr"
@@ -212,7 +212,7 @@ def get_top_pump_candidates(limit=10):
         
         usdt_pairs = [
             d for d in data 
-            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 3_000_000
+            if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 2_000_000  # Зменшимо мінімальний об'єм
         ]
         
         # Сортуємо за зміною ціни та об'ємом
@@ -222,7 +222,7 @@ def get_top_pump_candidates(limit=10):
             reverse=True
         )
         
-        top_symbols = [s["symbol"] for s in sorted_symbols[:30]]
+        top_symbols = [s["symbol"] for s in sorted_symbols[:50]]  # 50 монет
         
         pump_candidates = []
         for symbol in top_symbols:
