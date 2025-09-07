@@ -438,8 +438,6 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     
     # Формування повідомлення
     emoji = "🚀" if signal == "BUY" else "🔻"
-    rsi_status = f"RSI: {indicators['rsi']:.1f}" if indicators.get('rsi') is not None else "RSI: N/A"
-    macd_status = f"MACD: {'↑' if indicators.get('macd_histogram', 0) > 0 else '↓'}" if indicators.get('macd_histogram') is not None else "MACD: N/A"
     
     note = "✅ Високе підтвердження" if confidence > 0.7 else "⚠️ Помірне підтвердження"
     if timeframe_confirmation < len(TIMEFRAMES) * CONFIRMATION_THRESHOLD:
@@ -450,16 +448,14 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     if successful + unsuccessful > 0:
         history_info = f"📊 Історія: ✅{successful} | ❌{unsuccessful} | Успішність: {success_rate:.1f}% | Сер.прибуток: {avg_profit:.2f}%"
     
-    # Додаємо відсотки до TP/SL
-    tp_sl_info = f"🎯 TP: `{tp}` (+{tp_percent}%) | 🛑 SL: `{sl}` ({sl_percent}%)"
+    # ОНОВЛЕНО: TP і SL в різних рядках, видалено RSI/MACD та розмір позиції
+    tp_sl_info = f"🎯 Тейк-профіт: `{tp}` (+{tp_percent}%)\n🛑 Стоп-лос: `{sl}` ({sl_percent}%)"
     
     msg = (
         f"{emoji} *{symbol}* | {signal}\n"
         f"💰 Ціна: `{price}`\n"
         f"{tp_sl_info}\n"
-        f"📊 {rsi_status} | {macd_status} | Обсяг: x{indicators.get('volume_ratio', 0):.1f}\n"
         f"📈 Впевненість: {confidence*100:.1f}%\n"
-        f"💼 Розмір позиції: {position_size*100:.1f}% балансу\n"
         f"{history_info}\n"
         f"_{note}_"
     )
