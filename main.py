@@ -144,6 +144,44 @@ def analyze_symbol(symbol):
         logger.error(f"Помилка аналізу {symbol}: {e}")
         return None
 
+def check_golden_crosses():
+    """Автоматична перевірка золотих хрестів"""
+    try:
+        crosses = find_golden_crosses()
+        
+        if not crosses:
+            return
+        
+        # Групуємо по типах
+        golden = [c for c in crosses if c["type"] == "GOLDEN"]
+        death = [c for c in crosses if c["type"] == "DEATH"]
+        
+        # Надсилаємо сповіщення тільки про сильні сигнали
+        strong_signals = [c for c in crosses if c["crossover_strength"] > 0.5]
+        
+        for signal in strong_signals:
+            emoji = "🟢" if signal["type"] == "GOLDEN" else "🔴"
+            msg = (
+                f"{emoji} <b>{signal['symbol']}</b>\n"
+                f"{'Золотий' if signal['type'] == 'GOLDEN' else 'Смертельний'} хрест\n"
+                f"💰 Ціна: {signal['price']:.4f}\n"
+                f"📈 EMA20: {signal['ema20']:.4f}\n"
+                f"📉 EMA50: {signal['ema50']:.4f}\n"
+                f"⚡ Сила: {signal['crossover_strength']:.2f}%\n"
+                f"⏰ {datetime.now().strftime('%H:%M:%S')}"
+            )
+            
+            # Перевіряємо, чи не надсилали вже сигнал для цієї монети
+            if signal['symbol'] not in last_signals or \
+               (datetime.now() - last_signals[signal['symbol']]).total_seconds() > 3600:
+                
+                bot.send_message(CHAT_ID, msg, parse_mode="HTML")
+                last_signals[signal['symbol']] = datetime.now()
+                logger.info(f"Надіслано сигнал хреста: {signal['symbol']} {signal['type']}")
+                
+    except Exception as e:
+        logger.error(f"Помилка перевірки хрестів: {e}")
+
 # -------------------------
 # Команди Telegram
 # -------------------------
