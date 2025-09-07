@@ -457,49 +457,57 @@ def find_golden_crosses():
             if d["symbol"].endswith("USDT") and float(d["quoteVolume"]) > 10_000_000
         ]
         
-        top_symbols = [s["symbol"] for s in usdt_pairs[:20]]
+        # Беремо топ-15 за зміною ціни
+        sorted_symbols = sorted(
+            usdt_pairs,
+            key=lambda x: abs(float(x["priceChangePercent"])),
+            reverse=True
+        )
+        
+        top_symbols = [s["symbol"] for s in sorted_symbols[:15]]
         golden_crosses = []
         
         for symbol in top_symbols:
             try:
-                df = get_klines(symbol, interval="4h", limit=100)
+                df = get_klines(symbol, interval="1h", limit=100)  # Змінив на 1h для кращого виявлення
                 if not df or len(df["c"]) < 50:
                     continue
                 
                 closes = np.array(df["c"], dtype=float)
                 
-                # EMA 20 та EMA 50 - ВИПРАВЛЕНА РЕАЛІЗАЦІЯ
-                ema20 = []
-                ema50 = []
+                # Розраховуємо EMA20 та EMA50
+                ema20_values = []
+                ema50_values = []
                 
-                # Розраховуємо EMA для всіх точок
                 for i in range(len(closes)):
-                    if i >= 19:  # EMA20 потребує мінімум 20 точок
-                        ema20.append(calculate_ema(closes[:i+1], 20))
-                    if i >= 49:  # EMA50 потребує мінімум 50 точок
-                        ema50.append(calculate_ema(closes[:i+1], 50))
+                    # EMA20 потребує мінімум 20 точок
+                    if i >= 19:
+                        ema20 = calculate_ema(closes[:i+1], 20)
+                        ema20_values.append(ema20)
+                    
+                    # EMA50 потребує мінімум 50 точок
+                    if i >= 49:
+                        ema50 = calculate_ema(closes[:i+1], 50)
+                        ema50_values.append(ema50)
                 
-                # Перевіряємо, чи маємо достатньо даних
-                if len(ema20) < 2 or len(ema50) < 2:
+                # Перевіряємо, чи маємо достатньо даних для порівняння
+                if len(ema20_values) < 2 or len(ema50_values) < 2:
                     continue
                 
-                # Беремо останні значення
-                current_ema20 = ema20[-1]
-                current_ema50 = ema50[-1]
-                prev_ema20 = ema20[-2] if len(ema20) >= 2 else current_ema20
-                prev_ema50 = ema50[-2] if len(ema50) >= 2 else current_ema50
+                # Беремо останні 2 значення для порівняння
+                current_ema20 = ema20_values[-1]
+                current_ema50 = ema50_values[-1]
+                prev_ema20 = ema20_values[-2]
+                prev_ema50 = ema50_values[-2]
                 
-                # Перевірка золотого/смертельного хреста
-                golden_cross = prev_ema20 is not None and prev_ema50 is not None and \
-                              current_ema20 is not None and current_ema50 is not None and \
-                              prev_ema20 <= prev_ema50 and current_ema20 > current_ema50
+                # Перевірка золотого хреста (EMA20 перетинає EMA50 знизу вверх)
+                golden_cross = prev_ema20 <= prev_ema50 and current_ema20 > current_ema50
                 
-                death_cross = prev_ema20 is not None and prev_ema50 is not None and \
-                             current_ema20 is not None and current_ema50 is not None and \
-                             prev_ema20 >= prev_ema50 and current_ema20 < current_ema50
+                # Перевірка смертельного хреста (EMA20 перетинає EMA50 зверху вниз)
+                death_cross = prev_ema20 >= prev_ema50 and current_ema20 < current_ema50
                 
                 if golden_cross or death_cross:
-                    crossover_strength = abs((current_ema20 - current_ema50) / current_ema50 * 100) if current_ema50 else 0
+                    crossover_strength = abs((current_ema20 - current_ema50) / current_ema50 * 100)
                     
                     golden_crosses.append({
                         "symbol": symbol,
@@ -507,15 +515,16 @@ def find_golden_crosses():
                         "ema20": current_ema20,
                         "ema50": current_ema50,
                         "price": closes[-1],
-                        "crossover_strength": crossover_strength
+                        "crossover_strength": crossover_strength,
+                        "timestamp": datetime.now()
                     })
-                
-                time.sleep(0.1)  # Невелика затримка
+                    logger.info(f"Знайдено хрест: {symbol} {golden_crosses[-1]['type']}")
                 
             except Exception as e:
                 logger.error(f"Помилка аналізу {symbol}: {e}")
                 continue
         
+        logger.info(f"Знайдено {len(golden_crosses)} хрестів")
         return golden_crosses
         
     except Exception as e:
