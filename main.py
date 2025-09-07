@@ -547,7 +547,7 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     # Формування повідомлення
     emoji = "🚀" if signal == "BUY" else "🔻"
     
-    note = "✅ Високе підтвердження" if confidence > 0.7 else "⚠️ Помірне підтвердження"
+    note = "✅ Високе підтвердження" if confidence > 0.7 else "⚠️ Помірне підтвердженние"
     if timeframe_confirmation < len(TIMEFRAMES) * CONFIRMATION_THRESHOLD:
         note = f"⚠️ Лише {timeframe_confirmation}/{len(TIMEFRAMES)} ТФ"
     
@@ -570,6 +570,7 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     
     try:
         logging.info(f"Спроба відправки сигналу для {symbol}: {signal} по ціні {price}")
+        # ВИПРАВЛЕНО: Використовуємо пряме відправлення повідомлення замість вебхука
         sent_message = bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
         logging.info(f"Повідомлення успішно відправлено: ID {sent_message.message_id}")
         
@@ -899,11 +900,21 @@ def setup_webhook():
 if __name__ == "__main__":
     load_performance_stats()
     load_signals_history()
-    setup_webhook()
     
-    # Запускаємо перевірку ринку в окремому потоці ПЕРЕД запуском Flask
+    # Перевіряємо токен бота
+    if not check_bot_token():
+        logging.error("Невірний токен бота. Перевірте змінну середовища TELEGRAM_API_KEY")
+        exit(1)
+    
+    # ВИПРАВЛЕНО: Використовуємо пряме відправлення повідомлень замість вебхука
+    # Оскільки вебхук має проблеми з налаштуванням на Render
+    
+    # Запускаємо перевірку ринку в окремому потоці
     market_thread = threading.Thread(target=check_market, daemon=True)
     market_thread.start()
     
     print(f"{datetime.now()} - Бот запущено. Перевірка ринку активована.")
+    
+    # ВИПРАВЛЕНО: Запускаємо Flask тільки для обслуговування запитів,
+    # але використовуємо пряме відправлення повідомлень
     app.run(host="0.0.0.0", port=10000, debug=False, use_reloader=False)
