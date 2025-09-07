@@ -33,6 +33,14 @@ WEBHOOK_HOST = "https://troovy-detective-bot-1-4on4.onrender.com"
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = WEBHOOK_HOST + WEBHOOK_PATH
 
+# Додаткові API endpoints для ротації
+BINANCE_API_URLS = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com"
+]
+
 bot = telebot.TeleBot(API_KEY_TELEGRAM)
 app = Flask(__name__)
 
@@ -43,6 +51,11 @@ signal_history = []  # Історія всіх сигналів
 
 # Файл для збереження історії сигналів
 SIGNALS_HISTORY_FILE = "signals_history.json"
+
+# Налаштування кешу
+data_cache = {}
+CACHE_DURATION = 15  # Зменшено до 15 секунд для частіших оновлень
+CACHE_CLEANUP_INTERVAL = 300  # Очищення кешу кожні 5 хвилин
 
 # -------------------------
 # Завантаження та збереження історії сигналів
@@ -103,11 +116,8 @@ def get_top_symbols(min_volume=MIN_VOLUME, min_price_change=MIN_PRICE_CHANGE):
         return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 # -------------------------
-# Історичні дані з кешуванням
+# Історичні дані з кешуванням та ротацією API
 # -------------------------
-data_cache = {}
-CACHE_DURATION = 30
-
 def get_historical_data(symbol, interval, limit=100):
     cache_key = f"{symbol}_{interval}"
     current_time = time.time()
@@ -117,28 +127,54 @@ def get_historical_data(symbol, interval, limit=100):
         if current_time - timestamp < CACHE_DURATION:
             return data
     
-    try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        ohlc = []
-        for d in data:
-            timestamp = datetime.fromtimestamp(d[0] / 1000)
-            ohlc.append({
-                "time": timestamp,
-                "open": float(d[1]),
-                "high": float(d[2]),
-                "low": float(d[3]),
-                "close": float(d[4]),
-                "volume": float(d[5])
-            })
-        
-        data_cache[cache_key] = (ohlc, current_time)
-        return ohlc
-    except Exception as e:
-        print(f"Помилка отримання даних для {symbol}: {e}")
-        return []
+    # Ротація через різні API endpoints
+    for api_url in BINANCE_API_URLS:
+        try:
+            url = f"{api_url}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            ohlc = []
+            for d in data:
+                timestamp = datetime.fromtimestamp(d[0] / 1000)
+                ohlc.append({
+                    "time": timestamp,
+                    "open": float(d[1]),
+                    "high": float(d[2]),
+                    "low": float(d[3]),
+                    "close": float(d[4]),
+                    "volume": float(d[5])
+                })
+            
+            data_cache[cache_key] = (ohlc, current_time)
+            return ohlc
+            
+        except Exception as e:
+            print(f"Помилка отримання даних з {api_url} для {symbol}: {e}")
+            continue
+    
+    print(f"Всі API endpoints не відповідають для {symbol}")
+    return []
+
+# -------------------------
+# Функція очищення застарілого кешу
+# -------------------------
+def cleanup_cache():
+    while True:
+        try:
+            current_time = time.time()
+            keys_to_remove = []
+            
+            for key, (data, timestamp) in data_cache.items():
+                if current_time - timestamp > CACHE_DURATION * 2:  # Видаляємо старіші за подвійний час
+                    keys_to_remove.append(key)
+            
+            for key in keys_to_remove:
+                del data_cache[key]
+                
+            time.sleep(CACHE_CLEANUP_INTERVAL)
+        except Exception as e:
+            print(f"Помилка очищення кешу: {e}")
 
 # -------------------------
 # Власна реалізація технічних індикаторів (без TA-Lib)
@@ -437,7 +473,7 @@ def send_signal(symbol, signal, price, volatility, confidence, indicators, timef
     
     last_signals[symbol] = signal_data
     
-    # Додаємо сигнал до історії ТІЛЬКИ якщо confidence >= 40%
+    # Додаємо сигнал до історії ТІЛЬКИ якщo confidence >= 40%
     if confidence >= MIN_CONFIDENCE_FOR_HISTORY:
         signal_history.append(signal_data)
         
@@ -530,42 +566,79 @@ def update_performance_stats(symbol, signal, price):
         json.dump(performance_stats, f)
 
 # -------------------------
-# Перевірка ринку
+# Перевірка ринку з паралельною обробкою
 # -------------------------
+def check_symbol(symbol, results):
+    try:
+        signals = []
+        volatilities = []
+        confidences = []
+        all_indicators = []
+        last_prices = []
+        
+        for tf in TIMEFRAMES:
+            ohlc = get_historical_data(symbol, tf, N_CANDLES)
+            if not ohlc or len(ohlc) < N_CANDLES:
+                continue
+                
+            signal, volatility, confidence, indicators, is_strong = analyze_phase(ohlc)
+            signals.append(signal)
+            volatilities.append(volatility)
+            confidences.append(confidence)
+            all_indicators.append(indicators)
+            last_prices.append(ohlc[-1]["close"])
+        
+        if signals:
+            results.append({
+                'symbol': symbol,
+                'signals': signals,
+                'volatilities': volatilities,
+                'confidences': confidences,
+                'indicators': all_indicators,
+                'last_prices': last_prices
+            })
+    except Exception as e:
+        print(f"Помилка перевірки {symbol}: {e}")
+
 def check_market():
     global last_status
+    check_interval = 30  # секунд між перевірками
+    
     while True:
         try:
             symbols = get_top_symbols()
             print(f"{datetime.now()} - Перевірка {len(symbols)} монет...")
             
+            # Розпаралелюємо перевірку монет
+            threads = []
+            results = []
+            
             for symbol in symbols:
-                signals = []
-                volatilities = []
-                confidences = []
-                all_indicators = []
-                last_prices = []
-                
-                for tf in TIMEFRAMES:
-                    ohlc = get_historical_data(symbol, tf, N_CANDLES)
-                    if not ohlc or len(ohlc) < N_CANDLES:
-                        continue
-                        
-                    signal, volatility, confidence, indicators, is_strong = analyze_phase(ohlc)
-                    signals.append(signal)
-                    volatilities.append(volatility)
-                    confidences.append(confidence)
-                    all_indicators.append(indicators)
-                    last_prices.append(ohlc[-1]["close"])
-                
-                if not signals:
-                    continue
+                thread = threading.Thread(target=check_symbol, args=(symbol, results))
+                threads.append(thread)
+                thread.start()
+            
+            # Чекаємо завершення всіх потоків
+            for thread in threads:
+                thread.join()
+            
+            # Обробляємо результати
+            for result in results:
+                symbol = result['symbol']
+                signals = result['signals']
+                volatilities = result['volatilities']
+                confidences = result['confidences']
+                all_indicators = result['indicators']
+                last_prices = result['last_prices']
                 
                 buy_count = signals.count("BUY")
                 sell_count = signals.count("SELL")
                 total_tfs = len(signals)
                 
-                avg_confidence = sum(confidences) / total_tfs if total_tfs > 0 else 0
+                if total_tfs == 0:
+                    continue
+                
+                avg_confidence = sum(confidences) / total_tfs
                 
                 final_signal = "HOLD"
                 timeframe_confirmation = 0
@@ -599,15 +672,46 @@ def check_market():
                     "volatilities": volatilities,
                     "timestamp": datetime.now()
                 }
-                
-                time.sleep(0.2)
 
         except Exception as e:
-            print(f"{datetime.now()} - Помилка: {e}")
+            print(f"{datetime.now()} - Критична помилка: {e}")
             with open("errors.log", "a") as f:
                 f.write(f"{datetime.now()} - {e}\n")
         
-        time.sleep(30)
+        time.sleep(check_interval)
+
+# -------------------------
+# Додаткові сервісні функції
+# -------------------------
+def health_check():
+    """Перевірка здоров'я системи"""
+    while True:
+        try:
+            # Перевірка з'єднання з Binance
+            response = requests.get("https://api.binance.com/api/v3/ping", timeout=5)
+            if response.status_code != 200:
+                print("⚠️ Проблема з з'єднанням Binance")
+                
+            # Перевірка доступності Telegram
+            bot.get_me()
+            
+        except Exception as e:
+            print(f"⚠️ Health check failed: {e}")
+        
+        time.sleep(60)
+
+def backup_data():
+    """Регулярне резервне копіювання даних"""
+    while True:
+        try:
+            save_signals_history()
+            with open("performance_stats.json", "w") as f:
+                json.dump(performance_stats, f)
+            print("✅ Дані успішно збережено")
+        except Exception as e:
+            print(f"❌ Помилка резервного копіювання: {e}")
+        
+        time.sleep(300)  # Кожні 5 хвилин
 
 # -------------------------
 # Вебхук Telegram з додатковими командами
@@ -767,5 +871,11 @@ if __name__ == "__main__":
     load_performance_stats()
     load_signals_history()
     setup_webhook()
+    
+    # Запускаємо всі необхідні потоки
     threading.Thread(target=check_market, daemon=True).start()
+    threading.Thread(target=cleanup_cache, daemon=True).start()
+    threading.Thread(target=health_check, daemon=True).start()
+    threading.Thread(target=backup_data, daemon=True).start()
+    
     app.run(host="0.0.0.0", port=5000)
