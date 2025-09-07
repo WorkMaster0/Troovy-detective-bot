@@ -6,13 +6,28 @@ from scipy.signal import argrelextrema
 from scipy import stats
 import logging
 from datetime import datetime, timedelta
-import talib
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import DBSCAN
 import warnings
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
+
+def calculate_ema(prices, period):
+    """Власна реалізація EMA"""
+    if len(prices) < period:
+        return None
+    alpha = 2 / (period + 1)
+    ema = [prices[0]]
+    for i in range(1, len(prices)):
+        ema.append(alpha * prices[i] + (1 - alpha) * ema[i-1])
+    return ema[-1]
+
+def calculate_sma(prices, period):
+    """Власна реалізація SMA"""
+    if len(prices) < period:
+        return None
+    return sum(prices[-period:]) / period
 
 def get_klines(symbol, interval="1h", limit=200):
     """Отримання даних з Binance"""
@@ -442,8 +457,8 @@ def find_golden_crosses():
                 closes = np.array(df["c"], dtype=float)
                 
                 # EMA 20 та EMA 50
-                ema20 = talib.EMA(closes, timeperiod=20)
-                ema50 = talib.EMA(closes, timeperiod=50)
+                ema20 = calculate_ema(closes, 20)
+                ema50 = calculate_ema(closes, 50)
                 
                 if len(ema20) < 2 or len(ema50) < 2:
                     continue
