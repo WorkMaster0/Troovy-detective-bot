@@ -13,3 +13,6 @@ beautifulsoup4
 lxml
 scipy
 scikit-learn
+python-telegram-bot
+matplotlib
+seaborn
