@@ -198,6 +198,6 @@ class AdvancedPumpDetectBot:
 
 # Використання
 if __name__ == "__main__":
-    TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
+    TOKEN = "8489382938:AAHeFFZPODspuEFcSQyjw8lWzYpRRSv9n3g"
     bot = AdvancedPumpDetectBot(TOKEN)
     bot.run()
