@@ -1,9 +1,8 @@
-# main.py — Dex Flip Bot + Flask для Render
+# main.py — Dex Flip Bot + Flask для Render (тестова версія)
 import os, json, logging, threading, time, io
 from datetime import datetime, timezone
 
 import pandas as pd
-import numpy as np
 import requests
 import websocket
 import mplfinance as mpf
@@ -13,9 +12,8 @@ from flask import Flask, jsonify
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PORT = int(os.getenv("PORT", 10000))
-TOP_LIMIT = 50
-EMA_SCAN_LIMIT = 500
-CONF_THRESHOLD = 0.5
+TOP_LIMIT = 20           # менше для тесту
+EMA_SCAN_LIMIT = 100
 STATE_FILE = "state.json"
 
 # ---------------- LOGGING ----------------
@@ -40,7 +38,7 @@ state = load_state(STATE_FILE, {"signals": {}, "last_update": None})
 # ---------------- TELEGRAM ----------------
 def send_telegram(text, photo=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.info("Telegram token or chat_id missing, printing instead:\n%s", text)
+        logger.info("[TELEGRAM] %s", text)
         return
     try:
         if photo:
@@ -71,21 +69,15 @@ def detect_signal(df: pd.DataFrame):
     if len(df) < 2: 
         return "WATCH", [], df.iloc[-1], 0.0
     last = df.iloc[-1]
+    prev = df.iloc[-2]
     votes = []
-    conf = 0.2
-    # EMA strategy
-    ema20 = df["close"].rolling(20).mean().iloc[-1]
-    if last["close"] > ema20:
-        votes.append("bull"); conf += 0.1; action = "LONG"
-    elif last["close"] < ema20:
-        votes.append("bear"); conf += 0.1; action = "SHORT"
+    conf = 0.5
+    if last["close"] > prev["close"]:
+        action = "LONG"; votes.append("up"); conf = 0.7
+    elif last["close"] < prev["close"]:
+        action = "SHORT"; votes.append("down"); conf = 0.7
     else:
         action = "WATCH"
-    # Pre-top detection
-    pretop = False
-    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10])/df["close"].iloc[-10] > 0.1:
-        pretop = True; votes.append("pretop"); conf += 0.1
-    conf = min(1.0, conf)
     return action, votes, last, conf
 
 # ---------------- PLOT ----------------
@@ -108,14 +100,18 @@ def on_message(ws, msg):
         df = symbol_dfs.get(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
         df.loc[pd.to_datetime(k["t"], unit="ms")] = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
         df = df.tail(EMA_SCAN_LIMIT); symbol_dfs[s] = df
-    logger.info("Received candle for %s: close=%s", s, k["c"])
-    # send signal
+
+    # --- Логи свічки ---
+    logger.info("Candle: %s time=%s o=%s h=%s l=%s c=%s v=%s", s, k["t"], k["o"], k["h"], k["l"], k["c"], k["v"])
+
+    # --- Надсилання сигналу ---
     action, votes, last, conf = detect_signal(df)
     prev = state["signals"].get(s, "")
     if action != "WATCH" and (action != prev or candle_closed):
         buf = plot_signal(df, s, action, votes)
         send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
-        state["signals"][s] = action; state["last_update"]=str(datetime.now(timezone.utc))
+        state["signals"][s] = action
+        state["last_update"] = str(datetime.now(timezone.utc))
         save_state(STATE_FILE, state)
 
 def on_error(ws, err): logger.error("WebSocket error: %s", err)
@@ -138,16 +134,16 @@ def home():
 # ---------------- START BOT ----------------
 def start_bot():
     symbols = get_symbols_binance()
+    logger.info("Symbols loaded: %s", symbols)
     with lock:
-        for s in symbols: symbol_dfs.setdefault(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
+        for s in symbols:
+            symbol_dfs.setdefault(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
     threading.Thread(target=start_ws, args=(symbols,), daemon=True).start()
+    logger.info("Bot started ✅")
 
 if __name__=="__main__":
-    send_telegram("Bot started ✅")  # перевірка токена
-    # Flask для Render
+    # Flask для Render порту
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
-    # WebSocket бот
+    # Запуск WebSocket бота
     start_bot()
-    # нескінченний цикл для Render
-    while True:
-        time.sleep(1)
+    while True: time.sleep(1)
