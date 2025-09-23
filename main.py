@@ -1,4 +1,4 @@
-# main.py — Dex Flip Bot + Flask для Render (тестова версія)
+# main.py — Dex Flip Bot + Flask для Render
 import os, json, logging, threading, time, io
 from datetime import datetime, timezone
 
@@ -12,9 +12,10 @@ from flask import Flask, jsonify
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PORT = int(os.getenv("PORT", 10000))
-TOP_LIMIT = 20           # менше для тесту
-EMA_SCAN_LIMIT = 100
+TOP_LIMIT = 50
+EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
+CONF_THRESHOLD = 0.5
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -25,13 +26,16 @@ def load_state(path, default):
     try:
         if os.path.exists(path):
             return json.load(open(path))
-    except:
-        pass
+    except Exception as e:
+        logger.warning("Failed to load state: %s", e)
     return default
 
 def save_state(path, data):
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.warning("Failed to save state: %s", e)
 
 state = load_state(STATE_FILE, {"signals": {}, "last_update": None})
 
@@ -66,18 +70,28 @@ def get_symbols_binance():
 
 # ---------------- SIGNALS ----------------
 def detect_signal(df: pd.DataFrame):
-    if len(df) < 2: 
-        return "WATCH", [], df.iloc[-1], 0.0
+    if df.empty or len(df) < 2:
+        return "WATCH", [], None, 0.0
     last = df.iloc[-1]
     prev = df.iloc[-2]
     votes = []
     conf = 0.5
+
+    # Логіка сигналу
     if last["close"] > prev["close"]:
         action = "LONG"; votes.append("up"); conf = 0.7
     elif last["close"] < prev["close"]:
         action = "SHORT"; votes.append("down"); conf = 0.7
     else:
         action = "WATCH"
+
+    # Пре-топ
+    pretop = False
+    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10]) / df["close"].iloc[-10] > 0.1:
+        pretop = True
+        votes.append("pretop")
+        conf = min(1.0, conf + 0.1)
+
     return action, votes, last, conf
 
 # ---------------- PLOT ----------------
@@ -92,27 +106,34 @@ def plot_signal(df, symbol, action, votes):
 
 # ---------------- WEBSOCKET ----------------
 def on_message(ws, msg):
-    data = json.loads(msg)
-    k = data.get("k"); s = data.get("s")
-    if not k: return
-    candle_closed = k["x"]
-    with lock:
-        df = symbol_dfs.get(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
-        df.loc[pd.to_datetime(k["t"], unit="ms")] = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
-        df = df.tail(EMA_SCAN_LIMIT); symbol_dfs[s] = df
+    try:
+        data = json.loads(msg)
+        k = data.get("k")
+        s = data.get("s")
+        if not k or not s:
+            return
+        candle_closed = k["x"]
 
-    # --- Логи свічки ---
-    logger.info("Candle: %s time=%s o=%s h=%s l=%s c=%s v=%s", s, k["t"], k["o"], k["h"], k["l"], k["c"], k["v"])
+        with lock:
+            df = symbol_dfs.get(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
+            df.loc[pd.to_datetime(k["t"], unit="ms")] = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
+            df = df.tail(EMA_SCAN_LIMIT)
+            symbol_dfs[s] = df
 
-    # --- Надсилання сигналу ---
-    action, votes, last, conf = detect_signal(df)
-    prev = state["signals"].get(s, "")
-    if action != "WATCH" and (action != prev or candle_closed):
-        buf = plot_signal(df, s, action, votes)
-        send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
-        state["signals"][s] = action
-        state["last_update"] = str(datetime.now(timezone.utc))
-        save_state(STATE_FILE, state)
+        # Логи свічки
+        logger.info("Candle: %s time=%s o=%s h=%s l=%s c=%s v=%s", s, k["t"], k["o"], k["h"], k["l"], k["c"], k["v"])
+
+        # Надсилання сигналу
+        action, votes, last, conf = detect_signal(df)
+        prev = state["signals"].get(s, "")
+        if last is not None and action != "WATCH" and action != prev:
+            buf = plot_signal(df, s, action, votes)
+            send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
+            state["signals"][s] = action
+            state["last_update"] = str(datetime.now(timezone.utc))
+            save_state(STATE_FILE, state)
+    except Exception as e:
+        logger.exception("on_message error: %s", e)
 
 def on_error(ws, err): logger.error("WebSocket error: %s", err)
 def on_close(ws, cs, cm): logger.warning("WS closed, reconnect in 5s"); time.sleep(5); start_ws(list(symbol_dfs.keys()))
@@ -128,7 +149,7 @@ def start_ws(symbols):
 # ---------------- FLASK ----------------
 app = Flask(__name__)
 @app.route("/")
-def home(): 
+def home():
     return jsonify({"status":"ok", "time":str(datetime.now(timezone.utc))})
 
 # ---------------- START BOT ----------------
@@ -141,9 +162,8 @@ def start_bot():
     threading.Thread(target=start_ws, args=(symbols,), daemon=True).start()
     logger.info("Bot started ✅")
 
-if __name__=="__main__":
-    # Flask для Render порту
+if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
-    # Запуск WebSocket бота
     start_bot()
-    while True: time.sleep(1)
+    while True:
+        time.sleep(1)
