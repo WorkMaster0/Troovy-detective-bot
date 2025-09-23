@@ -136,9 +136,7 @@ def start_bot():
     threading.Thread(target=start_ws, args=(symbols,), daemon=True).start()
 
 if __name__=="__main__":
-    logger.info("Starting Dex Flip Bot + Flask for Render")
-    # Flask запускає Gunicorn через Render порт
+    # Flask для Render
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
     # WebSocket бот
-    start_bot()
-    while True: time.sleep(1)
+    start_bot()  # нескінченний цикл
