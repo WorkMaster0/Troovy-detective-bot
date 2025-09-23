@@ -7,7 +7,6 @@ import numpy as np
 import requests
 import websocket
 import mplfinance as mpf
-from scipy.signal import find_peaks
 from flask import Flask, jsonify
 
 # ---------------- CONFIG ----------------
@@ -69,17 +68,23 @@ def get_symbols_binance():
 
 # ---------------- SIGNALS ----------------
 def detect_signal(df: pd.DataFrame):
-    if len(df) < 2: return "WATCH", [], df.iloc[-1], 0.0
-    last = df.iloc[-1]; votes = []; conf = 0.2
+    if len(df) < 2: 
+        return "WATCH", [], df.iloc[-1], 0.0
+    last = df.iloc[-1]
+    votes = []
+    conf = 0.2
     # EMA strategy
     ema20 = df["close"].rolling(20).mean().iloc[-1]
-    if last["close"] > ema20: votes.append("bull"); conf += 0.1
-    else: votes.append("bear"); conf += 0.05
-    # simple pre-top detection
+    if last["close"] > ema20:
+        votes.append("bull"); conf += 0.1; action = "LONG"
+    elif last["close"] < ema20:
+        votes.append("bear"); conf += 0.1; action = "SHORT"
+    else:
+        action = "WATCH"
+    # Pre-top detection
     pretop = False
-    if len(df)>=10 and (last["close"]-df["close"].iloc[-10])/df["close"].iloc[-10]>0.1:
-        pretop=True; votes.append("pretop"); conf += 0.1
-    action = "LONG" if "bull" in votes else "SHORT"
+    if len(df) >= 10 and (last["close"] - df["close"].iloc[-10])/df["close"].iloc[-10] > 0.1:
+        pretop = True; votes.append("pretop"); conf += 0.1
     conf = min(1.0, conf)
     return action, votes, last, conf
 
@@ -103,6 +108,7 @@ def on_message(ws, msg):
         df = symbol_dfs.get(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
         df.loc[pd.to_datetime(k["t"], unit="ms")] = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
         df = df.tail(EMA_SCAN_LIMIT); symbol_dfs[s] = df
+    logger.info("Received candle for %s: close=%s", s, k["c"])
     # send signal
     action, votes, last, conf = detect_signal(df)
     prev = state["signals"].get(s, "")
@@ -126,7 +132,8 @@ def start_ws(symbols):
 # ---------------- FLASK ----------------
 app = Flask(__name__)
 @app.route("/")
-def home(): return jsonify({"status":"ok", "time":str(datetime.now(timezone.utc))})
+def home(): 
+    return jsonify({"status":"ok", "time":str(datetime.now(timezone.utc))})
 
 # ---------------- START BOT ----------------
 def start_bot():
@@ -136,7 +143,11 @@ def start_bot():
     threading.Thread(target=start_ws, args=(symbols,), daemon=True).start()
 
 if __name__=="__main__":
+    send_telegram("Bot started ✅")  # перевірка токена
     # Flask для Render
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
     # WebSocket бот
-    start_bot()  # нескінченний цикл
+    start_bot()
+    # нескінченний цикл для Render
+    while True:
+        time.sleep(1)
