@@ -1,4 +1,5 @@
-# main.py — Dex Flip Bot + Flask для Render (стабільна версія)
+# main.py — Dex Flip Bot + Flask для Render (стабільна версія з історією)
+
 import os, json, logging, threading, time, io
 from datetime import datetime, timezone
 
@@ -70,14 +71,39 @@ def get_symbols_binance():
         logger.exception("get_symbols_binance error: %s", e)
         return []
 
+def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
+    """Завантажує історичні свічки з Binance"""
+    try:
+        url = f"https://api.binance.com/api/v3/klines"
+        resp = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
+        data = resp.json()
+        if isinstance(data, list):
+            df = pd.DataFrame(data, columns=[
+                "time","open","high","low","close","volume","c","q","n","taker_base","taker_quote","ignore"
+            ])
+            df = df[["time","open","high","low","close","volume"]]
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+            df.set_index("time", inplace=True)
+            df = df.astype(float)
+            return df
+    except Exception as e:
+        logger.error("load_history error for %s: %s", symbol, e)
+    return pd.DataFrame(columns=["open","high","low","close","volume"])
+
 # ---------------- SIGNALS ----------------
 def detect_signal(df: pd.DataFrame):
-    if len(df) < 2:
-        return "WATCH", [], df.iloc[-1], 0.0
+    if len(df) < 3:
+        return "WATCH", [], df.iloc[-1] if len(df) else {}, 0.0
     last = df.iloc[-1]
     prev = df.iloc[-2]
-    votes, conf = [], 0.5
-    if last["close"] > prev["close"]:
+    prev2 = df.iloc[-3]
+    conf = 0.5
+    # спрощена стратегія — частіше дає сигнали
+    if last["close"] > prev["close"] > prev2["close"]:
+        return "LONG", ["3up"], last, 0.9
+    elif last["close"] < prev["close"] < prev2["close"]:
+        return "SHORT", ["3down"], last, 0.9
+    elif last["close"] > prev["close"]:
         return "LONG", ["up"], last, 0.7
     elif last["close"] < prev["close"]:
         return "SHORT", ["down"], last, 0.7
@@ -110,9 +136,8 @@ def on_message(ws, msg):
         df = df.tail(EMA_SCAN_LIMIT)
         symbol_dfs[s] = df
 
-    logger.info("Candle %s closed=%s c=%s", s, candle_closed, k["c"])
-
     if candle_closed:
+        logger.info("Candle closed: %s c=%s", s, k["c"])
         action, votes, last, conf = detect_signal(df)
         prev = state["signals"].get(s, "")
         if action != "WATCH" and (action != prev):
@@ -173,9 +198,12 @@ def start_bot():
     logger.info("Symbols loaded: %s", symbols)
     with lock:
         for s in symbols:
-            symbol_dfs.setdefault(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
+            df = load_history(s)
+            symbol_dfs[s] = df
+            logger.info("History loaded: %s rows=%s", s, len(df))
     start_ws(symbols)
     logger.info("Bot started ✅")
+    send_telegram("🤖 Bot started and ready to send signals!")
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
