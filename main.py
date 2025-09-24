@@ -174,7 +174,14 @@ def plot_signal(df, symbol, action, votes):
 
 # ---------------- WEBSOCKET ----------------
 def on_message(ws, msg):
-    data = json.loads(msg)
+    msg_json = json.loads(msg)
+
+    # підтримка мультистрімів
+    if "data" in msg_json:
+        data = msg_json["data"]
+    else:
+        data = msg_json
+
     k = data.get("k")
     s = data.get("s")
     if not k:
@@ -198,10 +205,9 @@ def on_message(ws, msg):
         last_candle["low"], last_candle["close"], last_candle["volume"], candle_closed
     )
 
-    # 🔹 Миттєві сигнали на будь-яку помітну зміну
+    # 🔹 Генеруємо сигнал навіть на незакриту свічку
     action, votes, last, conf = detect_signal(df, symbol=s)
 
-    # Тестово — надсилаємо сигнал навіть якщо він повторюється
     if action != "WATCH":
         buf = plot_signal(df, s, action, votes)
         send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
