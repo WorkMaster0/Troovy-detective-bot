@@ -36,14 +36,22 @@ def save_state(path, data):
 state = load_state(STATE_FILE, {"signals": {}, "last_update": None})
 
 # ---------------- TELEGRAM ----------------
+def escape_markdown_v2(text):
+    """Екранує всі спецсимволи для MarkdownV2"""
+    escape_chars = r'\_*[]()~`>#+-=|{}.!'
+    for c in escape_chars:
+        text = text.replace(c, f'\\{c}')
+    return text
+
 def send_telegram(text, photo=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.info("[TELEGRAM MOCK] %s", text)
-        return False
+        return
     try:
+        escaped_text = escape_markdown_v2(text)
         if photo:
             files = {"photo": ("signal.png", photo, "image/png")}
-            data = {"chat_id": CHAT_ID, "caption": text, "parse_mode": "MarkdownV2"}
+            data = {"chat_id": CHAT_ID, "caption": escaped_text, "parse_mode": "MarkdownV2"}
             resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
                 data=data, files=files, timeout=10
@@ -51,23 +59,23 @@ def send_telegram(text, photo=None):
         else:
             resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": text, "parse_mode": "MarkdownV2"},
+                json={"chat_id": CHAT_ID, "text": escaped_text, "parse_mode": "MarkdownV2"},
                 timeout=10
             )
-        logger.info("Telegram response: %s %s", resp.status_code, resp.text)
+
         if resp.status_code != 200:
             logger.warning("Telegram returned non-200, trying simple text...")
-            # Пробуємо без MarkdownV2
-            resp = requests.post(
+            # fallback на простий текст
+            requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": CHAT_ID, "text": text},
                 timeout=10
             )
-            logger.info("Telegram fallback response: %s %s", resp.status_code, resp.text)
-        return resp.status_code == 200
+        else:
+            logger.info("Telegram response: %s %s", resp.status_code, resp.text)
+
     except Exception as e:
         logger.exception("send_telegram error: %s", e)
-        return False
 
 # ---------------- MARKET DATA ----------------
 symbol_dfs = {}
