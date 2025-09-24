@@ -1,11 +1,13 @@
-# main.py — Dex Flip Bot + Flask для Render (стабільна версія з миттєвими сигналами)
+# main.py — Dex Flip Bot + Pattern Detector + Flask
 import os, json, logging, threading, time, io
 from datetime import datetime, timezone
 
 import pandas as pd
+import numpy as np
 import requests
 import websocket
 import mplfinance as mpf
+import matplotlib.pyplot as plt
 from flask import Flask, jsonify
 
 # ---------------- CONFIG ----------------
@@ -37,7 +39,6 @@ state = load_state(STATE_FILE, {"signals": {}, "last_update": None})
 
 # ---------------- TELEGRAM ----------------
 def escape_markdown_v2(text):
-    """Екранує всі спецсимволи для MarkdownV2"""
     escape_chars = r'\_*[]()~`>#+-=|{}.!'
     for c in escape_chars:
         text = text.replace(c, f'\\{c}')
@@ -62,18 +63,8 @@ def send_telegram(text, photo=None):
                 json={"chat_id": CHAT_ID, "text": escaped_text, "parse_mode": "MarkdownV2"},
                 timeout=10
             )
-
         if resp.status_code != 200:
-            logger.warning("Telegram returned non-200, trying simple text...")
-            # fallback на простий текст
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                json={"chat_id": CHAT_ID, "text": text},
-                timeout=10
-            )
-        else:
-            logger.info("Telegram response: %s %s", resp.status_code, resp.text)
-
+            logger.warning("Telegram non-200: %s %s", resp.status_code, resp.text)
     except Exception as e:
         logger.exception("send_telegram error: %s", e)
 
@@ -82,33 +73,18 @@ symbol_dfs = {}
 lock = threading.Lock()
 
 def get_symbols_binance():
-    """Отримує список торгованих символів USDT з Binance.
-       Якщо API не повертає 'symbols', повертає дефолтний список.
-    """
     try:
         ex = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=10).json()
-
         if "symbols" not in ex:
-            logger.error("Binance response missing 'symbols': %s", ex)
-            # fallback на тестові символи
             return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-
-        syms = [s["symbol"] for s in ex["symbols"] 
+        syms = [s["symbol"] for s in ex["symbols"]
                 if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"]
-
-        if not syms:
-            logger.warning("No USDT trading symbols found, using fallback symbols")
-            return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
-
-        return syms[:TOP_LIMIT]
-
+        return syms[:TOP_LIMIT] if syms else ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
     except Exception as e:
         logger.exception("get_symbols_binance error: %s", e)
-        # fallback на випадок помилки запиту
         return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
-    """Завантажує історичні свічки з Binance"""
     try:
         url = f"https://api.binance.com/api/v3/klines"
         resp = requests.get(url, params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=10)
@@ -130,37 +106,20 @@ def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
 def detect_signal(df: pd.DataFrame, symbol=""):
     if len(df) < 3:
         return "WATCH", [], df.iloc[-1] if len(df) else {}, 0.0
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
-
-    conf = 0.5
-    action = "WATCH"
-    votes = []
-
-    # Сильний тренд: три свічки вгору/вниз
+    last, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
+    conf, action, votes = 0.5, "WATCH", []
     if last["close"] > prev["close"] > prev2["close"]:
         action, votes, conf = "LONG", ["3up"], 0.9
     elif last["close"] < prev["close"] < prev2["close"]:
         action, votes, conf = "SHORT", ["3down"], 0.9
     else:
-        # Помірний рух
-        threshold = 0.005  # 0.5% зміни
+        threshold = 0.005
         if last["close"] > prev["close"] * (1 + threshold):
             action, votes, conf = "LONG", ["up"], 0.7
         elif last["close"] < prev["close"] * (1 - threshold):
             action, votes, conf = "SHORT", ["down"], 0.7
-
-    # Логування для дебагу
-    logger.info(
-        "Detect signal %s: last=%.6f prev=%.6f prev2=%.6f -> action=%s conf=%.2f",
-        symbol, last["close"], prev["close"], prev2["close"], action, conf
-    )
-
     return action, votes, last, conf
 
-# ---------------- PLOT ----------------
 def plot_signal(df, symbol, action, votes):
     df_plot = df[["open", "high", "low", "close", "volume"]].copy()
     buf = io.BytesIO()
@@ -172,42 +131,61 @@ def plot_signal(df, symbol, action, votes):
     buf.seek(0)
     return buf
 
+# ---------------- PATTERN DETECTOR ----------------
+def detect_patterns(df):
+    last = df.iloc[-1]
+    closes, highs, lows, volumes = df["close"].values, df["high"].values, df["low"].values, df["volume"].values
+    signals = []
+    if len(df) < 30: return signals
+    if (max(highs[-20:]) - min(lows[-20:]))/last["close"] < 0.02: signals.append("Triangle")
+    if (max(highs[-30:]) - min(lows[-30:]))/last["close"] < 0.015: signals.append("Rectangle")
+    if abs(highs[-5] - highs[-15]) / last["close"] < 0.01: signals.append("Double Top")
+    if abs(lows[-5] - lows[-15]) / last["close"] < 0.01: signals.append("Double Bottom")
+    if highs[-15] < highs[-10] and highs[-5] < highs[-10]: signals.append("Head & Shoulders")
+    if abs(closes[-30] - closes[-1]) / closes[-30] > 0.05 and (max(highs[-10:]) - min(lows[-10:]))/last["close"] < 0.02:
+        signals.append("Flag")
+    vol_ma = pd.Series(volumes).rolling(20).mean().iloc[-1]
+    if last["volume"] > 2 * vol_ma: signals.append("Volume Spike")
+    return signals
+
+def plot_chart(df, symbol, pattern_name):
+    fig, axlist = mpf.plot(
+        df.tail(80), type="candle", style="charles", volume=True,
+        returnfig=True, figsize=(10,6), title=f"{symbol} - {pattern_name}"
+    )
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
+
+def run_pattern_scan():
+    while True:
+        with lock:
+            for sym, df in list(symbol_dfs.items())[:10]:
+                if len(df) < 100: continue
+                try:
+                    patterns = detect_patterns(df)
+                    for p in patterns:
+                        buf = plot_chart(df, sym, p)
+                        send_telegram(f"📊 {sym} Pattern: *{p}* price={df['close'].iloc[-1]:.2f}", photo=buf)
+                except Exception as e:
+                    logger.error("Pattern scan error %s: %s", sym, e)
+        time.sleep(300)
+
 # ---------------- WEBSOCKET ----------------
 def on_message(ws, msg):
     msg_json = json.loads(msg)
-
-    # підтримка мультистрімів
-    if "data" in msg_json:
-        data = msg_json["data"]
-    else:
-        data = msg_json
-
-    k = data.get("k")
-    s = data.get("s")
-    if not k:
-        return
-
-    candle_closed = k["x"]
+    data = msg_json.get("data", msg_json)
+    k, s = data.get("k"), data.get("s")
+    if not k: return
     candle_time = pd.to_datetime(k["t"], unit="ms")
-
     with lock:
         df = symbol_dfs.get(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
-        df.loc[candle_time] = [
-            float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
-        ]
+        df.loc[candle_time] = [float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])]
         df = df.tail(EMA_SCAN_LIMIT)
         symbol_dfs[s] = df
-
-    last_candle = df.iloc[-1]
-    logger.info(
-        "Candle %s: time=%s o=%.6f h=%.6f l=%.6f c=%.6f v=%.6f closed=%s",
-        s, last_candle.name, last_candle["open"], last_candle["high"],
-        last_candle["low"], last_candle["close"], last_candle["volume"], candle_closed
-    )
-
-    # 🔹 Генеруємо сигнал навіть на незакриту свічку
     action, votes, last, conf = detect_signal(df, symbol=s)
-
     if action != "WATCH":
         buf = plot_signal(df, s, action, votes)
         send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
@@ -215,13 +193,9 @@ def on_message(ws, msg):
         state["last_update"] = str(datetime.now(timezone.utc))
         save_state(STATE_FILE, state)
 
-def on_error(ws, err): logger.error("WebSocket error: %s", err)
-def on_close(ws, cs, cm):
-    logger.warning("WS closed, reconnect in 5s")
-    time.sleep(5)
-    start_ws(list(symbol_dfs.keys()))
-def on_open(ws): logger.info("WebSocket connected")
-def on_pong(ws, msg): logger.info("PONG received")
+def on_error(ws, err): logger.error("WS error: %s", err)
+def on_close(ws, cs, cm): logger.warning("WS closed, reconnect in 5s"); time.sleep(5); start_ws(list(symbol_dfs.keys()))
+def on_open(ws): logger.info("WS connected")
 
 def start_ws(symbols):
     if not symbols: return
@@ -230,59 +204,34 @@ def start_ws(symbols):
         chunk = symbols[i:i+chunk_size]
         streams = "/".join([f"{s.lower()}@kline_1m" for s in chunk])
         url = f"wss://stream.binance.com:9443/stream?streams={streams}"
-
         def run_ws(u=url):
             while True:
                 try:
-                    ws = websocket.WebSocketApp(
-                        u,
-                        on_open=on_open,
-                        on_message=on_message,
-                        on_error=on_error,
-                        on_close=on_close,
-                        on_pong=on_pong
-                    )
-                    ws.run_forever(
-                        ping_interval=10,
-                        ping_timeout=5,
-                        ping_payload="keepalive"
-                    )
+                    ws = websocket.WebSocketApp(u, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+                    ws.run_forever(ping_interval=10, ping_timeout=5, ping_payload="keepalive")
                 except Exception as e:
-                    logger.error("WebSocket fatal error: %s", e)
-                logger.info("Reconnecting WS in 5s...")
-                time.sleep(5)
-
+                    logger.error("WS fatal: %s", e)
+                logger.info("Reconnecting WS in 5s..."); time.sleep(5)
         threading.Thread(target=run_ws, daemon=True).start()
 
 # ---------------- FLASK ----------------
 app = Flask(__name__)
 @app.route("/")
-def home():
-    return jsonify({"status": "ok", "time": str(datetime.now(timezone.utc))})
+def home(): return jsonify({"status": "ok", "time": str(datetime.now(timezone.utc))})
 
 # ---------------- START BOT ----------------
 def start_bot():
-    # 1️⃣ Отримуємо символи
     symbols = get_symbols_binance()
     logger.info("Symbols loaded: %s", symbols)
-
-    if not symbols:
-        logger.error("No symbols to load, bot cannot start WS")
-        return
-
-    # 2️⃣ Завантажуємо історію для кожного символу
     with lock:
         for s in symbols:
             df = load_history(s)
             symbol_dfs[s] = df
             logger.info("History loaded: %s rows=%s", s, len(df))
-
-    # 3️⃣ Запускаємо websocket для миттєвих сигналів
     start_ws(symbols)
-
-    # 4️⃣ Логування та повідомлення у Telegram
+    threading.Thread(target=run_pattern_scan, daemon=True).start()
     logger.info("Bot started ✅")
-    send_telegram("🤖 Bot started and ready to send signals!")
+    send_telegram("🤖 Bot started with pattern detection!")
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
