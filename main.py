@@ -1,4 +1,5 @@
-# main.py — Dex Flip Bot + Pattern Detection + Flask (Render-optimized)
+# main.py — Dex Flip Bot + Advanced Analysis (EMA, RSI, MACD, Patterns) + Flask
+
 import os, json, logging, threading, time, io
 from datetime import datetime, timezone
 
@@ -6,16 +7,17 @@ import pandas as pd
 import numpy as np
 import requests
 import websocket
-import mplfinance as mpf
 import matplotlib.pyplot as plt
+import mplfinance as mpf
 from flask import Flask, jsonify
+from scipy.signal import find_peaks
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 PORT = int(os.getenv("PORT", 10000))
-TOP_LIMIT = 30        # скільки символів моніторимо через WS
-PATTERN_LIMIT = 10    # скільки символів скануємо на патерни
+TOP_LIMIT = 30
+PATTERN_LIMIT = 10
 EMA_SCAN_LIMIT = 500
 STATE_FILE = "state.json"
 
@@ -65,7 +67,6 @@ def send_telegram(text, photo=None):
                 json={"chat_id": CHAT_ID, "text": escaped_text, "parse_mode": "MarkdownV2"},
                 timeout=10
             )
-
         if resp.status_code != 200:
             logger.warning("Telegram returned %s: %s", resp.status_code, resp.text)
     except Exception as e:
@@ -103,83 +104,88 @@ def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
         logger.error("load_history error for %s: %s", symbol, e)
     return pd.DataFrame(columns=["open","high","low","close","volume"])
 
+# ---------------- INDICATORS ----------------
+def add_indicators(df):
+    df["EMA9"] = df["close"].ewm(span=9).mean()
+    df["EMA21"] = df["close"].ewm(span=21).mean()
+    delta = df["close"].diff()
+    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
+    avg_gain = gain.rolling(14).mean()
+    avg_loss = loss.rolling(14).mean()
+    rs = avg_gain / avg_loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+    short = df["close"].ewm(span=12).mean()
+    long = df["close"].ewm(span=26).mean()
+    df["MACD"] = short - long
+    df["Signal"] = df["MACD"].ewm(span=9).mean()
+    return df
+
 # ---------------- FLIP SIGNALS ----------------
 def detect_signal(df, symbol=""):
-    if len(df) < 3:
-        return "WATCH", [], df.iloc[-1] if len(df) else {}, 0.0
-    last, prev, prev2 = df.iloc[-1], df.iloc[-2], df.iloc[-3]
-    conf, action, votes = 0.5, "WATCH", []
-    if last["close"] > prev["close"] > prev2["close"]:
-        action, votes, conf = "LONG", ["3up"], 0.9
-    elif last["close"] < prev["close"] < prev2["close"]:
-        action, votes, conf = "SHORT", ["3down"], 0.9
-    else:
-        threshold = 0.005
-        if last["close"] > prev["close"] * (1+threshold):
-            action, votes, conf = "LONG", ["up"], 0.7
-        elif last["close"] < prev["close"] * (1-threshold):
-            action, votes, conf = "SHORT", ["down"], 0.7
-    return action, votes, last, conf
+    if len(df) < 30: return "WATCH", [], {}, 0.0
+    df = add_indicators(df.copy())
+    last = df.iloc[-1]
+    signals, conf = [], 0.5
+    if last["EMA9"] > last["EMA21"]: signals.append("EMA↑")
+    if last["EMA9"] < last["EMA21"]: signals.append("EMA↓")
+    if last["RSI"] < 35: signals.append("RSI Oversold")
+    if last["RSI"] > 65: signals.append("RSI Overbought")
+    if last["MACD"] > last["Signal"]: signals.append("MACD Bull")
+    if last["MACD"] < last["Signal"]: signals.append("MACD Bear")
+    if "EMA↑" in signals and "MACD Bull" in signals and last["RSI"] < 65:
+        return "LONG", signals, last, 0.9
+    elif "EMA↓" in signals and "MACD Bear" in signals and last["RSI"] > 35:
+        return "SHORT", signals, last, 0.9
+    return "WATCH", signals, last, conf
 
 def plot_signal(df, symbol, action, votes):
-    df_plot = df.tail(80)[["open","high","low","close","volume"]]
+    df_plot = add_indicators(df.tail(100).copy())
+    ap = [
+        mpf.make_addplot(df_plot["EMA9"], color="blue"),
+        mpf.make_addplot(df_plot["EMA21"], color="orange"),
+    ]
     buf = io.BytesIO()
-    mpf.plot(
-        df_plot, type="candle", volume=True, style="yahoo",
-        title=f"{symbol} {action} {' '.join(votes)}",
-        savefig=dict(fname=buf, dpi=100, bbox_inches="tight")
-    )
+    mpf.plot(df_plot, type="candle", volume=True, style="yahoo",
+             addplot=ap, title=f"{symbol} {action} {' '.join(votes)}",
+             savefig=dict(fname=buf, dpi=120, bbox_inches="tight"))
     buf.seek(0)
     plt.close("all")
     return buf
 
 # ---------------- PATTERN DETECTION ----------------
 def detect_patterns(df):
-    if len(df) < 30: return []
-    last = df.iloc[-1]
-    highs, lows, closes, vols = df["high"].values, df["low"].values, df["close"].values, df["volume"].values
+    if len(df) < 50: return []
+    highs, lows, closes = df["high"].values, df["low"].values, df["close"].values
     signals = []
-    if (max(highs[-20:]) - min(lows[-20:]))/last["close"] < 0.02:
-        signals.append("Triangle")
-    if (max(highs[-30:]) - min(lows[-30:]))/last["close"] < 0.015:
-        signals.append("Rectangle")
-    if abs(highs[-5] - highs[-15]) / last["close"] < 0.01:
+    peaks, _ = find_peaks(highs, distance=5)
+    troughs, _ = find_peaks(-lows, distance=5)
+    if len(peaks) >= 2 and abs(highs[peaks[-1]] - highs[peaks[-2]])/closes[-1] < 0.01:
         signals.append("Double Top")
-    if abs(lows[-5] - lows[-15]) / last["close"] < 0.01:
+    if len(troughs) >= 2 and abs(lows[troughs[-1]] - lows[troughs[-2]])/closes[-1] < 0.01:
         signals.append("Double Bottom")
-    if highs[-15] < highs[-10] and highs[-5] < highs[-10]:
+    if len(peaks) >= 3 and highs[peaks[-2]] > highs[peaks[-3]] and highs[peaks[-2]] > highs[peaks[-1]]:
         signals.append("Head & Shoulders")
-    if abs(closes[-30] - closes[-1])/closes[-30] > 0.05 and (max(highs[-10:]) - min(lows[-10:]))/last["close"] < 0.02:
-        signals.append("Flag")
-    vol_ma = pd.Series(vols).rolling(20).mean().iloc[-1]
-    if last["volume"] > 2*vol_ma:
-        signals.append("Volume Spike")
+    if (max(highs[-20:]) - min(lows[-20:]))/closes[-1] < 0.02:
+        signals.append("Triangle")
     return signals
 
 def plot_pattern(df, symbol, pattern_name):
-    last80 = df.tail(80)
-    fig, axlist = mpf.plot(
-        last80, type="candle", style="charles", volume=True,
-        returnfig=True, figsize=(10,6),
-        title=f"{symbol} - {pattern_name}"
-    )
+    last100 = df.tail(100)
+    fig, axlist = mpf.plot(last100, type="candle", style="charles", volume=True,
+                           returnfig=True, figsize=(10,6),
+                           title=f"{symbol} - {pattern_name} (15m)")
     ax = axlist[0]
-    highs, lows, closes = last80["high"].values, last80["low"].values, last80["close"].values
-    if pattern_name == "Triangle":
-        ax.plot(last80.index, np.linspace(max(highs), min(highs[-10:]), len(last80)), "r--")
-        ax.plot(last80.index, np.linspace(min(lows), max(lows[-10:]), len(last80)), "g--")
-    elif pattern_name == "Rectangle":
-        ax.hlines([max(highs[-30:]), min(lows[-30:])], xmin=last80.index[0], xmax=last80.index[-1], colors=["r","g"], linestyles="--")
-    elif pattern_name == "Double Top":
-        ax.hlines(max(highs[-10:]), xmin=last80.index[0], xmax=last80.index[-1], colors="r", linestyles="--")
-    elif pattern_name == "Double Bottom":
-        ax.hlines(min(lows[-10:]), xmin=last80.index[0], xmax=last80.index[-1], colors="g", linestyles="--")
-    elif pattern_name == "Head & Shoulders":
-        neckline = (lows[-20] + lows[-10]) / 2
-        ax.hlines(neckline, xmin=last80.index[0], xmax=last80.index[-1], colors="orange", linestyles="--")
-    elif pattern_name == "Flag":
-        mid = np.mean(closes[-20:])
-        ax.plot(last80.index, np.linspace(mid*0.98, mid*1.02, len(last80)), "b--")
+    highs, lows = last100["high"].values, last100["low"].values
+    if "Double Top" in pattern_name:
+        ax.hlines([max(highs)], xmin=last100.index[0], xmax=last100.index[-1], colors="r", linestyles="--")
+    if "Double Bottom" in pattern_name:
+        ax.hlines([min(lows)], xmin=last100.index[0], xmax=last100.index[-1], colors="g", linestyles="--")
+    if "Head & Shoulders" in pattern_name:
+        neckline = (min(lows[-20:]) + min(lows[-10:])) / 2
+        ax.hlines(neckline, xmin=last100.index[0], xmax=last100.index[-1], colors="orange", linestyles="--")
+    if "Triangle" in pattern_name:
+        ax.plot(last100.index, np.linspace(max(highs), min(highs[-1:]), len(last100)), "r--")
+        ax.plot(last100.index, np.linspace(min(lows), max(lows[-1:]), len(last100)), "g--")
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
     buf.seek(0)
@@ -190,16 +196,14 @@ def pattern_scan_loop():
     while True:
         with lock:
             for sym in list(symbol_dfs.keys())[:PATTERN_LIMIT]:
-                # ✅ Завантажуємо історію 15m
-                df = load_history(sym, limit=200, interval="15m")
-                if df.empty: 
-                    continue
+                df = load_history(sym, limit=300, interval="15m")
+                if df.empty: continue
                 signals = detect_patterns(df)
                 for sig in signals:
                     caption = f"📊 {sym} [15m] Pattern: {sig} | Last Price: {df['close'].iloc[-1]:.2f}"
-                    buf = plot_pattern(df, sym, f"{sig} (15m)")
+                    buf = plot_pattern(df, sym, sig)
                     send_telegram(caption, photo=buf)
-        time.sleep(600)  # раз на 10 хв
+        time.sleep(600)
 
 # ---------------- WEBSOCKET ----------------
 def on_message(ws, msg):
@@ -264,7 +268,7 @@ def start_bot():
             logger.info("History loaded: %s rows=%s", s, len(df))
     start_ws(symbols)
     threading.Thread(target=pattern_scan_loop, daemon=True).start()
-    send_telegram("🤖 Bot started with Flip + Pattern detection ✅")
+    send_telegram("🤖 Bot started with Advanced Flip + Pattern detection ✅")
 
 if __name__ == "__main__":
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT), daemon=True).start()
