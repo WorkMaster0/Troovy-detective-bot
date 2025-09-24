@@ -82,13 +82,30 @@ symbol_dfs = {}
 lock = threading.Lock()
 
 def get_symbols_binance():
+    """Отримує список торгованих символів USDT з Binance.
+       Якщо API не повертає 'symbols', повертає дефолтний список.
+    """
     try:
         ex = requests.get("https://api.binance.com/api/v3/exchangeInfo", timeout=10).json()
-        syms = [s["symbol"] for s in ex["symbols"] if s["quoteAsset"] == "USDT" and s["status"] == "TRADING"]
+
+        if "symbols" not in ex:
+            logger.error("Binance response missing 'symbols': %s", ex)
+            # fallback на тестові символи
+            return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+
+        syms = [s["symbol"] for s in ex["symbols"] 
+                if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"]
+
+        if not syms:
+            logger.warning("No USDT trading symbols found, using fallback symbols")
+            return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+
         return syms[:TOP_LIMIT]
+
     except Exception as e:
         logger.exception("get_symbols_binance error: %s", e)
-        return []
+        # fallback на випадок помилки запиту
+        return ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
     """Завантажує історичні свічки з Binance"""
@@ -230,14 +247,25 @@ def home():
 
 # ---------------- START BOT ----------------
 def start_bot():
+    # 1️⃣ Отримуємо символи
     symbols = get_symbols_binance()
     logger.info("Symbols loaded: %s", symbols)
+
+    if not symbols:
+        logger.error("No symbols to load, bot cannot start WS")
+        return
+
+    # 2️⃣ Завантажуємо історію для кожного символу
     with lock:
         for s in symbols:
             df = load_history(s)
             symbol_dfs[s] = df
             logger.info("History loaded: %s rows=%s", s, len(df))
+
+    # 3️⃣ Запускаємо websocket для миттєвих сигналів
     start_ws(symbols)
+
+    # 4️⃣ Логування та повідомлення у Telegram
     logger.info("Bot started ✅")
     send_telegram("🤖 Bot started and ready to send signals!")
 
