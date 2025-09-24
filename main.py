@@ -113,18 +113,27 @@ def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
 def detect_signal(df: pd.DataFrame):
     if len(df) < 3:
         return "WATCH", [], df.iloc[-1] if len(df) else {}, 0.0
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
     prev2 = df.iloc[-3]
+
     conf = 0.5
+
+    # 1️⃣ Сильний тренд: три свічки вгору/вниз
     if last["close"] > prev["close"] > prev2["close"]:
         return "LONG", ["3up"], last, 0.9
     elif last["close"] < prev["close"] < prev2["close"]:
         return "SHORT", ["3down"], last, 0.9
-    elif last["close"] > prev["close"]:
+
+    # 2️⃣ Помірний рух: лише остання свічка з невеликим порогом
+    threshold = 0.0005  # 0.05% зміни
+    if last["close"] > prev["close"] * (1 + threshold):
         return "LONG", ["up"], last, 0.7
-    elif last["close"] < prev["close"]:
+    elif last["close"] < prev["close"] * (1 - threshold):
         return "SHORT", ["down"], last, 0.7
+
+    # 3️⃣ WATCH
     return "WATCH", [], last, conf
 
 # ---------------- PLOT ----------------
@@ -163,17 +172,16 @@ def on_message(ws, msg):
                 s, last_candle.name, last_candle["open"], last_candle["high"],
                 last_candle["low"], last_candle["close"], last_candle["volume"], candle_closed)
 
-    if candle_closed:
-        action, votes, last, conf = detect_signal(df)
-        logger.info("Signal %s -> action=%s conf=%.2f", s, action, conf)
-
-        prev = state["signals"].get(s, "")
-        if action != "WATCH" and action != prev:
-            buf = plot_signal(df, s, action, votes)
-            send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
-            state["signals"][s] = action
-            state["last_update"] = str(datetime.now(timezone.utc))
-            save_state(STATE_FILE, state)
+    # 🔹 Миттєві сигнали: перевіряємо навіть незакриту свічку
+    action, votes, last, conf = detect_signal(df)
+    prev = state["signals"].get(s, "")
+    
+    if action != "WATCH" and action != prev:
+        buf = plot_signal(df, s, action, votes)
+        send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
+        state["signals"][s] = action
+        state["last_update"] = str(datetime.now(timezone.utc))
+        save_state(STATE_FILE, state)
 
 def on_error(ws, err): logger.error("WebSocket error: %s", err)
 def on_close(ws, cs, cm):
