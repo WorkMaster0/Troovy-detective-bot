@@ -169,23 +169,70 @@ def detect_patterns(df):
         signals.append("Triangle")
     return signals
 
+from scipy.signal import find_peaks
+
 def plot_pattern(df, symbol, pattern_name):
-    last100 = df.tail(100)
-    fig, axlist = mpf.plot(last100, type="candle", style="charles", volume=True,
-                           returnfig=True, figsize=(10,6),
-                           title=f"{symbol} - {pattern_name} (15m)")
+    last80 = df.tail(80)
+    fig, axlist = mpf.plot(
+        last80, type="candle", style="charles", volume=True,
+        returnfig=True, figsize=(10,6),
+        title=f"{symbol} - {pattern_name} (15m)"
+    )
     ax = axlist[0]
-    highs, lows = last100["high"].values, last100["low"].values
-    if "Double Top" in pattern_name:
-        ax.hlines([max(highs)], xmin=last100.index[0], xmax=last100.index[-1], colors="r", linestyles="--")
-    if "Double Bottom" in pattern_name:
-        ax.hlines([min(lows)], xmin=last100.index[0], xmax=last100.index[-1], colors="g", linestyles="--")
-    if "Head & Shoulders" in pattern_name:
-        neckline = (min(lows[-20:]) + min(lows[-10:])) / 2
-        ax.hlines(neckline, xmin=last100.index[0], xmax=last100.index[-1], colors="orange", linestyles="--")
-    if "Triangle" in pattern_name:
-        ax.plot(last100.index, np.linspace(max(highs), min(highs[-1:]), len(last100)), "r--")
-        ax.plot(last100.index, np.linspace(min(lows), max(lows[-1:]), len(last100)), "g--")
+
+    highs = last80["high"].values
+    lows = last80["low"].values
+    closes = last80["close"].values
+    idx = np.arange(len(last80))
+
+    # ---- Пошук піків і впадин ----
+    peaks, _ = find_peaks(highs, distance=3)
+    bottoms, _ = find_peaks(-lows, distance=3)
+
+    if pattern_name.startswith("Triangle"):
+        if len(peaks) >= 2 and len(bottoms) >= 2:
+            # Верхня трендова
+            x1, x2 = peaks[-2], peaks[-1]
+            y1, y2 = highs[x1], highs[x2]
+            ax.plot(last80.index[[x1, x2]], [y1, y2], "r--", label="Upper Trend")
+
+            # Нижня трендова
+            b1, b2 = bottoms[-2], bottoms[-1]
+            ly1, ly2 = lows[b1], lows[b2]
+            ax.plot(last80.index[[b1, b2]], [ly1, ly2], "g--", label="Lower Trend")
+
+    elif pattern_name.startswith("Rectangle"):
+        high_zone = max(highs[-30:])
+        low_zone = min(lows[-30:])
+        ax.hlines([high_zone, low_zone], xmin=last80.index[0], xmax=last80.index[-1], 
+                  colors=["r","g"], linestyles="--")
+
+    elif pattern_name.startswith("Double Top"):
+        if len(peaks) >= 2:
+            level = np.mean(highs[peaks[-2:]])
+            ax.hlines(level, xmin=last80.index[0], xmax=last80.index[-1], 
+                      colors="r", linestyles="--")
+
+    elif pattern_name.startswith("Double Bottom"):
+        if len(bottoms) >= 2:
+            level = np.mean(lows[bottoms[-2:]])
+            ax.hlines(level, xmin=last80.index[0], xmax=last80.index[-1], 
+                      colors="g", linestyles="--")
+
+    elif pattern_name.startswith("Head & Shoulders"):
+        if len(peaks) >= 3 and len(bottoms) >= 2:
+            neckline = np.mean([lows[bottoms[-1]], lows[bottoms[-2]]])
+            ax.hlines(neckline, xmin=last80.index[0], xmax=last80.index[-1], 
+                      colors="orange", linestyles="--")
+
+    elif pattern_name.startswith("Flag"):
+        if len(peaks) >= 2 and len(bottoms) >= 2:
+            # верхня межа каналу
+            ax.plot(last80.index[[peaks[-2], peaks[-1]]], highs[peaks[-2:]], "b--")
+            # нижня межа каналу
+            ax.plot(last80.index[[bottoms[-2], bottoms[-1]]], lows[bottoms[-2:]], "b--")
+
+    ax.legend()
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
     buf.seek(0)
