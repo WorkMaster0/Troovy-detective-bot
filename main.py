@@ -127,7 +127,7 @@ def load_history(symbol, limit=EMA_SCAN_LIMIT, interval="1m"):
     return pd.DataFrame(columns=["open","high","low","close","volume"])
 
 # ---------------- SIGNALS ----------------
-def detect_signal(df: pd.DataFrame):
+def detect_signal(df: pd.DataFrame, symbol=""):
     if len(df) < 3:
         return "WATCH", [], df.iloc[-1] if len(df) else {}, 0.0
 
@@ -136,22 +136,29 @@ def detect_signal(df: pd.DataFrame):
     prev2 = df.iloc[-3]
 
     conf = 0.5
+    action = "WATCH"
+    votes = []
 
-    # 1️⃣ Сильний тренд: три свічки вгору/вниз
+    # Сильний тренд: три свічки вгору/вниз
     if last["close"] > prev["close"] > prev2["close"]:
-        return "LONG", ["3up"], last, 0.9
+        action, votes, conf = "LONG", ["3up"], 0.9
     elif last["close"] < prev["close"] < prev2["close"]:
-        return "SHORT", ["3down"], last, 0.9
+        action, votes, conf = "SHORT", ["3down"], 0.9
+    else:
+        # Помірний рух
+        threshold = 0.005  # 0.5% зміни
+        if last["close"] > prev["close"] * (1 + threshold):
+            action, votes, conf = "LONG", ["up"], 0.7
+        elif last["close"] < prev["close"] * (1 - threshold):
+            action, votes, conf = "SHORT", ["down"], 0.7
 
-    # 2️⃣ Помірний рух: лише остання свічка з невеликим порогом
-    threshold = 0.0005  # 0.05% зміни
-    if last["close"] > prev["close"] * (1 + threshold):
-        return "LONG", ["up"], last, 0.7
-    elif last["close"] < prev["close"] * (1 - threshold):
-        return "SHORT", ["down"], last, 0.7
+    # Логування для дебагу
+    logger.info(
+        "Detect signal %s: last=%.6f prev=%.6f prev2=%.6f -> action=%s conf=%.2f",
+        symbol, last["close"], prev["close"], prev2["close"], action, conf
+    )
 
-    # 3️⃣ WATCH
-    return "WATCH", [], last, conf
+    return action, votes, last, conf
 
 # ---------------- PLOT ----------------
 def plot_signal(df, symbol, action, votes):
@@ -185,15 +192,17 @@ def on_message(ws, msg):
         symbol_dfs[s] = df
 
     last_candle = df.iloc[-1]
-    logger.info("Candle %s time=%s o=%.6f h=%.6f l=%.6f c=%.6f v=%.6f closed=%s",
-                s, last_candle.name, last_candle["open"], last_candle["high"],
-                last_candle["low"], last_candle["close"], last_candle["volume"], candle_closed)
+    logger.info(
+        "Candle %s: time=%s o=%.6f h=%.6f l=%.6f c=%.6f v=%.6f closed=%s",
+        s, last_candle.name, last_candle["open"], last_candle["high"],
+        last_candle["low"], last_candle["close"], last_candle["volume"], candle_closed
+    )
 
-    # 🔹 Миттєві сигнали: перевіряємо навіть незакриту свічку
-    action, votes, last, conf = detect_signal(df)
-    prev = state["signals"].get(s, "")
-    
-    if action != "WATCH" and action != prev:
+    # 🔹 Миттєві сигнали на будь-яку помітну зміну
+    action, votes, last, conf = detect_signal(df, symbol=s)
+
+    # Тестово — надсилаємо сигнал навіть якщо він повторюється
+    if action != "WATCH":
         buf = plot_signal(df, s, action, votes)
         send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
         state["signals"][s] = action
