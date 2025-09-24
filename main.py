@@ -39,23 +39,35 @@ state = load_state(STATE_FILE, {"signals": {}, "last_update": None})
 def send_telegram(text, photo=None):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         logger.info("[TELEGRAM MOCK] %s", text)
-        return
+        return False
     try:
         if photo:
             files = {"photo": ("signal.png", photo, "image/png")}
             data = {"chat_id": CHAT_ID, "caption": text, "parse_mode": "MarkdownV2"}
-            requests.post(
+            resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
                 data=data, files=files, timeout=10
             )
         else:
-            requests.post(
+            resp = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 json={"chat_id": CHAT_ID, "text": text, "parse_mode": "MarkdownV2"},
                 timeout=10
             )
+        logger.info("Telegram response: %s %s", resp.status_code, resp.text)
+        if resp.status_code != 200:
+            logger.warning("Telegram returned non-200, trying simple text...")
+            # Пробуємо без MarkdownV2
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": text},
+                timeout=10
+            )
+            logger.info("Telegram fallback response: %s %s", resp.status_code, resp.text)
+        return resp.status_code == 200
     except Exception as e:
         logger.exception("send_telegram error: %s", e)
+        return False
 
 # ---------------- MARKET DATA ----------------
 symbol_dfs = {}
