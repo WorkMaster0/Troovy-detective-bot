@@ -134,28 +134,38 @@ def plot_signal(df, symbol, action, votes):
 # ---------------- WEBSOCKET ----------------
 def on_message(ws, msg):
     data = json.loads(msg)
-    k = data.get("k"); s = data.get("s")
-    if not k: return
+    k = data.get("k")
+    s = data.get("s")
+    if not k:
+        return
+
+    candle_closed = k["x"]
+    candle_time = pd.to_datetime(k["t"], unit="ms")
 
     with lock:
         df = symbol_dfs.get(s, pd.DataFrame(columns=["open","high","low","close","volume"]))
-        df.loc[pd.to_datetime(k["t"], unit="ms")] = [
+        df.loc[candle_time] = [
             float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"])
         ]
         df = df.tail(EMA_SCAN_LIMIT)
         symbol_dfs[s] = df
 
-    # --- Генеруємо сигнал на кожній свічці ---
-    action, votes, last, conf = detect_signal(df)
-    logger.info("Signal %s -> action=%s conf=%.2f", s, action, conf)
+    last_candle = df.iloc[-1]
+    logger.info("Candle %s time=%s o=%.6f h=%.6f l=%.6f c=%.6f v=%.6f closed=%s",
+                s, last_candle.name, last_candle["open"], last_candle["high"],
+                last_candle["low"], last_candle["close"], last_candle["volume"], candle_closed)
 
-    prev = state["signals"].get(s, "")
-    if action != "WATCH" and (action != prev):
-        buf = plot_signal(df, s, action, votes)
-        send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
-        state["signals"][s] = action
-        state["last_update"] = str(datetime.now(timezone.utc))
-        save_state(STATE_FILE, state)
+    if candle_closed:
+        action, votes, last, conf = detect_signal(df)
+        logger.info("Signal %s -> action=%s conf=%.2f", s, action, conf)
+
+        prev = state["signals"].get(s, "")
+        if action != "WATCH" and action != prev:
+            buf = plot_signal(df, s, action, votes)
+            send_telegram(f"⚡ {s} {action} price={last['close']:.6f} conf={conf:.2f}", photo=buf)
+            state["signals"][s] = action
+            state["last_update"] = str(datetime.now(timezone.utc))
+            save_state(STATE_FILE, state)
 
 def on_error(ws, err): logger.error("WebSocket error: %s", err)
 def on_close(ws, cs, cm):
