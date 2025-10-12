@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Futures spread watcher (ccxt.pro) — моніторить USDT perpetual (swap) пари
-на множині бірж через websockets і відправляє сигнали в Telegram, якщо
-знайдено валідний спред (але ігнорує спреди >100%).
+Futures Spread Watcher — ccxt.pro + REST fallback + HTTP keepalive (для Render)
+Моніторить USDT ф’ючерси між біржами та шле сповіщення в Telegram.
 """
 
 import os
@@ -10,350 +9,199 @@ import asyncio
 import time
 import json
 import logging
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
 
 import requests
-import pandas as pd
-
-# зовнішні: ccxt, ccxt.pro
-try:
-    import ccxt
-except Exception as e:
-    raise RuntimeError("ccxt required. pip install ccxt") from e
+import ccxt
 
 try:
     import ccxt.pro as ccxtpro
 except Exception:
-    ccxtpro = None  # ми перевіримо пізніше і дамо зрозуміле повідомлення
+    ccxtpro = None
 
-# --- LOGGING ---
+# === CONFIG ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("futures-spread-bot")
+logger = logging.getLogger("futures-bot")
 
-# --- CONFIG (env) ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
-# біржі, які будемо намагатись моніторити (ccxt ids)
-EXCHANGES_TO_TRY = os.getenv("EXCHANGES", "gate,mexc,lbank,hotbit").split(",")  # можна змінити через env
-MIN_SPREAD_PCT = float(os.getenv("MIN_SPREAD_PCT", "0.5"))  # мінімум 0.5% spread для сигналу
-MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "100.0"))  # ігнорувати >100%
-RECONNECT_DELAY = int(os.getenv("RECONNECT_DELAY", "5"))  # backoff
-WS_TIMEOUT = int(os.getenv("WS_TIMEOUT", "30"))  # таймаут між тиками, не критично
-PRICE_SAFETY_MIN = 1e-8  # мінімальна ціна, нижче якої вважаємо аномалією
 
-# Telegram helper
-MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
-import re
+# Три біржі, які реально підтримуються ccxt.pro
+EXCHANGES_TO_TRY = ["gate", "mexc", "lbank"]
+
+MIN_SPREAD_PCT = 0.5
+MAX_SPREAD_PCT = 100.0
+PRICE_MIN = 1e-8
+REST_FALLBACK_INTERVAL = 15  # секунд
+DEDUP_INTERVAL = 120
+
+# === Telegram ===
 def escape_md_v2(text: str) -> str:
-    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
+    import re
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f"([{re.escape(escape_chars)}])", r"\\\1", str(text))
 
-def send_telegram(text: str):
+def send_telegram(msg: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram not configured -> skip send")
         return
     try:
-        payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
-        if not r.ok:
-            logger.warning("Telegram send failed: %s %s", r.status_code, r.text)
-    except Exception as ex:
-        logger.exception("send_telegram error: %s", ex)
+        payload = {"chat_id": CHAT_ID, "text": escape_md_v2(msg), "parse_mode": "MarkdownV2"}
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+    except Exception as e:
+        logger.warning(f"Telegram send error: {e}")
 
-# --- utility: human timestamp
-def now_utc_str():
+def now_utc():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-# --- Step 1: initial market discovery via ccxt (sync) ---
+# === Market Discovery ===
 def discover_futures_markets(exchange_ids):
-    """
-    Викликаємо ccxt REST fetch_markets для кожної біржі і збираємо futures/swap
-    пари з USDT (підозрюємо, що їх маркування міститиме 'USDT').
-    Повертаємо dict: exchange_id -> set(symbols)
-    """
-    logger.info("Discovering markets via REST for exchanges: %s", exchange_ids)
-    exchange_symbols = {}
+    results = {}
     for ex_id in exchange_ids:
         try:
-            logger.info("Init REST client for %s", ex_id)
             ex = getattr(ccxt, ex_id)()
-            # fetch markets
-            markets = ex.load_markets(True)
-            symbols = set()
-            for mkt in markets.values():
-                sym = mkt.get('symbol')
-                if not sym:
-                    continue
-                # Filter: must contain USDT and be a contract / swap / future market
-                mtype = mkt.get('type', '') or ''
-                info = mkt.get('info') or {}
-                is_contract = False
-                # heuristics
-                if 'swap' in mtype or 'future' in mtype or mkt.get('contract') or info.get('contractType') or info.get('contract') == True:
-                    is_contract = True
-                # Some exchanges have 'linear' flag or 'spot' flag -> skip spot
-                if 'USDT' in sym and is_contract:
-                    symbols.add(sym)
-            logger.info("  %s -> %d futures symbols", ex_id, len(symbols))
-            exchange_symbols[ex_id] = symbols
+            markets = ex.load_markets()
+            futures = {
+                m["symbol"]
+                for m in markets.values()
+                if ("USDT" in m["symbol"])
+                and (m.get("contract") or "swap" in (m.get("type") or "") or "future" in (m.get("type") or ""))
+            }
+            logger.info("%s -> %d futures symbols", ex_id, len(futures))
+            results[ex_id] = futures
         except Exception as e:
-            logger.exception("Failed to discover markets for %s: %s", ex_id, e)
-            exchange_symbols[ex_id] = set()
-    return exchange_symbols
+            logger.warning(f"{ex_id} discover error: {e}")
+            results[ex_id] = set()
+    return results
 
-# --- Step 2: compute cross-exchange common symbols list ---
 def find_common_symbols(exchange_symbols):
-    """
-    Знайдемо всі символи, які присутні принаймні на двох біржах,
-    оскільки для арбітражу потрібно порівняння.
-    Повертаємо sorted list.
-    """
-    cnt = {}
+    count = {}
     for ex, syms in exchange_symbols.items():
         for s in syms:
-            cnt[s] = cnt.get(s, 0) + 1
-    common = [s for s, c in cnt.items() if c >= 2]
-    logger.info("Found %d symbols that exist on >=2 exchanges", len(common))
+            count[s] = count.get(s, 0) + 1
+    common = [s for s, c in count.items() if c >= 2]
+    logger.info("Found %d common symbols", len(common))
     return common
 
-# --- Step 3: create async ccxt.pro clients (one per exchange) ---
-async def create_pro_client(exchange_id):
-    """
-    Створюємо ccxt.pro клієнт для exchange_id.
-    Якщо ccxt.pro не встановлено або exchange не підтримується — повертаємо None.
-    """
-    if ccxtpro is None:
-        logger.error("ccxt.pro not available. Install it to use websockets.")
-        return None
-    try:
-        logger.info("Creating ws client for %s", exchange_id)
-        ex_class = getattr(ccxtpro, exchange_id, None)
-        if ex_class is None:
-            logger.warning("ccxt.pro has no exchange class for id '%s'", exchange_id)
-            return None
-        ex = ex_class({
-            # деякі біржі вимагають 'enableRateLimit': True для стабільності
-            "enableRateLimit": True,
-            "timeout": 20000,
-        })
-        # спробуємо load_markets асинхронно
-        await ex.load_markets()
-        logger.info("Initialized exchange client: %s", exchange_id)
-        return ex
-    except Exception as e:
-        logger.exception("Failed to init exchange client %s: %s", exchange_id, e)
-        return None
+# === Spread check ===
+last_sent = {}
 
-# --- helper: normalize symbol names between exchanges ---
-def normalize_symbol(symbol):
-    # ccxt symbols are often unified, leave as-is
-    return symbol.replace(":", "/")  # some have ':' suffix for inverse contracts
-
-# --- Core: watch loops & comparison ---
-async def watch_symbol_across_exchanges(symbol, clients_map, last_prices_cache):
-    """
-    Для певного символу підписуємось (через clients_map) на watch_ticker.
-    Але щоб не створювати окремий корутин на кожну пару+exchange доволі тяжко —
-    логіка: кожен exchange клієнт має свій корутин, що слухає watch_ticker по багатьох парах.
-    Тому ця функція не використовується напряму. (залишаю для розширення)
-    """
-    pass  # main logic реалізовано в per-exchange watcher нижче
-
-async def exchange_ticker_watcher(exchange_id, ex_client, symbols_on_exchange, shared_book):
-    """
-    На одному exchange слухаємо watch_ticker для усіх symbols_on_exchange (список).
-    Прихід кожного тікера зберігаємо в shared_book: shared_book[symbol][exchange_id] = {'bid':..., 'ask':..., 'ts':...}
-    Потім для цього symbol виконуємо пошук найкращих bid/ask across other exchanges і рахуємо spread.
-    """
-    logger.info("Starting watcher for exchange %s (symbols: %d)", exchange_id, len(symbols_on_exchange))
-    # chunk subscribes to avoid overloading ws — будемо підписуватись по черзі
-    symbols = list(symbols_on_exchange)
-    for sym in symbols:
-        # async subscribe with retry
-        mapped = sym
-        tries = 0
-        while True:
-            try:
-                # watch_ticker returns a dict like { 'symbol':..., 'bid':..., 'ask':... }
-                ticker = await ex_client.watch_ticker(mapped, params={})
-                bid = ticker.get('bid') or ticker.get('bestBid') or 0.0
-                ask = ticker.get('ask') or ticker.get('bestAsk') or 0.0
-                ts = ticker.get('timestamp') or ticker.get('datetime') or datetime.now(timezone.utc).timestamp()
-                # safe-cast
-                try:
-                    bid = float(bid) if bid is not None else 0.0
-                    ask = float(ask) if ask is not None else 0.0
-                except Exception:
-                    bid = 0.0; ask = 0.0
-
-                # store
-                shared_book.setdefault(sym, {})[exchange_id] = {"bid": bid, "ask": ask, "ts": time.time()}
-
-                # compare with other exchanges present for this symbol
-                await analyze_spreads_for_symbol(sym, shared_book)
-
-                # small sleep to yield control
-                await asyncio.sleep(0.01)
-            except asyncio.CancelledError:
-                logger.info("watcher cancelled for %s @ %s", sym, exchange_id)
-                return
-            except Exception as e:
-                # often websocket will close; attempt backoff
-                tries += 1
-                logger.debug("watch_ticker exception for %s on %s (try %d): %s", sym, exchange_id, tries, e)
-                await asyncio.sleep(min(10 + tries, 60))
-                # try to reload markets or reconnect if needed
-                try:
-                    await ex_client.load_markets()
-                except Exception:
-                    pass
-                continue
-
-async def analyze_spreads_for_symbol(symbol, shared_book):
-    """
-    Для символу беремо всі біржі з даними, знаходимо найменший ask (купити)
-    і найбільший bid (продати). Рахуємо spread.
-    Якщо spread_pct в межах (MIN_SPREAD_PCT, MAX_SPREAD_PCT) — надсилаємо повідомлення.
-    Також перевіряємо, що ціни не аномально малі.
-    Використовуємо simple dedup: зберігаємо останній відправлений spread для символу і пар (buy_ex/sell_ex)
-    і не спамимо повторно за короткий інтервал.
-    """
-    data = shared_book.get(symbol, {})
-    if not data or len(data) < 2:
+def analyze_spread(symbol, shared):
+    data = shared.get(symbol, {})
+    if len(data) < 2:
         return
-    # build list of (exchange, bid, ask)
-    rows = []
+    best_ask, best_ask_ex = float("inf"), None
+    best_bid, best_bid_ex = 0.0, None
     for ex, v in data.items():
-        bid = v.get("bid", 0.0) or 0.0
-        ask = v.get("ask", 0.0) or 0.0
-        rows.append((ex, bid, ask))
-    # find best ask (min) and best bid (max)
-    best_ask_ex, best_ask = None, float('inf')
-    best_bid_ex, best_bid = None, 0.0
-    for ex, bid, ask in rows:
-        if ask and ask > PRICE_SAFETY_MIN and ask < best_ask:
-            best_ask = ask; best_ask_ex = ex
-        if bid and bid > PRICE_SAFETY_MIN and bid > best_bid:
-            best_bid = bid; best_bid_ex = ex
-    if best_ask_ex is None or best_bid_ex is None:
+        bid, ask = v.get("bid", 0), v.get("ask", 0)
+        if ask and ask < best_ask:
+            best_ask, best_ask_ex = ask, ex
+        if bid and bid > best_bid:
+            best_bid, best_bid_ex = bid, ex
+    if not best_ask_ex or not best_bid_ex or best_ask_ex == best_bid_ex:
         return
-    # ignore if same exchange
-    if best_ask_ex == best_bid_ex:
+    spread = (best_bid / best_ask - 1) * 100 if best_ask > 0 else 0
+    if spread <= MIN_SPREAD_PCT or spread > MAX_SPREAD_PCT:
         return
-    # compute spread pct = (best_bid / best_ask - 1) * 100
-    try:
-        spread_ratio = best_bid / best_ask if best_ask > 0 else 0.0
-        spread_pct = (spread_ratio - 1.0) * 100.0
-    except Exception:
+    key = f"{symbol}|{best_ask_ex}|{best_bid_ex}"
+    now = time.time()
+    if now - last_sent.get(key, 0) < DEDUP_INTERVAL:
         return
-    # sanity filters
-    if spread_pct <= MIN_SPREAD_PCT:
-        return
-    if spread_pct > MAX_SPREAD_PCT:
-        # ignore crazy numbers
-        logger.debug("Ignoring %s spread %.2f%% (>%s%%) between %s/%s", symbol, spread_pct, MAX_SPREAD_PCT, best_bid_ex, best_ask_ex)
-        return
-    # Dedup: do not resend same pair+symbol too frequently
-    dedup_key = f"{symbol}|{best_ask_ex}|{best_bid_ex}"
-    now_ts = time.time()
-    last_sent = analyze_spreads_for_symbol._last_sent.get(dedup_key, 0)
-    # resend only if > 120s since last alert for same arrangement (configurable)
-    if now_ts - last_sent < 120:
-        return
-    analyze_spreads_for_symbol._last_sent[dedup_key] = now_ts
-
-    # Build human-friendly message
+    last_sent[key] = now
     msg = (
-        f"🔔 *Spread Alert via WS*\n"
+        f"🔔 *Spread Alert*\n"
         f"Symbol: `{symbol}`\n"
         f"Buy (ask): `{best_ask:.8f}` @ *{best_ask_ex}*\n"
         f"Sell (bid): `{best_bid:.8f}` @ *{best_bid_ex}*\n"
-        f"Spread: *{spread_pct:.2f}%* ({best_bid - best_ask:.8f})\n"
-        f"Time: {now_utc_str()}\n"
+        f"Spread: *{spread:.2f}%* ({best_bid - best_ask:.8f})\n"
+        f"Time: {now_utc()}"
     )
-    logger.info("Spread found %s: ask %s@%s bid %s@%s => %.2f%%", symbol, best_ask, best_ask_ex, best_bid, best_bid_ex, spread_pct)
+    logger.info(msg.replace("*", ""))
     send_telegram(msg)
 
-# attach state
-analyze_spreads_for_symbol._last_sent = {}
-
-# --- Main runner ---
-async def run_ws_monitor():
-    # 1) discover REST markets for all exchanges
-    exchange_ids = [e.strip() for e in EXCHANGES_TO_TRY if e.strip()]
-    rest_markets = discover_futures_markets(exchange_ids)
-    # 2) find common symbols (>=2 exch) — we'll monitor only them (to be efficient)
-    common_symbols = find_common_symbols(rest_markets)
-    if not common_symbols:
-        logger.warning("No common futures symbols found across exchanges. Exiting.")
-        return
-
-    # 3) prepare mapping exchange -> symbols present there (intersection)
-    exch_to_symbols = {}
-    for ex in exchange_ids:
-        # keep only symbols that are in common_symbols
-        syms = rest_markets.get(ex, set())
-        use = sorted([s for s in syms if s in common_symbols])
-        exch_to_symbols[ex] = use
-        logger.info("%s -> subscribing to %d common symbols", ex, len(use))
-
-    # 4) create ccxt.pro clients async
-    pro_clients = {}
-    for ex in exchange_ids:
-        client = await create_pro_client(ex)
-        if client is None:
-            logger.warning("Skipping exchange %s (no ws client)", ex)
-            continue
-        pro_clients[ex] = client
-
-    if not pro_clients:
-        logger.error("No websocket clients available (ccxt.pro missing or all failed). Exiting.")
-        return
-
-    # 5) spin watchers per exchange
-    shared_book = {}  # symbol -> exchange -> {bid,ask,ts}
-    watchers = []
-    for ex_id, client in pro_clients.items():
-        symbols = exch_to_symbols.get(ex_id, [])
-        if not symbols:
-            continue
-        # create an independent task
-        task = asyncio.create_task(exchange_ticker_watcher(ex_id, client, symbols, shared_book))
-        watchers.append(task)
-
-    # 6) join tasks (they run forever); handle cancellation
+# === Async WS Mode ===
+async def create_client(ex_id):
     try:
-        await asyncio.gather(*watchers)
-    except asyncio.CancelledError:
-        logger.info("Run cancelled, closing clients")
+        ex_class = getattr(ccxtpro, ex_id)
+        client = ex_class({"enableRateLimit": True})
+        await client.load_markets()
+        return client
     except Exception as e:
-        logger.exception("run_ws_monitor top-level error: %s", e)
-    finally:
-        # close clients
-        for cli in pro_clients.values():
-            try:
-                await cli.close()
-            except Exception:
-                pass
+        logger.warning(f"{ex_id} ws init fail: {e}")
+        return None
 
-# --- entrypoint ---
-def main():
-    logger.info("Starting futures-spread-bot (ccxt.pro event-based). Exchanges: %s", EXCHANGES_TO_TRY)
-    if ccxtpro is None:
-        logger.error("ccxt.pro is not installed. Install ccxt.pro to use websocket monitoring.")
-        return
+async def ws_watcher(ex_id, client, symbols, shared):
+    logger.info(f"Watcher started for {ex_id}")
+    for s in symbols:
+        asyncio.create_task(single_ticker_loop(ex_id, client, s, shared))
 
-    # run asyncio loop
-    loop = asyncio.get_event_loop()
-    try:
-        loop.run_until_complete(run_ws_monitor())
-    finally:
-        # ensure loop closed gracefully
+async def single_ticker_loop(ex_id, client, symbol, shared):
+    while True:
         try:
-            loop.run_until_complete(loop.shutdown_asyncgens())
-        except Exception:
-            pass
-        loop.close()
+            t = await client.watch_ticker(symbol)
+            bid = t.get("bid") or 0
+            ask = t.get("ask") or 0
+            if not bid or not ask:
+                continue
+            shared.setdefault(symbol, {})[ex_id] = {"bid": bid, "ask": ask}
+            analyze_spread(symbol, shared)
+        except Exception as e:
+            logger.debug(f"{ex_id}:{symbol} ws err {e}")
+            await asyncio.sleep(5)
+
+# === REST fallback ===
+async def rest_fallback_loop(exchange_ids, symbols, shared):
+    exchanges = [getattr(ccxt, ex)() for ex in exchange_ids]
+    while True:
+        for ex in exchanges:
+            try:
+                tickers = ex.fetch_tickers(symbols)
+                for sym, t in tickers.items():
+                    bid, ask = t.get("bid"), t.get("ask")
+                    if not bid or not ask:
+                        continue
+                    shared.setdefault(sym, {})[ex.id] = {"bid": bid, "ask": ask}
+                    analyze_spread(sym, shared)
+            except Exception as e:
+                logger.debug(f"REST err {ex.id}: {e}")
+        await asyncio.sleep(REST_FALLBACK_INTERVAL)
+
+# === HTTP keepalive (Render fix) ===
+class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+def start_http_server():
+    port = int(os.getenv("PORT", 10000))
+    srv = HTTPServer(("", port), KeepAliveHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    logger.info(f"Keepalive HTTP server running on port {port}")
+
+# === main ===
+async def main():
+    start_http_server()
+
+    exchange_symbols = discover_futures_markets(EXCHANGES_TO_TRY)
+    common = find_common_symbols(exchange_symbols)
+    if not common:
+        logger.error("No common symbols found!")
+        return
+    exch_symbols = {ex: [s for s in syms if s in common] for ex, syms in exchange_symbols.items()}
+    shared = {}
+
+    if ccxtpro:
+        clients = {}
+        for ex in EXCHANGES_TO_TRY:
+            cli = await create_client(ex)
+            if cli:
+                clients[ex] = cli
+        tasks = [ws_watcher(ex, cli, exch_symbols[ex], shared) for ex, cli in clients.items()]
+        await asyncio.gather(*tasks)
+    else:
+        await rest_fallback_loop(EXCHANGES_TO_TRY, common, shared)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
