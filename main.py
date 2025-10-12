@@ -193,26 +193,33 @@ def render_orderbook_image(title: str, orderbooks: Dict[str, Dict], width=800, h
     return buf.getvalue()
 
 # ---------------- CCXT Exchange setup ----------------
-def create_ccxt_exchanges() -> Dict[str, ccxt.Exchange]:
+def create_ccxt_exchanges(futures_mode=True) -> Dict[str, ccxt.Exchange]:
     exchanges = {}
     for ex_id, friendly in EXCHANGE_IDS.items():
         try:
-            # instantiate exchange via ccxt
             ex_class = getattr(ccxt, ex_id)
-            # API keys from env if provided: e.g. GATEIO_APIKEY, GATEIO_SECRET
             api_key = os.getenv(f"{ex_id.upper()}_API_KEY", "") or os.getenv(f"{ex_id.upper()}_KEY", "")
             api_secret = os.getenv(f"{ex_id.upper()}_API_SECRET", "") or os.getenv(f"{ex_id.upper()}_SECRET", "")
-            params = {}
+            params = {"enableRateLimit": True}
             if api_key and api_secret:
-                params = {"apiKey": api_key, "secret": api_secret}
+                params["apiKey"] = api_key
+                params["secret"] = api_secret
+
             exchange = ex_class(params)
-            exchange.enableRateLimit = True
-            # optional tweak for some exchanges
-            exchange.options = getattr(exchange, "options", {}) or {}
+
+            # === 🔥 ось головне: перемикач на futures/swap ===
+            if futures_mode:
+                if ex_id in ["gateio", "mexc", "lbank"]:
+                    exchange.options["defaultType"] = "swap"
+                elif ex_id in ["binance", "bybit", "okx"]:
+                    exchange.options["defaultMarket"] = "future"
+
+            exchange.load_markets()
             exchanges[ex_id] = exchange
-            logger.info("Created ccxt exchange: %s", ex_id)
+            logger.info("Created ccxt exchange: %s (mode=%s)", ex_id, "futures" if futures_mode else "spot")
+
         except Exception as e:
-            logger.warning("Could not create ccxt exchange %s (%s). Skipping. Error: %s", ex_id, friendly, e)
+            logger.warning("Could not init exchange %s (%s): %s", ex_id, friendly, e)
     return exchanges
 
 # ---------------- Helpers for orderbook retrieval ----------------
