@@ -31,8 +31,6 @@ STATE_FILE = "spread_state.json"
 EXCHANGES_TO_TRY = {
     "gateio": ["gateio", "gate"],
     "mexc": ["mexc", "mexc3", "mexc3p"],
-    "hotcoin": ["hotcoin", "hotbit"],
-    "lbank": ["lbank"]
 }
 
 SYMBOL_QUOTE = "USDT"
