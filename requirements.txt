@@ -34,3 +34,4 @@ mplfinance
 websocket-client
 rel
 fpdf
+ccxtpro
