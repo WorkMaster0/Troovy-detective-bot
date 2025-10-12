@@ -229,7 +229,7 @@ async def create_pro_client(exchange_id: str):
 
 async def watch_exchange_tickers(exchange, ex_id: str, symbols: List[str]):
     """
-    Subscribe to tickers via watch_ticker for given exchange and symbols.
+    Subscribe to order books via watch_order_book for given exchange and symbols.
     Keeps updating latest_quote[ex_id][symbol].
     """
     global latest_quote
@@ -239,29 +239,23 @@ async def watch_exchange_tickers(exchange, ex_id: str, symbols: List[str]):
         while True:
             for s in symbols:
                 try:
-                    # map symbol to exchange-specific representation if needed
-                    # ccxt.pro should accept the unified symbol usually
-                    ticker = await exchange.watch_ticker(s)
-                    # ticker typically contains bid/ask
-                    bid = float(ticker.get('bid') or 0.0)
-                    ask = float(ticker.get('ask') or 0.0)
-                    ts = float(ticker.get('timestamp') or time.time())
-                    latest_quote[ex_id][s] = {'bid': bid, 'ask': ask, 'timestamp': ts, 'info': ticker.get('info')}
-                    # if debug, log small
+                    orderbook = await exchange.watch_order_book(s)
+                    if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
+                        continue
+                    bid = float(orderbook['bids'][0][0])
+                    ask = float(orderbook['asks'][0][0])
+                    ts = float(orderbook.get('timestamp') or time.time())
+                    latest_quote[ex_id][s] = {'bid': bid, 'ask': ask, 'timestamp': ts}
                     if DEBUG_MODE:
-                        logger.debug("%s: %s bid=%s ask=%s", ex_id, s, bid, ask)
-                    # after each update, perform cross-exchange check for that symbol
+                        logger.debug("%s %s bid=%s ask=%s", ex_id, s, bid, ask)
                     await check_spread_for_symbol(s, ex_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    # catch per-symbol errors and continue
-                    logger.debug("watch_ticker error for %s on %s: %s", s, ex_id, e)
-                    await asyncio.sleep(0.1)
-            # small sleep to yield
+                    logger.debug("%s watch_order_book error for %s: %s", ex_id, s, e)
+                    await asyncio.sleep(0.05)
             await asyncio.sleep(0.01)
     finally:
-        # close exchange later by caller
         logger.info("Watcher finished for %s", ex_id)
 
 async def check_spread_for_symbol(symbol: str, updated_ex: str):
