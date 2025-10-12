@@ -1,446 +1,407 @@
 #!/usr/bin/env python3
 """
-Cross-exchange spread parser + Telegram alerts.
-
-Features:
-- Uses ccxt to fetch orderbooks from configured exchanges (Gate.io, MEXC, LBank, HotCoin(if supported))
-- Filters leveraged / synthetic tickers (3L/3S/UP/DOWN/BEAR/BULL/PERP etc.)
-- Normalizes pairs, checks base/quote match
-- Computes spread = (best_bid - best_ask) / best_ask  (arbitrage potential)
-- Filters out absurd spreads and false positives
-- Sends Telegram alerts with orderbook snapshot (and retries on timeout)
-- Config via environment variables
+Futures spread scanner (ccxt.pro websocket)
+- Exchanges: gateio, mexc, hotcoin, lbank (futures/swap mode)
+- Event-based (watchTicker)
+- Send Telegram alerts for spreads within thresholds (ignores >100%)
 """
 
 import os
+import asyncio
 import time
-import math
 import json
 import logging
-import io
-import re
+import math
 from datetime import datetime, timezone
-from typing import Dict, Tuple, List
-
+from typing import Dict, Any, List, Tuple
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
+import io
 
-import ccxt
-import pandas as pd
+# requires ccxt.pro
+try:
+    import ccxt.pro as ccxtpro
+except Exception as e:
+    raise RuntimeError("ccxt.pro is required. Install it with `pip install ccxtpro`") from e
 
-# ---------------- Logging ----------------
+# ---------------- logging ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler("spread_bot.log"), logging.StreamHandler()]
+    handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("spread-bot")
+logger = logging.getLogger("futures-spread-bot")
 
-# ---------------- Config ----------------
+# ---------------- config from env ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-# Exchanges to try via ccxt exchange id -> friendly name
-EXCHANGE_IDS = {
-    "gateio": "Gate.io",
-    "mexc": "MEXC",
-    "lbank": "LBank",
-    # "hotcoin" may or may not be supported in your ccxt version.
-    # Try "hotcoin" or "hotbit" etc. If not supported, it will be skipped.
-    "hotcoin": "HotCoin"
-}
+# Exchanges to use (ccxt ids)
+EXCHANGE_IDS = ["gateio", "mexc", "hotcoin", "lbank"]
 
-# Pairs to monitor: pass via env as comma separated like "BTC/USDT,ETH/USDT"
-PAIRS_ENV = os.getenv("SPREAD_PAIRS", "")
-if PAIRS_ENV.strip():
-    WATCH_PAIRS = [p.strip().upper() for p in PAIRS_ENV.split(",")]
-else:
-    # default: common large-cap pairs
-    WATCH_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT"]
+# Default symbols (3m futures-perp style). You can override via env SYMBOLS (comma-separated)
+DEFAULT_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "ADA/USDT",
+    "XRP/USDT", "LTC/USDT", "DOT/USDT", "LINK/USDT", "AVAX/USDT"
+]
+SYMBOLS = [s.strip() for s in os.getenv("SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",") if s.strip()]
 
-# Spread threshold (relative): e.g. 0.01 = 1%
-SPREAD_THRESHOLD = float(os.getenv("SPREAD_THRESHOLD", "0.01"))
+# thresholds
+MIN_SPREAD_PCT = float(os.getenv("MIN_SPREAD_PCT", "0.5"))  # minimum spread to alert (percent)
+MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "100.0"))  # do not show > 100%
+MIN_DELTA_PCT = float(os.getenv("MIN_DELTA_PCT", "0.5"))  # minimal change vs last alert to resend (percent)
+POLL_TIMEOUT = int(os.getenv("POLL_TIMEOUT", "20"))  # seconds for watchTicker timeout fallback
 
-# Absolute price sanity threshold (ignore microdust tokens if desired)
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.00005"))
+# dedupe
+DEDUP_WINDOW = int(os.getenv("DEDUP_WINDOW", "30"))  # seconds to "cooldown" same pair if no significant change
 
-# Max allowed multiplier between prices -- if exceeded, treat as suspicious (e.g. 100x)
-MAX_PRICE_RATIO = float(os.getenv("MAX_PRICE_RATIO", "100.0"))
+# safety
+MAX_RECONNECT_DELAY = 60
 
-# How often check (seconds)
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "15"))
+# ---------------- global runtime state ----------------
+# latest_prices[symbol][exchange_id] = {"bid": float, "ask": float, "timestamp": ts}
+latest_prices: Dict[str, Dict[str, Dict[str, Any]]] = {}
+# last_sent[symbol] = {"buy_ex":..,"sell_ex":..,"spread":float,"time":ts}
+last_sent: Dict[str, Dict[str, Any]] = {}
 
-# Telegram request timeout and retry
-TELEGRAM_TIMEOUT = 12
-TELEGRAM_RETRIES = 2
-
-# Debug mode
-DEBUG = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
-
-# Regex: filter leveraged / synthetic tokens (common substrings)
-LEVERAGED_RE = re.compile(r"(3S|3L|UP|DOWN|BEAR|BULL|PERP|ETF|SYNTH|LEVER|3X|-3X|-UP|-DOWN)$", re.IGNORECASE)
-
-# Whitelist of allowed quote currencies (we only compare same quote)
-ALLOWED_QUOTES = {"USDT", "USD", "BTC", "USDC", "BUSD"}
-
-# Optional per-exchange symbol mapping overrides (if an exchange uses different notation)
-# Example: {"gateio": {"BTC/USDT": "BTC_USDT"}} - ccxt usually handles mapping so not necessary
-EXCHANGE_SYMBOL_OVERRIDES = {}
-
-# Optional limit for orderbook depth to fetch
-OB_LIMIT = 5
-
-# ---------------- Utilities ----------------
-def now_utc_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-# ---------------- Telegram helper ----------------
+# ---------------- Telegram helpers ----------------
 MARKDOWNV2_ESCAPE = r"_*[]()~`>#+-=|{}.!"
 
 def escape_md_v2(text: str) -> str:
-    return re.sub(f"([{re.escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
+    return __import__("re").sub(f"([{__import__('re').escape(MARKDOWNV2_ESCAPE)}])", r"\\\1", str(text))
 
-def send_telegram(text: str, image_bytes: bytes = None, tries: int = TELEGRAM_RETRIES):
-    """Send message + optional photo to Telegram with retry on timeout."""
+def send_telegram_message(text: str, photo_bytes: bytes = None, tries: int = 2):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.debug("Telegram credentials not set, skipping send.")
+        logger.debug("Telegram not configured; skipping send.")
         return False
     try:
-        headers = {"User-Agent": "spread-bot/1.0"}
-        if image_bytes:
-            # Try to process via PIL first (avoid ANTIALIAS warnings)
+        if photo_bytes:
+            # use PIL to re-save to avoid Pillow ANTIALIAS issue in some envs
             try:
-                img = Image.open(io.BytesIO(image_bytes))
+                img = Image.open(io.BytesIO(photo_bytes))
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 buf.seek(0)
-                files = {"photo": ("spread.png", buf, "image/png")}
+                files = {'photo': ('signal.png', buf, 'image/png')}
             except Exception:
-                files = {"photo": ("spread.png", io.BytesIO(image_bytes), "image/png")}
-            data = {"chat_id": CHAT_ID, "caption": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
-                                 data=data, files=files, timeout=TELEGRAM_TIMEOUT, headers=headers)
+                files = {'photo': ('signal.png', io.BytesIO(photo_bytes), 'image/png')}
+            data = {'chat_id': CHAT_ID, 'caption': escape_md_v2(text), 'parse_mode': 'MarkdownV2'}
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto", data=data, files=files, timeout=15)
         else:
             payload = {"chat_id": CHAT_ID, "text": escape_md_v2(text), "parse_mode": "MarkdownV2"}
-            resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                                 json=payload, timeout=TELEGRAM_TIMEOUT, headers=headers)
-        resp.raise_for_status()
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
         return True
     except requests.exceptions.ReadTimeout as e:
-        logger.warning("Telegram send timeout: %s", e)
+        logger.warning("Telegram timeout: %s", e)
         if tries > 0:
             time.sleep(1)
-            return send_telegram(text, image_bytes, tries - 1)
+            return send_telegram_message(text, photo_bytes, tries-1)
         return False
     except Exception as e:
         logger.exception("send_telegram error: %s", e)
         return False
 
-# ---------------- Image snapshot helper ----------------
-def render_orderbook_image(title: str, orderbooks: Dict[str, Dict], width=800, height_per_exchange=120) -> bytes:
+# ---------------- ccxt.pro exchanges factory ----------------
+async def create_exchange_client(exchange_id: str):
     """
-    Renders a compact image showing best bids/asks per exchange and small lists.
-    orderbooks: {exchange: {"bid": bid_price, "ask": ask_price, "bids": [(p,q)...], "asks":[...]}}
+    Create ccxt.pro exchange instance in futures/swap mode.
+    Uses env variables for API keys if present (EXCHANGEID_API_KEY, EXCHANGEID_API_SECRET).
     """
-    exchanges = list(orderbooks.keys())
-    height = max(200, len(exchanges) * height_per_exchange)
-    img = Image.new("RGB", (width, height), color=(255, 255, 255))
-    draw = ImageDraw.Draw(img)
+    api_key = os.getenv(f"{exchange_id.upper()}_API_KEY", "") or os.getenv(f"{exchange_id.upper()}_KEY", "")
+    api_secret = os.getenv(f"{exchange_id.upper()}_API_SECRET", "") or os.getenv(f"{exchange_id.upper()}_SECRET", "")
+    params = {"enableRateLimit": True}
+    if api_key and api_secret:
+        params['apiKey'] = api_key
+        params['secret'] = api_secret
     try:
-        # choose a default font (system-dep). If fails, fallback to default PIL font.
-        font = ImageFont.load_default()
+        ex_class = getattr(ccxtpro, exchange_id)
     except Exception:
-        font = None
+        # fallback: dynamic creation
+        ex_class = getattr(ccxtpro, exchange_id, None)
+    if ex_class is None:
+        raise RuntimeError(f"ccxt.pro has no exchange class for id '{exchange_id}'")
+    exchange = ex_class(params)
+    # try to set futures/swap mode
+    try:
+        # many exchanges accept defaultType = 'swap'
+        exchange.options = getattr(exchange, 'options', {}) or {}
+        exchange.options["defaultType"] = "swap"
+    except Exception:
+        logger.debug("Could not set defaultType for %s (may be fine)", exchange_id)
+    try:
+        await exchange.load_markets()
+    except Exception as e:
+        logger.warning("load_markets failed for %s: %s", exchange_id, e)
+        # still return instance; some exchanges may lazy-load on watchTicker
+    return exchange
 
-    y = 10
-    draw.text((10, y), title, fill=(0, 0, 0), font=font)
-    y += 18
-    for ex in exchanges:
-        ob = orderbooks[ex]
-        bid = ob.get("bid")
-        ask = ob.get("ask")
-        draw.text((10, y), f"{ex}  bid={bid if bid is not None else 'N/A'}  ask={ask if ask is not None else 'N/A'}", fill=(0, 0, 0), font=font)
-        y += 14
-        # show first 3 bids and asks
-        bids = ob.get("bids", [])[:3]
-        asks = ob.get("asks", [])[:3]
-        draw.text((20, y), "BIDS:", fill=(0, 100, 0), font=font)
-        bx = 80
-        for p, q in bids:
-            draw.text((bx, y), f"{p:.6f}@{q:.3f}", fill=(0, 100, 0), font=font)
-            bx += 160
-        y += 14
-        draw.text((20, y), "ASKS:", fill=(139, 0, 0), font=font)
-        ax = 80
-        for p, q in asks:
-            draw.text((ax, y), f"{p:.6f}@{q:.3f}", fill=(139, 0, 0), font=font)
-            ax += 160
-        y += 18
-        draw.line((10, y, width - 10, y), fill=(220, 220, 220))
-        y += 6
+# ---------------- symbol helper ----------------
+def find_exchange_symbol(exchange, unified_symbol: str) -> str:
+    """
+    Try to map unified_symbol (e.g. 'BTC/USDT') to exchange-specific symbol variant.
+    ccxt.pro usually supports unified symbols, but some markets might be named 'BTC/USDT:USDT' etc.
+    Strategy: prefer exact match, else try same base/quote, else fallback to unified.
+    """
+    try:
+        markets = getattr(exchange, "markets", None)
+        if not markets:
+            # no markets loaded yet
+            return unified_symbol
+        if unified_symbol in markets:
+            return unified_symbol
+        base, quote = unified_symbol.split("/")
+        # try find a market with same base and quote in exchange.symbols
+        for s in exchange.symbols:
+            parts = s.split("/")
+            if len(parts) >= 2 and parts[0].upper() == base.upper() and parts[1].upper().startswith(quote.upper()):
+                return s
+        # fallback
+        return unified_symbol
+    except Exception:
+        return unified_symbol
 
-    # footer
-    draw.text((10, height - 20), f"Generated: {now_utc_str()}", fill=(80, 80, 80), font=font)
+# ---------------- ticker watching per exchange/symbol ----------------
+async def watch_ticker_loop(exchange, exchange_id: str, symbol: str, shared_symbol: str):
+    """
+    Continuously watch ticker for a given exchange & symbol, update latest_prices on updates.
+    This coroutine reconnects on failures.
+    """
+    mapped_symbol = find_exchange_symbol(exchange, symbol)
+    reconnect_delay = 1
+    while True:
+        try:
+            logger.debug("Watching %s:%s (mapped %s)", exchange_id, symbol, mapped_symbol)
+            # watch_ticker yields dict with bid/ask
+            ticker = await exchange.watch_ticker(mapped_symbol, params={})
+            # ticker expected keys: bid, ask, timestamp, datetime, last...
+            bid = float(ticker.get("bid") or 0.0)
+            ask = float(ticker.get("ask") or 0.0)
+            ts = ticker.get("timestamp") or int(time.time() * 1000)
+            # push into global latest_prices
+            latest_prices.setdefault(symbol, {})
+            latest_prices[symbol][exchange_id] = {"bid": bid, "ask": ask, "timestamp": ts}
+            # When a new tick arrives — process spread decision
+            await process_spread_event(symbol)
+            # reset reconnect_delay
+            reconnect_delay = 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("watch_ticker error for %s on %s: %s", symbol, exchange_id, e)
+            # exponential backoff
+            await asyncio.sleep(min(reconnect_delay, MAX_RECONNECT_DELAY))
+            reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * 2)
+            # attempt to reload markets
+            try:
+                await exchange.load_markets()
+            except Exception:
+                pass
+
+# ---------------- spread calculation & alert ----------------
+def compute_best_prices_for_symbol(symbol: str) -> Tuple[Tuple[str, float], Tuple[str, float]]:
+    """
+    Returns ((buy_ex, buy_price), (sell_ex, sell_price))
+    buy = lowest ask (we buy there), sell = highest bid (we sell there)
+    If insufficient data -> returns (None,None)
+    """
+    if symbol not in latest_prices:
+        return (None, None)
+    asks = []
+    bids = []
+    for ex_id, data in latest_prices[symbol].items():
+        a = data.get("ask", 0.0)
+        b = data.get("bid", 0.0)
+        # sanity: require both > 0
+        if a and a > 0:
+            asks.append((ex_id, float(a)))
+        if b and b > 0:
+            bids.append((ex_id, float(b)))
+    if not asks or not bids:
+        return (None, None)
+    # best buy = min ask
+    best_buy = min(asks, key=lambda x: x[1])
+    # best sell = max bid
+    best_sell = max(bids, key=lambda x: x[1])
+    return best_buy, best_sell
+
+def pct(a, b):
+    """percent change from a to b: (b-a)/a*100. caller ensures a>0"""
+    return (b - a) / a * 100.0
+
+def should_alert(symbol: str, buy_ex: str, buy_price: float, sell_ex: str, sell_price: float) -> Tuple[bool, float]:
+    """
+    Decide whether to alert based on thresholds and dedup rules.
+    Returns (should_send, spread_pct)
+    """
+    if buy_price <= 0:
+        return False, 0.0
+    spread_pct = pct(buy_price, sell_price)  # how much higher sell is vs buy
+    # ignore reversed or negative spreads
+    if spread_pct <= 0:
+        return False, spread_pct
+    # ignore huge anomalies
+    if spread_pct > MAX_SPREAD_PCT:
+        return False, spread_pct
+    # threshold
+    if spread_pct < MIN_SPREAD_PCT:
+        return False, spread_pct
+    # dedupe: if last_sent exists, compare
+    last = last_sent.get(symbol)
+    now_ts = time.time()
+    if last:
+        same_pair = (last.get("buy_ex") == buy_ex and last.get("sell_ex") == sell_ex)
+        prev_spread = float(last.get("spread", 0.0))
+        # if same pair and change small -> ignore
+        if same_pair and abs(spread_pct - prev_spread) < MIN_DELTA_PCT:
+            # if still within cooldown window -> skip
+            if now_ts - float(last.get("time", 0)) < DEDUP_WINDOW:
+                return False, spread_pct
+    return True, spread_pct
+
+def craft_message(symbol: str, buy_ex: str, buy_price: float, sell_ex: str, sell_price: float, spread_pct: float) -> str:
+    time_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    msg = (
+        f"🔔 *Spread Alert via WS*\n"
+        f"Symbol: `{symbol}`\n"
+        f"Buy (ask): `{buy_price:.8f}` @ *{buy_ex}*\n"
+        f"Sell (bid): `{sell_price:.8f}` @ *{sell_ex}*\n"
+        f"Spread: *{spread_pct:.2f}%* ({sell_price - buy_price:.8f})\n"
+        f"Time: {time_str}\n"
+    )
+    return msg
+
+# ---------------- optional simple text chart (no matplotlib) ----------------
+def craft_small_textbook(symbol: str, buy_ex: str, buy_price: float, sell_ex: str, sell_price: float, spread_pct: float) -> bytes:
+    """
+    Create a tiny PNG with the price and arrows (PIL) to send to Telegram.
+    Keep it simple to avoid heavy plotting libs.
+    """
+    from PIL import ImageDraw, ImageFont
+    W, H = 640, 200
+    img = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(img)
+    # fonts: default
+    title = f"{symbol}  Spread: {spread_pct:.2f}%"
+    draw.text((10, 10), title, fill="black")
+    draw.text((10, 50), f"Buy @ {buy_ex}: {buy_price:.8f}", fill="green")
+    draw.text((10, 90), f"Sell @ {sell_ex}: {sell_price:.8f}", fill="red")
+    # arrows
+    draw.line((450, 60, 580, 60), fill="green", width=4)
+    draw.polygon([(580,60),(570,55),(570,65)], fill="green")
+    draw.line((450, 100, 580, 100), fill="red", width=4)
+    draw.polygon([(450,100),(460,95),(460,105)], fill="red")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
     return buf.getvalue()
 
-# ---------------- CCXT Exchange setup ----------------
-def create_ccxt_exchanges(futures_mode=True) -> Dict[str, ccxt.Exchange]:
-    exchanges = {}
-    for ex_id, friendly in EXCHANGE_IDS.items():
-        try:
-            ex_class = getattr(ccxt, ex_id)
-            api_key = os.getenv(f"{ex_id.upper()}_API_KEY", "") or os.getenv(f"{ex_id.upper()}_KEY", "")
-            api_secret = os.getenv(f"{ex_id.upper()}_API_SECRET", "") or os.getenv(f"{ex_id.upper()}_SECRET", "")
-            params = {"enableRateLimit": True}
-            if api_key and api_secret:
-                params["apiKey"] = api_key
-                params["secret"] = api_secret
+# ---------------- process event when price updated ----------------
+last_process_time = {}  # per symbol throttle not to spin
 
-            exchange = ex_class(params)
-
-            # === 🔥 ось головне: перемикач на futures/swap ===
-            if futures_mode:
-                if ex_id in ["gateio", "mexc", "lbank"]:
-                    exchange.options["defaultType"] = "swap"
-                elif ex_id in ["binance", "bybit", "okx"]:
-                    exchange.options["defaultMarket"] = "future"
-
-            exchange.load_markets()
-            exchanges[ex_id] = exchange
-            logger.info("Created ccxt exchange: %s (mode=%s)", ex_id, "futures" if futures_mode else "spot")
-
-        except Exception as e:
-            logger.warning("Could not init exchange %s (%s): %s", ex_id, friendly, e)
-    return exchanges
-
-# ---------------- Helpers for orderbook retrieval ----------------
-def safe_fetch_orderbook(exchange: ccxt.Exchange, symbol: str, limit: int = OB_LIMIT):
+async def process_spread_event(symbol: str):
     """
-    Fetch orderbook via ccxt and normalize fields.
-    Returns dict with keys: bid, ask, bids(list), asks(list)
+    Called from ticker watchers whenever a new tick for symbol arrives.
+    Compute best_buy & best_sell, decide, and alert if needed.
     """
-    try:
-        ob = exchange.fetch_order_book(symbol, limit)
-        bids = ob.get("bids", []) or []
-        asks = ob.get("asks", []) or []
-        best_bid = bids[0][0] if bids else None
-        best_ask = asks[0][0] if asks else None
-        # format lists to (price, amount)
-        bids = [(float(p), float(q)) for p, q in bids]
-        asks = [(float(p), float(q)) for p, q in asks]
-        return {"bid": safe_float(best_bid), "ask": safe_float(best_ask), "bids": bids, "asks": asks}
-    except ccxt.BadSymbol:
-        logger.debug("%s does not have symbol %s", exchange.id, symbol)
-        return None
-    except Exception as e:
-        logger.debug("Orderbook fetch failed for %s %s: %s", exchange.id, symbol, e)
-        return None
+    # small debounce: process at most once per 0.5s per symbol
+    now = time.time()
+    if symbol in last_process_time and (now - last_process_time[symbol]) < 0.4:
+        return
+    last_process_time[symbol] = now
 
-# ---------------- Symbol normalization and validation ----------------
-def is_leveraged(symbol: str) -> bool:
-    """Return True if symbol likely refers to leveraged / synthetic token."""
-    return bool(LEVERAGED_RE.search(symbol.replace("/", "").upper()))
-
-def normalize_pair(pair: str) -> Tuple[str, str]:
-    """Return (base, quote) for a pair string like 'BTC/USDT'."""
-    parts = pair.replace("-", "/").replace("_", "/").split("/")
-    if len(parts) >= 2:
-        base = parts[0].upper()
-        quote = parts[1].upper()
-        return base, quote
-    return pair.upper(), ""
-
-def try_ccxt_symbol(exchange: ccxt.Exchange, pair: str) -> str:
-    """
-    Try to find correct ccxt symbol on exchange for a desired pair.
-    ccxt.exchange.markets mapping used to find matching symbol.
-    """
-    target_base, target_quote = normalize_pair(pair)
-    # if exchange has markets loaded, try direct match
-    try:
-        markets = exchange.load_markets()
-    except Exception:
-        markets = getattr(exchange, "markets", None) or {}
-    # direct variations
-    candidates = [
-        f"{target_base}/{target_quote}",
-        f"{target_base}/{target_quote.replace('USDC', 'USDT')}",
-        f"{target_base}_{target_quote}",
-        f"{target_base}{target_quote}",
-    ]
-    for c in candidates:
-        if c in markets:
-            return c
-    # fallback: search through markets
-    for m in markets.keys():
-        try:
-            b, q = normalize_pair(m)
-        except Exception:
-            continue
-        if b == target_base and q == target_quote:
-            return m
-    # not found
-    return None
-
-# ---------------- Spread calculation ----------------
-def compute_spread_snapshot(exchanges: Dict[str, ccxt.Exchange], pair: str) -> Dict:
-    """
-    For given pair (standard 'BASE/QUOTE'), fetch best bid/ask across exchanges
-    and compute spread opportunities.
-    Returns dict with snapshot info.
-    """
-    base, quote = normalize_pair(pair)
-    if quote not in ALLOWED_QUOTES:
-        # allow but log
-        logger.debug("Pair %s uses non-standard quote %s", pair, quote)
-    orderbooks = {}
-    for ex_id, ex in exchanges.items():
-        try:
-            # first try to map pair to exchange's market symbol
-            sym = try_ccxt_symbol(ex, pair)
-            if not sym:
-                logger.debug("Symbol %s not on %s", pair, ex_id)
-                continue
-            ob = safe_fetch_orderbook(ex, sym, limit=OB_LIMIT)
-            if not ob:
-                continue
-            # sanity: price not None and > MIN_PRICE
-            if (ob["bid"] is None or ob["ask"] is None):
-                continue
-            if ob["bid"] < MIN_PRICE and ob["ask"] < MIN_PRICE:
-                # probably tiny alt or mismatch -> skip
-                logger.debug("Skipping %s on %s due to price < MIN_PRICE", sym, ex_id)
-                continue
-            orderbooks[ex_id] = ob
-        except Exception as e:
-            logger.debug("Error fetching orderbook for %s on %s: %s", pair, ex_id, e)
-    if not orderbooks:
-        return {}
-
-    # find best bid (max) and best ask (min)
-    best_bid_ex, best_bid = None, -math.inf
-    best_ask_ex, best_ask = None, math.inf
-    for ex_id, ob in orderbooks.items():
-        if ob["bid"] and ob["bid"] > best_bid:
-            best_bid = ob["bid"]
-            best_bid_ex = ex_id
-        if ob["ask"] and ob["ask"] < best_ask:
-            best_ask = ob["ask"]
-            best_ask_ex = ex_id
-
-    if best_bid_ex is None or best_ask_ex is None:
-        return {}
-
-    # Basic sanity checks
-    # 1) symbols could be different assets (e.g. VET3S vs VET) -- detect via huge ratio
-    if best_bid <= 0 or best_ask <= 0:
-        return {}
-    price_ratio = max(best_bid, best_ask) / min(best_bid, best_ask) if min(best_bid, best_ask) > 0 else float('inf')
-    if price_ratio > MAX_PRICE_RATIO:
-        # suspect mismatch (e.g. different assets like leveraged tokens); ignore
-        logger.info("Suspicious price ratio for %s: ratio=%.2f (bid=%s@%s ask=%s@%s) -> skipping",
-                    pair, price_ratio, best_bid, best_bid_ex, best_ask, best_ask_ex)
-        return {}
-
-    # compute spread metric (arbitrage: sell at bid, buy at ask)
-    raw_diff = best_bid - best_ask
-    spread_rel = raw_diff / best_ask if best_ask != 0 else 0.0
-
-    snapshot = {
-        "pair": pair,
-        "orderbooks": orderbooks,
-        "best_bid_ex": best_bid_ex,
-        "best_bid": best_bid,
-        "best_ask_ex": best_ask_ex,
-        "best_ask": best_ask,
-        "raw_diff": raw_diff,
-        "spread_rel": spread_rel,
-        "price_ratio": price_ratio,
-        "timestamp": now_utc_str()
-    }
-    return snapshot
-
-# ---------------- Main scanning logic ----------------
-def run_scan_loop():
-    exchanges = create_ccxt_exchanges()
-    if not exchanges:
-        logger.error("No exchanges available. Exiting.")
+    best_buy, best_sell = compute_best_prices_for_symbol(symbol)
+    if not best_buy or not best_sell:
+        return
+    buy_ex, buy_price = best_buy
+    sell_ex, sell_price = best_sell
+    # if same exchange (no arbitrage) skip
+    if buy_ex == sell_ex:
+        return
+    # sanity: prices must be positive and reasonable
+    if buy_price <= 0 or sell_price <= 0:
         return
 
-    logger.info("Monitoring pairs: %s", ", ".join(WATCH_PAIRS))
-    while True:
+    should, spread_pct = should_alert(symbol, buy_ex, buy_price, sell_ex, sell_price)
+    if not should:
+        return
+
+    # craft message and small image
+    msg = craft_message(symbol, buy_ex, buy_price, sell_ex, sell_price, spread_pct)
+    img = craft_small_textbook(symbol, buy_ex, buy_price, sell_ex, sell_price, spread_pct)
+
+    # send and record
+    ok = send_telegram_message(msg, photo_bytes := img)
+    if ok:
+        last_sent[symbol] = {"buy_ex": buy_ex, "sell_ex": sell_ex, "spread": spread_pct, "time": time.time()}
+        logger.info("Alert sent for %s: buy %s@%f sell %s@%f spread=%.2f%%", symbol, buy_ex, buy_price, sell_ex, sell_price, spread_pct)
+    else:
+        logger.warning("Failed to send alert for %s", symbol)
+
+# ---------------- orchestrator ----------------
+async def run_ws_monitor():
+    """
+    Start exchange clients, spawn watch_ticker tasks for each (exchange,symbol).
+    """
+    # create exchange clients
+    exchanges = {}
+    for ex_id in EXCHANGE_IDS:
         try:
-            for pair in WATCH_PAIRS:
-                # Skip leveraged-looking pairs early
-                if is_leveraged(pair):
-                    if DEBUG:
-                        logger.debug("Skipping leveraged/synthetic pair: %s", pair)
-                    continue
-                snap = compute_spread_snapshot(exchanges, pair)
-                if not snap:
-                    if DEBUG:
-                        logger.debug("No valid snapshot for %s", pair)
-                    continue
-                # Check thresholds
-                if snap["spread_rel"] >= SPREAD_THRESHOLD and snap["raw_diff"] > 0:
-                    # Compose message and image
-                    spread_pct = snap["spread_rel"] * 100
-                    msg = (
-                        f"🔔 *Spread Alert via Parser*\n"
-                        f"Pair: `{pair}`\n"
-                        f"Buy (ask): `{snap['best_ask']:.8f}` @ *{EXCHANGE_IDS.get(snap['best_ask_ex'], snap['best_ask_ex'])}*\n"
-                        f"Sell (bid): `{snap['best_bid']:.8f}` @ *{EXCHANGE_IDS.get(snap['best_bid_ex'], snap['best_bid_ex'])}*\n"
-                        f"Spread: *{spread_pct:.2f}%* ({snap['raw_diff']:.8f})\n"
-                        f"Time: {snap['timestamp']}\n"
-                    )
-                    # small sanity re-check: ensure both prices reasonably close to median across exchanges
-                    prices = [v["bid"] for v in snap["orderbooks"].values()] + [v["ask"] for v in snap["orderbooks"].values()]
-                    prices = [p for p in prices if p and p > 0]
-                    median_price = float(pd.Series(prices).median()) if prices else None
-                    if median_price:
-                        # if median differs from best_ask or best_bid by > MAX_PRICE_RATIO/4, warn
-                        if (abs(snap["best_ask"] - median_price) / median_price > 0.9) or (abs(snap["best_bid"] - median_price) / median_price > 0.9):
-                            logger.info("Median price check failed for %s: median=%.6f bid=%.6f ask=%.6f -> skipping", pair, median_price, snap["best_bid"], snap["best_ask"])
-                            continue
-
-                    # build image
-                    try:
-                        image = render_orderbook_image(f"{pair} spread {spread_pct:.2f}% ({snap['best_bid_ex']}->{snap['best_ask_ex']})", 
-                                                       {EXCHANGE_IDS.get(k,k): v for k,v in snap["orderbooks"].items()})
-                    except Exception as e:
-                        logger.exception("render_orderbook_image failed: %s", e)
-                        image = None
-
-                    # send telegram
-                    send_ok = send_telegram(msg, image)
-                    if send_ok:
-                        logger.info("Alert sent for %s: spread=%.4f (%.2f%%) buy@%s sell@%s", pair, snap["raw_diff"], spread_pct, snap["best_ask_ex"], snap["best_bid_ex"])
-                    else:
-                        logger.warning("Failed to send alert for %s", pair)
-                else:
-                    if DEBUG:
-                        logger.debug("Pair %s no significant spread (%.6f)", pair, snap.get("spread_rel", 0))
-            time.sleep(CHECK_INTERVAL)
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user, exiting.")
-            return
+            exchanges[ex_id] = await create_exchange_client(ex_id)
+            logger.info("Initialized exchange client: %s", ex_id)
         except Exception as e:
-            logger.exception("Main loop error: %s", e)
-            time.sleep(5)
+            logger.exception("Failed to init exchange %s: %s", ex_id, e)
 
-# ---------------- Entry ----------------
+    # validate which symbols are available on which exchanges (map)
+    symbol_map: Dict[str, List[Tuple[str, str]]] = {s: [] for s in SYMBOLS}
+    for s in SYMBOLS:
+        for ex_id, ex in exchanges.items():
+            try:
+                mapped = find_exchange_symbol(ex, s)
+                # test if market exists
+                if hasattr(ex, "markets") and mapped in getattr(ex, "markets", {}):
+                    symbol_map[s].append((ex_id, mapped))
+                else:
+                    # some exchanges lazily expose markets; we still try to subscribe later
+                    symbol_map[s].append((ex_id, mapped))
+            except Exception:
+                logger.debug("Market check failed for %s on %s", s, ex_id)
+
+    # start watch tasks
+    tasks = []
+    for s in SYMBOLS:
+        for ex_id, ex in exchanges.items():
+            # spawn task
+            t = asyncio.create_task(watch_ticker_loop(ex, ex_id, s, s))
+            tasks.append(t)
+            # small sleep to avoid bursting connections
+            await asyncio.sleep(0.05)
+
+    # run until cancelled
+    await asyncio.gather(*tasks)
+
+# ---------------- entrypoint ----------------
+def main():
+    logger.info("Starting futures-spread-bot (ccxt.pro event-based). Symbols: %s", SYMBOLS)
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(run_ws_monitor())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user, shutting down.")
+    except Exception as e:
+        logger.exception("Fatal error in main: %s", e)
+    finally:
+        # try to close exchanges
+        async def close_all():
+            for ex_id in list(EXCHANGE_IDS):
+                try:
+                    ex = getattr(ccxtpro, ex_id, None)
+                except Exception:
+                    ex = None
+            # ccxt.pro automatically closes clients on process end; nothing guaranteed here
+        try:
+            loop.run_until_complete(asyncio.sleep(0.1))
+        except Exception:
+            pass
+
 if __name__ == "__main__":
-    logger.info("Starting Spread Parser bot")
-    logger.info("Exchanges configured: %s", ", ".join(EXCHANGE_IDS.keys()))
-    logger.info("Pairs configured: %s", ", ".join(WATCH_PAIRS))
-    logger.info("SPREAD_THRESHOLD=%.4f MIN_PRICE=%.8f MAX_PRICE_RATIO=%.2f CHECK_INTERVAL=%ds", SPREAD_THRESHOLD, MIN_PRICE, MAX_PRICE_RATIO, CHECK_INTERVAL)
-    run_scan_loop()
+    main()
