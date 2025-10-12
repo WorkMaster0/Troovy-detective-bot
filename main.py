@@ -13,7 +13,7 @@ import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from collections import defaultdict
-
+import signal
 import requests
 import ccxt
 
@@ -29,13 +29,11 @@ logger = logging.getLogger("futures-bot")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 CHAT_ID = os.getenv("CHAT_ID", "")
 
-# Три біржі, які реально підтримуються ccxt.pro
 EXCHANGES_TO_TRY = ["gate", "mexc", "lbank"]
 
 MIN_SPREAD_PCT = 0.5
 MAX_SPREAD_PCT = 100.0
-PRICE_MIN = 1e-8
-REST_FALLBACK_INTERVAL = 15  # секунд
+REST_FALLBACK_INTERVAL = 15
 DEDUP_INTERVAL = 120
 
 # === Telegram ===
@@ -134,22 +132,20 @@ async def create_client(ex_id):
 
 async def ws_watcher(ex_id, client, symbols, shared):
     logger.info(f"Watcher started for {ex_id}")
-    for s in symbols:
-        asyncio.create_task(single_ticker_loop(ex_id, client, s, shared))
+    tasks = [asyncio.create_task(single_ticker_loop(ex_id, client, s, shared)) for s in symbols]
+    await asyncio.gather(*tasks)
 
 async def single_ticker_loop(ex_id, client, symbol, shared):
     while True:
         try:
             t = await client.watch_ticker(symbol)
-            bid = t.get("bid") or 0
-            ask = t.get("ask") or 0
+            bid, ask = t.get("bid") or 0, t.get("ask") or 0
             if not bid or not ask:
                 continue
             shared.setdefault(symbol, {})[ex_id] = {"bid": bid, "ask": ask}
             analyze_spread(symbol, shared)
         except Exception as e:
-            logger.debug(f"{ex_id}:{symbol} ws err {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
 # === REST fallback ===
 async def rest_fallback_loop(exchange_ids, symbols, shared):
@@ -164,16 +160,21 @@ async def rest_fallback_loop(exchange_ids, symbols, shared):
                         continue
                     shared.setdefault(sym, {})[ex.id] = {"bid": bid, "ask": ask}
                     analyze_spread(sym, shared)
-            except Exception as e:
-                logger.debug(f"REST err {ex.id}: {e}")
+            except Exception:
+                pass
         await asyncio.sleep(REST_FALLBACK_INTERVAL)
 
 # === HTTP keepalive (Render fix) ===
 class KeepAliveHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"OK")
+
 def start_http_server():
     port = int(os.getenv("PORT", 10000))
     srv = HTTPServer(("", port), KeepAliveHandler)
@@ -186,22 +187,30 @@ async def main():
 
     exchange_symbols = discover_futures_markets(EXCHANGES_TO_TRY)
     common = find_common_symbols(exchange_symbols)
-    if not common:
-        logger.error("No common symbols found!")
-        return
     exch_symbols = {ex: [s for s in syms if s in common] for ex, syms in exchange_symbols.items()}
     shared = {}
 
-    if ccxtpro:
-        clients = {}
-        for ex in EXCHANGES_TO_TRY:
-            cli = await create_client(ex)
-            if cli:
-                clients[ex] = cli
-        tasks = [ws_watcher(ex, cli, exch_symbols[ex], shared) for ex, cli in clients.items()]
-        await asyncio.gather(*tasks)
-    else:
-        await rest_fallback_loop(EXCHANGES_TO_TRY, common, shared)
+    clients = {}
+    try:
+        if ccxtpro:
+            for ex in EXCHANGES_TO_TRY:
+                cli = await create_client(ex)
+                if cli:
+                    clients[ex] = cli
+            tasks = [ws_watcher(ex, cli, exch_symbols[ex], shared) for ex, cli in clients.items()]
+            await asyncio.gather(*tasks)
+        else:
+            await rest_fallback_loop(EXCHANGES_TO_TRY, common, shared)
+    finally:
+        # акуратне закриття WS
+        for ex, cli in clients.items():
+            try:
+                await cli.close()
+            except Exception:
+                pass
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down gracefully...")
