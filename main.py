@@ -39,7 +39,7 @@ CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "10000"))
 
 # Exchanges to attempt (ids used by ccxt / ccxt.pro)
-EXCHANGE_IDS = ["gate", "mexc", "lbank", "hotcoin", "hotbit"]  # will skip unsupported
+EXCHANGE_IDS = ["bybit", "mexc", "lbank"]
 TOP_N_PER_EXCHANGE = 120      # top N symbols by 24h change on each exchange (absolute change)
 INTERSECTION_MIN_EXCHANGES = 2  # symbol must exist on at least this many exchanges to monitor
 SPREAD_MIN_ABS = 0.0001        # minimal absolute spread (in quote currency) to consider
