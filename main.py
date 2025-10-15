@@ -217,7 +217,7 @@ async def create_pro_client(exchange_id: str):
             if 'defaultType' in ex.options:
                 ex.options['defaultType'] = 'future'
             else:
-                ex.options.update({'defaultType': 'future', 'defaultSubType': 'linear'})
+                ex.options.update({'defaultType': 'swap', 'defaultSubType': 'linear'})
         except Exception:
             pass
         await asyncio.sleep(0)  # ensure coroutine
