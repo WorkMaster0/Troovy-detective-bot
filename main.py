@@ -20,7 +20,7 @@ PORT = int(os.getenv("PORT", "10000"))
 # Біржові пари для моніторингу
 PAIRS = {
     "bybit_mexc": ["bybit", "mexc"],
-    "mexc_lbank": ["mexc", "lbank"],
+    "mexc_lbank": ["mexc", "GMGN"],
 }
 
 SPREAD_MIN_PCT = 2.0
