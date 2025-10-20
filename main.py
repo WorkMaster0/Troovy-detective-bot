@@ -1,289 +1,427 @@
 #!/usr/bin/env python3
+"""
+Futures spread watcher (ccxt.pro) — watch multiple exchanges (futures), pick top-N by 24h change,
+subscribe to tickers via websocket and alert to Telegram when cross-exchange spread appears.
+
+Environment variables:
+  TELEGRAM_TOKEN, CHAT_ID
+  PORT (optional, default 10000)
+  GATE_API_KEY, GATE_API_SECRET, MEXC_API_KEY, MEXC_API_SECRET, LBANK_API_KEY, LBANK_API_SECRET
+Config in code below.
+"""
 import os
 import asyncio
 import time
+import json
 import logging
-from datetime import datetime
-from threading import Thread
-from typing import Dict
-from flask import Flask, request
+import math
+from datetime import datetime, timezone
+from typing import Dict, Set, List, Tuple
 import requests
-import ccxt.pro as ccxtpro
-import ccxt
 
-# ================= CONFIG =================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # e.g. https://your-app.onrender.com/webhook
-CHAT_ID = os.getenv("CHAT_ID")
+try:
+    import ccxt.pro as ccxtpro
+    import ccxt
+except Exception as e:
+    ccxtpro = None
+    ccxt = None
+
+# ---------------- logging ----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger("futures-spread-bot")
+
+# ---------------- CONFIG ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHAT_ID = os.getenv("CHAT_ID", "")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Біржові пари для моніторингу
-PAIRS = {
-    "bybit_mexc": ["bybit", "mexc"],
-    "mexc_gmgn": ["mexc", "gmgn"],   # заміна lbank → gmgn (DEX Screener)
-}
+# Exchanges to attempt (ids used by ccxt / ccxt.pro)
+EXCHANGE_IDS = ["bybit", "mexc", "lbank"]
+TOP_N_PER_EXCHANGE = 120      # top N symbols by 24h change on each exchange (absolute change)
+INTERSECTION_MIN_EXCHANGES = 2  # symbol must exist on at least this many exchanges to monitor
+SPREAD_MIN_ABS = 0.0001        # minimal absolute spread (in quote currency) to consider
+SPREAD_MIN_PCT = 2.0           # minimal relative spread percent (0.1%)
+SPREAD_MAX_PCT = 100.0         # exclude absurd spreads >100%
+ALERT_COOLDOWN = 60           # seconds per symbol pair to avoid duplicates
+PRICE_CHANGE_LOOKBACK = "24h"  # descriptive only
+DEBUG_MODE = False             # set True to increase verbosity / test alerts
+TOP_BY_CHANGE = True           # use price-change filter instead of volume
 
-SPREAD_MIN_PCT = 2.0
-SPREAD_MAX_PCT = 100.0
-ALERT_COOLDOWN = 60
-DEX_REFRESH_INTERVAL = 5  # сек
+# ---------------- global state ----------------
+latest_quote = {}  # { exchange_id: { symbol: {'bid':float,'ask':float,'timestamp':ts, 'info':...} } }
+watched_symbols: Set[str] = set()
+last_alert_ts: Dict[Tuple[str, str, str], float] = {}  # key: (symbol, cheap_ex, expensive_ex) -> ts
 
-# ================= LOGGER =================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("spread-bot")
-
-# ================= FLASK =================
-app = Flask(__name__)
-
-# Глобальні змінні
-active_tasks: Dict[str, asyncio.Future] = {}
-latest_quote = {}
-last_alert_ts = {}
-
-# ================= TELEGRAM =================
+# ---------------- helper: telegram ----------------
 def send_telegram(text: str):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        logger.warning("Telegram token or chat ID not set.")
+        logger.debug("Telegram credentials not set; skipping send.")
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"},
-            timeout=10
-        )
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        resp = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=10)
+        if resp.status_code != 200:
+            logger.warning("Telegram send failed: %s %s", resp.status_code, resp.text)
     except Exception as e:
-        logger.warning("Telegram send failed: %s", e)
+        logger.exception("send_telegram error: %s", e)
 
+def format_alert(symbol: str, buy_ex: str, buy_ask: float, sell_ex: str, sell_bid: float, pct: float, absdiff: float, ts: float):
+    t = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    text = (
+        "🔔 *Futures Spread Alert*\n"
+        f"*Symbol:* `{symbol}`\n"
+        f"*Buy (ask):* `{buy_ask:.8f}` @ *{buy_ex}*\n"
+        f"*Sell (bid):* `{sell_bid:.8f}` @ *{sell_ex}*\n"
+        f"*Spread:* *{pct:.2f}%* (`{absdiff:.8f}`)\n"
+        f"*Time:* {t}"
+    )
+    return text
 
-# ================== BOT COMMANDS ==================
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    if not data or "message" not in data:
-        return "ok", 200
-
-    msg = data["message"]
-    text = msg.get("text", "").strip().lower()
-
-    if text == "/start":
-        send_telegram("🤖 *Spread Bot запущено!*\nВикористай /help для списку команд.")
-    elif text == "/help":
-        send_telegram(
-            "📘 *Команди:*\n"
-            "/status — статус активних моніторів\n"
-            "/list — доступні пари\n"
-            "/bybit_mexc — запуск BYBIT↔MEXC\n"
-            "/mexc_gmgn — запуск MEXC↔DEX (GMGN)\n"
-            "/stop — зупинити всі\n"
-            "/stop_bybit_mexc — зупинити BYBIT↔MEXC\n"
-            "/stop_mexc_gmgn — зупинити MEXC↔GMGN"
-        )
-    elif text == "/status":
-        if not active_tasks:
-            send_telegram("🟡 Немає активних моніторів.")
-        else:
-            send_telegram("🟢 Активні монітори:\n" + "\n".join(f"• {n}" for n in active_tasks))
-    elif text == "/list":
-        send_telegram("📊 *Доступні пари:*\n" + "\n".join(f"/{n}" for n in PAIRS))
-    elif text.startswith("/bybit_mexc"):
-        start_monitor("bybit_mexc")
-    elif text.startswith("/mexc_gmgn"):
-        start_monitor("mexc_gmgn")
-    elif text == "/stop":
-        stop_all()
-    elif text.startswith("/stop_bybit_mexc"):
-        stop_monitor("bybit_mexc")
-    elif text.startswith("/stop_mexc_gmgn"):
-        stop_monitor("mexc_gmgn")
-    else:
-        send_telegram("❓ Невідома команда. Використай /help")
-
-    return "ok", 200
-
-
-# ================== EXCHANGE SETUP ==================
-async def create_client(ex_id):
-    if ex_id == "gmgn":
-        return "dexscreener"  # маркер, що це не ccxt біржа
+# ---------------- utilities for ccxt discovery ----------------
+def safe_attr(obj, key, default=None):
     try:
-        client = getattr(ccxtpro, ex_id)({"enableRateLimit": True})
-        client.options["defaultType"] = "swap"
-        await asyncio.sleep(0)
-        return client
+        return obj.get(key, default)
+    except Exception:
+        return default
+
+async def discover_futures_markets(exchange_ids: List[str]) -> Dict[str, List[str]]:
+    """
+    For each exchange id, use synchronous ccxt (if available) to load markets and return
+    list of futures (contract) symbols settled in USDT (common naming).
+    """
+    if not ccxt:
+        logger.error("ccxt (sync) not available — cannot discover markets")
+        return {}
+
+    markets_by_exchange = {}
+    for ex_id in exchange_ids:
+        try:
+            if not hasattr(ccxt, ex_id):
+                logger.warning("ccxt has no exchange class for id '%s' — skipping", ex_id)
+                continue
+            ex_kwargs = {}
+            # pick API keys from env if provided
+            api_key = os.getenv(f"{ex_id.upper()}_API_KEY")
+            secret = os.getenv(f"{ex_id.upper()}_API_SECRET")
+            if api_key and secret:
+                ex_kwargs['apiKey'] = api_key
+                ex_kwargs['secret'] = secret
+            ex = getattr(ccxt, ex_id)(ex_kwargs)
+            # load markets (sync)
+            ex.load_markets()
+            symbols = []
+            for s, m in ex.markets.items():
+                # contract futures detection: market.get('contract') true and USDT involved
+                is_contract = bool(m.get('contract') or m.get('future') or m.get('type') == 'future')
+                settle = m.get('settle') or m.get('settlement') or m.get('quote')
+                # many exchanges represent futures as 'BTC/USDT:USDT' or market['symbol'] includes 'USDT'
+                if is_contract and ('USDT' in s or (isinstance(settle, str) and 'USDT' in settle.upper())):
+                    symbols.append(s)
+            markets_by_exchange[ex_id] = sorted(list(set(symbols)))
+            logger.info("%s -> %d futures symbols discovered", ex_id, len(symbols))
+        except Exception as e:
+            logger.exception("discover markets failed for %s: %s", ex_id, e)
+    return markets_by_exchange
+
+async def compute_top_by_change(exchange_ids: List[str], markets_by_exchange: Dict[str, List[str]], top_n: int) -> Dict[str, List[str]]:
+    """
+    For each exchange, compute 24h change % via synchronous ccxt.fetch_ticker or via REST
+    and return top_n symbols by absolute change.
+    """
+    if not ccxt:
+        logger.error("ccxt not available — cannot compute 24h change")
+        return markets_by_exchange
+
+    top_by_exchange = {}
+    for ex_id, symbols in markets_by_exchange.items():
+        try:
+            if not hasattr(ccxt, ex_id):
+                logger.warning("ccxt has no exchange class for id '%s' — skipping", ex_id)
+                continue
+            ex_kwargs = {}
+            api_key = os.getenv(f"{ex_id.upper()}_API_KEY")
+            secret = os.getenv(f"{ex_id.upper()}_API_SECRET")
+            if api_key and secret:
+                ex_kwargs['apiKey'] = api_key
+                ex_kwargs['secret'] = secret
+            ex = getattr(ccxt, ex_id)(ex_kwargs)
+            to_score = []
+            # fetch tickers in batches if supported
+            try:
+                tickers = ex.fetch_tickers(symbols)
+            except Exception:
+                # fallback: fetch one by one
+                tickers = {}
+                for s in symbols:
+                    try:
+                        tickers[s] = ex.fetch_ticker(s)
+                    except Exception:
+                        continue
+            for s, t in tickers.items():
+                pct = None
+                try:
+                    pct = safe_attr(t, 'percentage')
+                    if pct is None:
+                        # some exchanges provide 'info' with other fields
+                        info = safe_attr(t, 'info', {})
+                        # try common fields
+                        pct = safe_attr(info, 'priceChangePercent') or safe_attr(info, 'priceChangePercent24h') or safe_attr(info, 'percentChange')
+                        if pct is not None:
+                            pct = float(pct)
+                except Exception:
+                    pct = None
+                if pct is None:
+                    pct = 0.0
+                to_score.append((s, abs(float(pct))))
+            to_score.sort(key=lambda x: x[1], reverse=True)
+            top_symbols = [s for s, _ in to_score[:top_n]]
+            top_by_exchange[ex_id] = top_symbols
+            logger.info("%s -> selected top %d by 24h change", ex_id, len(top_symbols))
+        except Exception as e:
+            logger.exception("compute top change failed for %s: %s", ex_id, e)
+            top_by_exchange[ex_id] = symbols[:top_n]
+    return top_by_exchange
+
+# ---------------- ccxt.pro WS watchers ----------------
+async def create_pro_client(exchange_id: str):
+    """
+    Create ccxt.pro client instance (async). Returns instance or None if not available.
+    """
+    if not ccxtpro:
+        logger.error("ccxt.pro not available in environment; cannot use WS clients")
+        return None
+    if not hasattr(ccxtpro, exchange_id):
+        logger.warning("ccxt.pro has no exchange class for id '%s' - skipping", exchange_id)
+        return None
+    kwargs = {
+        'enableRateLimit': True,
+        # optional keys from env
+    }
+    api_key = os.getenv(f"{exchange_id.upper()}_API_KEY")
+    api_secret = os.getenv(f"{exchange_id.upper()}_API_SECRET")
+    if api_key and api_secret:
+        kwargs['apiKey'] = api_key
+        kwargs['secret'] = api_secret
+    try:
+        ex = getattr(ccxtpro, exchange_id)(kwargs)
+        # set verbose in debug
+        if DEBUG_MODE:
+            ex.verbose = True
+        # some exchanges require specify defaultType = 'future' / 'swap'
+        try:
+            ex.options = ex.options or {}
+            # many providers: set default type to 'future' or 'swap'
+            if 'defaultType' in ex.options:
+                ex.options['defaultType'] = 'future'
+            else:
+                ex.options.update({'defaultType': 'swap', 'defaultSubType': 'linear'})
+        except Exception:
+            pass
+        await asyncio.sleep(0)  # ensure coroutine
+        logger.info("Initialized exchange client: %s", exchange_id)
+        return ex
     except Exception as e:
-        logger.error("Failed to init %s: %s", ex_id, e)
+        logger.exception("Failed to init exchange %s: %s", exchange_id, e)
         return None
 
-
-# ================== WATCH LOGIC ==================
-async def fetch_dex_price(symbol: str):
-    """Отримати ціну токена з DEX Screener API."""
+async def watch_exchange_tickers(exchange, ex_id: str, symbols: List[str]):
+    """
+    Subscribe to order books via watch_order_book for given exchange and symbols.
+    Keeps updating latest_quote[ex_id][symbol].
+    """
+    global latest_quote
+    latest_quote.setdefault(ex_id, {})
+    logger.info("Watcher started for %s (symbols=%d)", ex_id, len(symbols))
     try:
-        url = f"https://api.dexscreener.com/latest/dex/search?q={symbol.replace('/', '')}"
-        r = requests.get(url, timeout=10).json()
-        if "pairs" in r and len(r["pairs"]) > 0:
-            pair = r["pairs"][0]
-            price = float(pair.get("priceUsd", 0))
-            if price > 0:
-                return price
-    except Exception as e:
-        logger.debug("DEX fetch error: %s", e)
-    return None
-
-
-async def watch_pair(ex1, ex2):
-    logger.info(f"👀 Starting monitor {ex1.upper()} ↔ {ex2.upper()}")
-    clients = {}
-    for ex in [ex1, ex2]:
-        clients[ex] = await create_client(ex)
-        latest_quote[ex] = {}
-
-    # Визначення режиму (DEX чи біржа)
-    dex_mode = "gmgn" in [ex1, ex2]
-
-    # Якщо є DEX — беремо спільні USDT-пари між MEXC та DEX-токенами
-    if dex_mode:
-        try:
-            ccx_ex = ex1 if ex1 != "gmgn" else ex2
-            m1 = getattr(ccxt, ccx_ex)().load_markets()
-            symbols = [s for s in m1 if "USDT" in s and ":USDT" in s]
-        except Exception as e:
-            logger.error("Market load error: %s", e)
-            return
-    else:
-        # стандартна логіка
-        try:
-            m1 = getattr(ccxt, ex1)().load_markets()
-            m2 = getattr(ccxt, ex2)().load_markets()
-            common = set(m1).intersection(set(m2))
-            symbols = [s for s in common if "USDT" in s and ":USDT" in s]
-        except Exception as e:
-            logger.error("Market load error: %s", e)
-            return
-
-    async def watch_ccxt(ex):
         while True:
-            for s in symbols[:60]:
+            for s in symbols:
                 try:
-                    ob = await clients[ex].watch_order_book(s)
-                    bid, ask = ob["bids"][0][0], ob["asks"][0][0]
-                    latest_quote[ex][s] = {"bid": bid, "ask": ask, "ts": time.time()}
-                    await check_spread(s, ex1, ex2)
-                except Exception:
-                    await asyncio.sleep(0.1)
-            await asyncio.sleep(0.05)
+                    orderbook = await exchange.watch_order_book(s)
+                    if not orderbook or not orderbook.get('bids') or not orderbook.get('asks'):
+                        continue
+                    bid = float(orderbook['bids'][0][0])
+                    ask = float(orderbook['asks'][0][0])
+                    ts = float(orderbook.get('timestamp') or time.time())
+                    latest_quote[ex_id][s] = {'bid': bid, 'ask': ask, 'timestamp': ts}
+                    if DEBUG_MODE:
+                        logger.debug("%s %s bid=%s ask=%s", ex_id, s, bid, ask)
+                    await check_spread_for_symbol(s, ex_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug("%s watch_order_book error for %s: %s", ex_id, s, e)
+                    await asyncio.sleep(0.05)
+            await asyncio.sleep(0.01)
+    finally:
+        logger.info("Watcher finished for %s", ex_id)
 
-    async def watch_dex():
-        while True:
-            for s in symbols[:30]:
-                price = await fetch_dex_price(s)
-                if not price:
-                    continue
-                latest_quote["gmgn"][s] = {
-                    "bid": price * 0.999,
-                    "ask": price * 1.001,
-                    "ts": time.time(),
-                }
-                await check_spread(s, ex1, ex2)
-                await asyncio.sleep(0.2)
-            await asyncio.sleep(DEX_REFRESH_INTERVAL)
-
-    # Запускаємо
-    if dex_mode:
-        if ex1 == "gmgn":
-            await asyncio.gather(watch_dex(), watch_ccxt(ex2))
+async def check_spread_for_symbol(symbol: str, updated_ex: str):
+    """
+    Compare updated_ex's ask vs other exchanges' bid for same symbol to find arbitrage spread.
+    Send alert if found and passes filters.
+    """
+    # collect available quotes for this symbol across exchanges
+    rows = []
+    for ex, d in latest_quote.items():
+        q = d.get(symbol)
+        if q and q.get('bid') and q.get('ask'):
+            rows.append((ex, q['bid'], q['ask'], q['timestamp']))
+    if len(rows) < 2:
+        return
+    # sort by ask ascending to find cheapest ask and by bid descending to find most expensive bid
+    rows_by_ask = sorted(rows, key=lambda x: x[2])   # (ex, bid, ask, ts)
+    rows_by_bid = sorted(rows, key=lambda x: x[1], reverse=True)
+    # evaluate best buy (cheapest ask) vs best sell (highest bid)
+    buy_ex, buy_bid_dummy, buy_ask, buy_ts = rows_by_ask[0]
+    sell_ex, sell_bid, sell_ask_dummy, sell_ts = rows_by_bid[0]
+    # ensure not same exchange
+    if buy_ex == sell_ex:
+        # possibly check second best
+        if len(rows_by_bid) > 1 and rows_by_bid[1][0] != buy_ex:
+            sell_ex, sell_bid, _, sell_ts = rows_by_bid[1]
         else:
-            await asyncio.gather(watch_ccxt(ex1), watch_dex())
-    else:
-        await asyncio.gather(watch_ccxt(ex1), watch_ccxt(ex2))
-
-
-async def check_spread(symbol, ex1, ex2):
-    if symbol not in latest_quote.get(ex1, {}) or symbol not in latest_quote.get(ex2, {}):
-        return
-
-    q1, q2 = latest_quote[ex1][symbol], latest_quote[ex2][symbol]
-    for (buy_ex, buy_ask), (sell_ex, sell_bid) in [
-        ((ex1, q1["ask"]), (ex2, q2["bid"])),
-        ((ex2, q2["ask"]), (ex1, q1["bid"])),
-    ]:
-        diff = sell_bid - buy_ask
-        if diff <= 0:
-            continue
-        pct = (diff / buy_ask) * 100
-        if pct < SPREAD_MIN_PCT or pct > SPREAD_MAX_PCT:
-            continue
-
-        key = (symbol, buy_ex, sell_ex)
-        now = time.time()
-        if now - last_alert_ts.get(key, 0) < ALERT_COOLDOWN:
             return
-        last_alert_ts[key] = now
+    # compute spread percent relative to buy_ask
+    if buy_ask == 0:
+        return
+    absdiff = sell_bid - buy_ask
+    pct = (absdiff / buy_ask) * 100.0
+    # require positive arbitrage
+    if absdiff <= 0:
+        return
+    # filters
+    if pct < SPREAD_MIN_PCT:
+        return
+    if pct > SPREAD_MAX_PCT:
+        # skip absurd spreads
+        if DEBUG_MODE:
+            logger.debug("Skipping huge spread %s%% for %s (%s vs %s)", pct, symbol, buy_ex, sell_ex)
+        return
+    # low absolute threshold
+    if absdiff < SPREAD_MIN_ABS:
+        return
+    # cooldown deduplication
+    key = (symbol, buy_ex, sell_ex)
+    now = time.time()
+    last = last_alert_ts.get(key, 0)
+    if now - last < ALERT_COOLDOWN:
+        return
+    last_alert_ts[key] = now
+    # format & send
+    msg = format_alert(symbol, buy_ex, buy_ask, sell_ex, sell_bid, pct, absdiff, now)
+    logger.info("ALERT %s: buy %s @%s sell %s @%s pct=%.2f", symbol, buy_ex, buy_ask, sell_ex, sell_bid, pct)
+    send_telegram(msg)
 
-        msg = (
-            f"🔔 *Spread Alert*\n"
-            f"Symbol: `{symbol}`\n"
-            f"Buy: `{buy_ask:.6f}` @ *{buy_ex}*\n"
-            f"Sell: `{sell_bid:.6f}` @ *{sell_ex}*\n"
-            f"Spread: *{pct:.2f}%* (`{diff:.6f}`)\n"
-            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
-        )
-        logger.info(f"ALERT: {symbol} {pct:.2f}% ({buy_ex}->{sell_ex})")
-        send_telegram(msg)
-
-
-# ================== CONTROL FUNCTIONS ==================
-def start_monitor(pair_name):
-    if pair_name in active_tasks:
-        send_telegram(f"⚙️ Монітор {pair_name} вже активний.")
+# ---------------- orchestration ----------------
+async def run_ws_monitor():
+    if ccxtpro is None or ccxt is None:
+        logger.error("ccxt/ccxt.pro not installed. Exiting.")
         return
 
-    ex1, ex2 = PAIRS[pair_name]
-    task = asyncio.run_coroutine_threadsafe(watch_pair(ex1, ex2), loop)
-    active_tasks[pair_name] = task
-    send_telegram(f"✅ Запущено монітор *{pair_name.upper()}*")
-
-
-def stop_monitor(pair_name):
-    if pair_name not in active_tasks:
-        send_telegram(f"⚙️ Монітор {pair_name} не активний.")
+    # 1) discover futures markets via sync ccxt
+    markets_by_exchange = await discover_futures_markets(EXCHANGE_IDS)
+    if not markets_by_exchange:
+        logger.error("No markets discovered — exiting")
         return
-    active_tasks[pair_name].cancel()
-    active_tasks.pop(pair_name, None)
-    send_telegram(f"🛑 Зупинено монітор {pair_name.upper()}")
 
+    # 2) compute top by 24h change (if enabled)
+    if TOP_BY_CHANGE:
+        top_by_exchange = await compute_top_by_change(list(markets_by_exchange.keys()), markets_by_exchange, TOP_N_PER_EXCHANGE)
+    else:
+        top_by_exchange = {k: v[:TOP_N_PER_EXCHANGE] for k, v in markets_by_exchange.items()}
 
-def stop_all():
-    for n, t in list(active_tasks.items()):
-        t.cancel()
-        active_tasks.pop(n, None)
-    send_telegram("🛑 Усі монітори зупинено.")
+    # 3) build candidate pool (symbols that appear on at least INTERSECTION_MIN_EXCHANGES)
+    symbol_occurrences = {}
+    for ex, syms in top_by_exchange.items():
+        for s in syms:
+            symbol_occurrences.setdefault(s, set()).add(ex)
+    # pick symbols present on enough exchanges
+    candidates = [s for s, exs in symbol_occurrences.items() if len(exs) >= INTERSECTION_MIN_EXCHANGES]
+    logger.info("Found %d candidate symbols present on >=%d exchanges", len(candidates), INTERSECTION_MIN_EXCHANGES)
+    if not candidates:
+        logger.error("No candidate symbols to watch — exiting")
+        return
 
+    # 4) For each exchange, prepare the list of symbols (intersection with candidates)
+    watch_list = {}
+    for ex_id, syms in top_by_exchange.items():
+        watch_symbols = [s for s in syms if s in candidates]
+        if watch_symbols:
+            watch_list[ex_id] = watch_symbols
+            logger.info("%s -> subscribing to %d common symbols", ex_id, len(watch_symbols))
+        else:
+            logger.info("%s -> no common symbols to subscribe", ex_id)
 
-# ================== SERVER ==================
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT)
-
-
-# ================== ENTRY POINT ==================
-if __name__ == "__main__":
-    logger.info("🚀 Starting Spread Bot (DEX + Futures)")
-
-    if TELEGRAM_TOKEN and WEBHOOK_URL:
-        try:
-            requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}/webhook"
-            )
-            logger.info("Webhook set successfully.")
-        except Exception as e:
-            logger.error(f"Webhook setup failed: {e}")
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    Thread(target=run_flask, daemon=True).start()
-
+    # 5) create ccxt.pro clients for exchanges and start watchers
+    clients = {}
+    tasks = []
     try:
-        loop.run_forever()
+        for ex_id, symbols in watch_list.items():
+            client = await create_pro_client(ex_id)
+            if client is None:
+                continue
+            clients[ex_id] = client
+            t = asyncio.create_task(watch_exchange_tickers(client, ex_id, symbols))
+            tasks.append(t)
+        if not tasks:
+            logger.error("No websocket watcher tasks started — exiting")
+            return
+        # wait until cancelled (run forever)
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        logger.info("WS monitor cancelled, closing clients")
+    except Exception as e:
+        logger.exception("run_ws_monitor error: %s", e)
+    finally:
+        # close all clients cleanly
+        for ex_id, client in clients.items():
+            try:
+                await client.close()
+            except Exception as e:
+                logger.exception("Error closing client %s: %s", ex_id, e)
+
+# ---------------- HTTP keepalive (simple) ----------------
+from http.server import BaseHTTPRequestHandler, HTTPServer
+def start_keepalive_server(port: int = PORT):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"futures-spread-bot ok")
+        def log_message(self, fmt, *args):
+            # minimal logging
+            logger.debug(fmt % args)
+    server = HTTPServer(("", port), Handler)
+    logger.info("Keepalive HTTP server running on port %d", port)
+    server.serve_forever()
+
+# ---------------- main entry ----------------
+def main():
+    # run keepalive server in thread for platforms like Render
+    import threading
+    t = threading.Thread(target=start_keepalive_server, daemon=True)
+    t.start()
+
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(run_ws_monitor())
     except KeyboardInterrupt:
-        logger.info("Stopped.")
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.exception("Main loop error: %s", e)
+    finally:
+        # ensure loop closed
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
+        logger.info("Stopped")
+
+if __name__ == "__main__":
+    logger.info("Starting futures-spread-bot (ccxt.pro event-based). Symbols: top-by-change mode=%s", TOP_BY_CHANGE)
+    main()
