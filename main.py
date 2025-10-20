@@ -155,9 +155,9 @@ def start_monitor(pair_name):
     if pair_name in active_tasks:
         send_telegram(f"⚙️ Already running {pair_name}")
         return
-    loop = asyncio.get_event_loop()
     ex1, ex2 = PAIRS[pair_name]
-    task = loop.create_task(watch_pair(ex1, ex2))
+    global loop
+    task = asyncio.run_coroutine_threadsafe(watch_pair(ex1, ex2), loop)
     active_tasks[pair_name] = task
     send_telegram(f"✅ Started monitoring {pair_name.upper()} (futures spread)")
 
@@ -173,11 +173,17 @@ def run_flask():
 
 if __name__ == "__main__":
     logger.info("Starting Telegram futures spread bot with webhook...")
-    # register webhook
+
     if TELEGRAM_TOKEN and WEBHOOK_URL:
-        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}/webhook")
-    # run flask in thread
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}/webhook"
+        )
+
+    # Flask у потоці
     Thread(target=run_flask, daemon=True).start()
-    # start asyncio loop
-    loop = asyncio.get_event_loop()
-    loop.run_forever()
+
+    # головний asyncio event loop
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        logger.info("Stopped.")
