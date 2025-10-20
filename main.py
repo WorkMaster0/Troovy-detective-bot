@@ -175,14 +175,22 @@ if __name__ == "__main__":
     logger.info("Starting Telegram futures spread bot with webhook...")
 
     if TELEGRAM_TOKEN and WEBHOOK_URL:
-        requests.get(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}/webhook"
-        )
+        try:
+            requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setWebhook?url={WEBHOOK_URL}/webhook"
+            )
+            logger.info("Webhook set successfully.")
+        except Exception as e:
+            logger.error(f"Webhook setup failed: {e}")
 
-    # Flask у потоці
+    # ✅ створюємо ГОЛОВНИЙ asyncio event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # ✅ запускаємо Flask у окремому потоці
     Thread(target=run_flask, daemon=True).start()
 
-    # головний asyncio event loop
+    # ✅ запускаємо головний loop
     try:
         loop.run_forever()
     except KeyboardInterrupt:
