@@ -219,14 +219,17 @@ class CEXWatcher:
         self.running = False
 
     async def start(self):
-        import ccxt
-        self.client = getattr(ccxt, self.exchange_id)({
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"}
-        })
+        if self.running:
+            return
+        try:
+            # Використовуємо синхронний ccxt для REST
+            self.client = getattr(ccxt, self.exchange_id)({"enableRateLimit": True})
+        except Exception as e:
+            logger.exception("Failed to init %s: %s", self.exchange_id, e)
+            self.client = None
+            return
         self.running = True
         self.task = asyncio.create_task(self._run())
-        logger.info("%s watcher started (REST mode)", self.exchange_id)
 
     async def stop(self):
         self.running = False
@@ -236,38 +239,37 @@ class CEXWatcher:
                 await self.task
             except Exception:
                 pass
-        self.client = None
         self.task = None
+        self.client = None
 
-    # в CEXWatcher._run замінимо цикл на пакетну версію
-async def _run(self):
-    while self.running:
-        syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
-        if not syms:
-            await asyncio.sleep(1.0)
-            continue
+    async def _run(self):
+        """Періодичне опитування цін через REST"""
+        logger.info("%s watcher started (REST mode)", self.exchange_id)
+        while self.running:
+            syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
+            if not syms or not self.client:
+                await asyncio.sleep(1.0)
+                continue
+            try:
+                all_tickers = self.client.fetch_tickers()
+            except Exception as e:
+                logger.warning("CEX fetch_tickers failed: %s", e)
+                await asyncio.sleep(2.0)
+                continue
 
-        try:
-            all_tickers = self.client.fetch_tickers()
-        except Exception as e:
-            logger.warning("CEX fetch_tickers failed: %s", e)
+            for s in syms:
+                found = False
+                s_upper = s.upper()
+                for pair, ticker in all_tickers.items():
+                    if s_upper in pair:
+                        last = ticker.get("last") or ticker.get("close") or ticker.get("price")
+                        if last is not None:
+                            cex_prices[s] = float(last)
+                            found = True
+                            break
+                if not found:
+                    logger.debug("No CEX price found for %s", s)
             await asyncio.sleep(2.0)
-            continue
-
-        for s in syms:
-            found = False
-            s_upper = s.upper()
-            for pair, ticker in all_tickers.items():
-                if s_upper in pair:
-                    last = ticker.get("last") or ticker.get("close") or ticker.get("price")
-                    if last:
-                        cex_prices[s] = float(last)
-                        found = True
-                        break
-            if not found:
-                logger.debug("No CEX price found for %s", s)
-
-        await asyncio.sleep(2.0)
 
 # ---------------- DEX poller ----------------
 class DexPoller:
