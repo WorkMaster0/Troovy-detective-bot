@@ -210,9 +210,9 @@ def generate_candidates(symbol: str) -> List[str]:
     s = symbol.upper()
     return [f"{s}/USDT", f"{s}USDT", f"{s}/USD", f"{s}/USDT:USDT", f"{s}/PERP"]  # common variants
 
-# ---------------- CEX watcher (ccxt.pro) ----------------
+# ---------------- CEX (MEXC) watcher using ccxt.pro ----------------
 class CEXWatcher:
-    def __init__(self, exchange_id: str = CEX_PRIMARY):
+    def __init__(self, exchange_id="mexc"):
         self.exchange_id = exchange_id
         self.client = None
         self.task = None
@@ -224,25 +224,24 @@ class CEXWatcher:
             return
         if self.running:
             return
+
         kwargs = {"enableRateLimit": True}
-        api_k = os.getenv(f"{self.exchange_id.upper()}_API_KEY")
-        api_s = os.getenv(f"{self.exchange_id.upper()}_API_SECRET")
-        if api_k and api_s:
-            kwargs["apiKey"] = api_k
-            kwargs["secret"] = api_s
+        # optional API keys
+        api_key = os.getenv(f"{self.exchange_id.upper()}_API_KEY")
+        api_secret = os.getenv(f"{self.exchange_id.upper()}_API_SECRET")
+        if api_key and api_secret:
+            kwargs["apiKey"] = api_key
+            kwargs["secret"] = api_secret
+
         try:
             self.client = getattr(ccxtpro, self.exchange_id)(kwargs)
-            # prefer futures
-            try:
-                if isinstance(self.client.options, dict):
-                    if "defaultType" in self.client.options:
-                        self.client.options["defaultType"] = "future"
-            except Exception:
-                pass
+            # explicit futures
+            self.client.options["defaultType"] = "future"
         except Exception as e:
-            logger.exception("Failed to init cex client %s: %s", self.exchange_id, e)
+            logger.exception("Failed to init %s: %s", self.exchange_id, e)
             self.client = None
             return
+
         self.running = True
         self.task = asyncio.create_task(self._run())
 
@@ -264,36 +263,36 @@ class CEXWatcher:
 
     async def _run(self):
         logger.info("%s watcher started", self.exchange_id)
+        semaphore = asyncio.Semaphore(12)  # limit concurrent subscriptions
+
         while self.running:
-            syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
-            if not syms:
+            symbols = list(state.get("symbols", []))[:MAX_SYMBOLS]
+            if not symbols:
                 await asyncio.sleep(1.0)
                 continue
-            semaphore = asyncio.Semaphore(12)
+
             tasks = []
-            async def watch_one(sym: str):
-                candidates = generate_candidates(sym)
-                for pair in candidates:
-                    try:
-                        async with semaphore:
-                            ticker = await self.client.watch_ticker(pair)
-                        last = ticker.get("last") or ticker.get("close") or ticker.get("price")
-                        if last is not None:
-                            cex_prices[sym] = float(last)
-                            last_update[sym] = time.time()
-                            return
-                    except Exception:
-                        # try next mapping quietly
-                        await asyncio.sleep(0.0)
-                        continue
-            for s in syms:
-                tasks.append(asyncio.create_task(watch_one(s)))
-            # wait a short time so tasks can populate results
+            for sym in symbols:
+                tasks.append(asyncio.create_task(self.watch_symbol(sym, semaphore)))
+
             try:
                 await asyncio.wait(tasks, timeout=2.0)
-            except Exception:
-                pass
-            await asyncio.sleep(0.4)
+            except Exception as e:
+                logger.debug("CEXWatcher gather error: %s", e)
+
+            await asyncio.sleep(0.5)
+
+    async def watch_symbol(self, sym: str, semaphore: asyncio.Semaphore):
+        pair = f"{sym}/USDT"  # only one supported format
+        try:
+            async with semaphore:
+                ticker = await self.client.watch_ticker(pair)
+            last_price = ticker.get("last") or ticker.get("close") or ticker.get("price")
+            if last_price is not None:
+                cex_prices[sym] = float(last_price)
+                logger.debug("MEXC %s -> %.8f", pair, last_price)
+        except Exception as e:
+            logger.debug("Failed to fetch %s: %s", pair, e)
 
 # ---------------- DEX poller ----------------
 class DexPoller:
