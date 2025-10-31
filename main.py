@@ -239,31 +239,35 @@ class CEXWatcher:
         self.client = None
         self.task = None
 
-    async def _run(self):
-        while self.running:
-            syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
-            if not syms:
-                await asyncio.sleep(1.0)
-                continue
+    # в CEXWatcher._run замінимо цикл на пакетну версію
+async def _run(self):
+    while self.running:
+        syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
+        if not syms:
+            await asyncio.sleep(1.0)
+            continue
 
-            for s in syms:
-                pair_candidates = generate_candidate_pairs(s)
-                found = False
-                for pair in pair_candidates:
-                    try:
-                        ticker = self.client.fetch_ticker(pair)
-                        last = ticker.get("last") or ticker.get("close") or ticker.get("price")
-                        if last:
-                            cex_prices[s] = float(last)
-                            found = True
-                            break
-                    except Exception:
-                        continue
-                if not found:
-                    logger.debug("No CEX price for %s", s)
-                await asyncio.sleep(0.3)  # avoid rate limit
-
+        try:
+            all_tickers = self.client.fetch_tickers()
+        except Exception as e:
+            logger.warning("CEX fetch_tickers failed: %s", e)
             await asyncio.sleep(2.0)
+            continue
+
+        for s in syms:
+            found = False
+            s_upper = s.upper()
+            for pair, ticker in all_tickers.items():
+                if s_upper in pair:
+                    last = ticker.get("last") or ticker.get("close") or ticker.get("price")
+                    if last:
+                        cex_prices[s] = float(last)
+                        found = True
+                        break
+            if not found:
+                logger.debug("No CEX price found for %s", s)
+
+        await asyncio.sleep(2.0)
 
 # ---------------- DEX poller ----------------
 class DexPoller:
