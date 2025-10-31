@@ -4,7 +4,8 @@ aiofiles==24.1.0
 aiodns==3.5.0
 asyncio==4.0.0
 cachetools==6.2.1
-ccxtpro==4.2.91
+ccxt==4.3.87
+websockets==15.0.1
 charset-normalizer==3.3.2
 cryptography==46.0.3
 eventlet==0.40.3
