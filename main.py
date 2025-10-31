@@ -573,7 +573,7 @@ def on_clear_symbols():
 class Orchestrator:
     def __init__(self):
         self.loop = None
-        self.thclass Orchestrator:
+        class Orchestrator:
     def __init__(self):
         self.loop = None
         self.thread = None
