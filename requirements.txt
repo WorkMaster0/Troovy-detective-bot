@@ -1,5 +1,5 @@
-aiogram==3.22.0
-aiohttp==3.10.10
+aiogram
+aiohttp
 aiofiles==24.1.0
 aiodns==3.5.0
 asyncio==4.0.0
@@ -12,13 +12,13 @@ eventlet==0.40.3
 Flask==3.0.3
 gunicorn==23.0.0
 joblib==1.5.2
-lightgbm==4.6.0
+lightgbm
 mplfinance==0.12.10b0
-numba==0.61.2
+numba
 numpy
 orjson==3.11.4
-pandas==2.2.3
-pandas-ta==0.4.71b0
+pandas
+pandas-ta
 psutil==7.1.2
 pydantic==2.11.10
 pytelegrambotapi==4.29.1
