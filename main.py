@@ -661,155 +661,38 @@ class Orchestrator:
         Poll CEX tickers (MEXC + BIN), poll DEX prices for top candidates,
         build top-N list by 1h change, broadcast to UI and optionally Telegram.
         """
-        # 1) Fetch mexc tickers
-        if self.mexc_client:
-            tickers = await asyncio.get_event_loop().run_in_executor(None, fetch_cex_tickers_sync, self.mexc_client)
-            # map mexc tickers into mexc_prices by base token
-            for pair, t in tickers.items():
-                # attempt to extract base token
-                try:
-                    base = t.get("symbol") or pair
-                    # some tickers have format 'ABC/USDT' or 'ABC/USDT:USDT'; base can be parsed
-                    base_token = None
-                    if "/" in pair:
-                        base_token = pair.split("/")[0]
-                    else:
-                        # fallback: remove USDT suffix
-                        if pair.upper().endswith("USDT"):
-                            base_token = pair[:-4]
-                        else:
-                            base_token = pair
-                    base_token = base_token.upper()
-                    last = t.get("last") or t.get("close") or t.get("price")
-                    if is_valid_price(float(last)):
-                        mexc_prices[base_token] = float(last)
-                        push_price_history(base_token, float(last))
-                        # update last_update
-                        # last_update keeps when we last saw dex/cex price for UI (use mexc time)
-                        last_update[base_token] = now_ts()
-                except Exception:
-                    continue
+       # --- Безпечний розрахунок реального спреду між DEX / MEXC / BINANCE ---
+for sym in common_symbols:
 
-        # 2) Fetch binance tickers
-        if self.binance_client:
-            tickers = await asyncio.get_event_loop().run_in_executor(None, fetch_cex_tickers_sync, self.binance_client)
-            for pair, t in tickers.items():
-                try:
-                    if "/" in pair:
-                        base_token = pair.split("/")[0].upper()
-                    else:
-                        if pair.upper().endswith("USDT"):
-                            base_token = pair[:-4].upper()
-                        else:
-                            base_token = pair.upper()
-                    last = t.get("last") or t.get("close") or t.get("price")
-                    if is_valid_price(float(last)):
-                        binance_prices[base_token] = float(last)
-                except Exception:
-                    continue
+    dex_price = dex_prices.get(sym)
+    mexc_price = mexc_prices.get(f"{sym}/USDT") or mexc_prices.get(f"{sym}/USDC")
+    bin_price = bin_prices.get(f"{sym}/USDT") or bin_prices.get(f"{sym}/USDC")
 
-        # 3) Build candidate list to check on DEX:
-        # Use discovered mexc_symbols (auto) + manually added state symbols (priority)
-        candidate_tokens = []
-        # prioritize mexc discovered tokens
-        candidate_tokens.extend(mexc_symbols)
-        # append any manually added tokens not already included
-        for s in state.get("symbols", []):
-            if s.upper() not in candidate_tokens:
-                candidate_tokens.append(s.upper())
+    # Пропускаємо токени без цін або з нульовими значеннями
+    if not mexc_price or mexc_price <= 0:
+        continue
 
-        # cap candidates to a reasonable number to avoid heavy DEX load
-        MAX_CAND = 600
-        if len(candidate_tokens) > MAX_CAND:
-            candidate_tokens = candidate_tokens[:MAX_CAND]
+    # Визначаємо джерело з найвищою та найнижчою ціною для точного спреду
+    valid_prices = [p for p in [dex_price, bin_price, mexc_price] if p and p > 0]
+    if len(valid_prices) < 2:
+        continue
 
-        # 4) Fetch DEX prices in threadpool
-        loop = asyncio.get_event_loop()
-        coros = [loop.run_in_executor(None, fetch_price_from_dex, t) for t in candidate_tokens]
-        try:
-            results = await asyncio.gather(*coros, return_exceptions=True)
-        except Exception as e:
-            logger.debug("dex gather error: %s", e)
-            results = [None] * len(candidate_tokens)
+    high = max(valid_prices)
+    low = min(valid_prices)
+    spread_percent = (high - low) / low * 100
 
-        # update dex_prices map
-        for tok, res in zip(candidate_tokens, results):
-            try:
-                if isinstance(res, Exception) or res is None:
-                    # keep previous if available; do not delete
-                    continue
-                if is_valid_price(float(res)):
-                    dex_prices[tok] = float(res)
-                    last_update[tok] = now_ts()
-            except Exception:
-                continue
+    # Фільтрація дрібних коливань (< 3%)
+    if spread_percent < 3:
+        continue
 
-        # 5) Compute 1h change for each token using mexc history
-        rows = []
-        for tok in candidate_tokens:
-            mex_price = mexc_prices.get(tok)
-            dex_price = dex_prices.get(tok)
-            bin_price = binance_prices.get(tok)
-            # compute 1h change (using mexc price history)
-            old = get_price_1h_ago(tok)
-            oneh_pct = pct_change(old, mex_price) if old and mex_price else 0.0
-            # compute spread dex <-> mexc if both valid
-            spread = None
-            if is_valid_price(mex_price) and is_valid_price(dex_price):
-                spread = pct_change(dex_price, mex_price)
-                # filter unrealistic spreads
-                if abs(spread) > MAX_ABS_SPREAD_PCT:
-                    spread = None
-            # include only if there is at least one valid price among mexc/dex (we'll filter later)
-            rows.append({
-                "symbol": tok,
-                "1h_change": oneh_pct,
-                "dex": dex_price,
-                "mexc": mex_price,
-                "bin": bin_price,
-                "spread_pct": spread,
-                "last": last_update.get(tok)
-            })
-
-        # 6) Choose top-N by absolute 1h change
-        rows_valid = [r for r in rows if (r.get("mexc") or r.get("dex"))]
-        rows_sorted = sorted(rows_valid, key=lambda r: abs(r.get("1h_change", 0.0)), reverse=True)
-        top_rows = rows_sorted[:TOP_N]
-
-        # 7) Additional filtering: remove rows without both mexc & dex prices if you want strict
-        filtered = []
-        for r in top_rows:
-            # require mexc price present; dex optional but preferable
-            if not is_valid_price(r.get("mexc") or 0.0):
-                continue
-            # if dex missing, we still show but mark spread empty
-            filtered.append(r)
-
-        # 8) For each filtered row, check alerts and enforce alert cooldown rules
-        for r in filtered:
-            check_and_alert(r["symbol"], r.get("dex"), r.get("mexc"), r.get("bin"))
-
-        # 9) Broadcast to SocketIO (web UI)
-        try:
-            socketio.emit("live.update", {"rows": filtered})
-        except Exception:
-            pass
-
-        # 10) Optionally edit Telegram live message
-        if state.get("live_to_telegram") and state.get("chat_id"):
-            try:
-                txt = build_live_text(filtered)
-                if not state.get("msg_id"):
-                    res = tg_send(txt)
-                    if res and isinstance(res, dict):
-                        mid = res.get("result", {}).get("message_id")
-                        if mid:
-                            state["msg_id"] = int(mid)
-                            save_state()
-                else:
-                    tg_edit(state["msg_id"], txt)
-            except Exception as e:
-                logger.debug("tg live edit err: %s", e)
+    # Формуємо запис у таблиці
+    rows.append({
+        "symbol": sym,
+        "dex": f"{dex_price:.8f}" if dex_price else "—",
+        "mexc": f"{mexc_price:.8f}" if mexc_price else "—",
+        "bin": f"{bin_price:.8f}" if bin_price else "—",
+        "spread": f"{spread_percent:+.2f}%"
+    })
 
 # ---------------- BOOT ----------------
 orchestrator = Orchestrator()
