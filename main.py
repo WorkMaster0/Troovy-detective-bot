@@ -662,7 +662,66 @@ class Orchestrator:
         build top-N list by 1h change, broadcast to UI and optionally Telegram.
         """
                # --- Fetch current prices ---
-        rows = []
+        # --- Фʼючерсний монітор: DEX (spot) ↔ MEXC Futures ↔ Binance Futures ---
+rows = []
+
+# Отримуємо ціни з усіх джерел
+dex_prices = await self._get_dex_prices()
+mexc_fut = await self._get_mexc_futures_prices()
+bin_fut = await self._get_binance_futures_prices()
+
+# Перетворюємо у зручний вигляд
+common_symbols = set(dex_prices.keys()) & set(mexc_fut.keys()) & set(bin_fut.keys())
+
+for sym in common_symbols:
+    dex_price = dex_prices.get(sym)
+    mex_price = mexc_fut.get(sym)
+    bin_price = bin_fut.get(sym)
+
+    # Пропускаємо некоректні або нульові значення
+    valid = [p for p in [dex_price, mex_price, bin_price] if p and p > 0]
+    if len(valid) < 2:
+        continue
+
+    # Обчислюємо спред
+    high = max(valid)
+    low = min(valid)
+    spread = (high - low) / low * 100
+
+    # Ігноруємо незначні коливання
+    if spread < 3:
+        continue
+
+    # Додаємо у таблицю
+    rows.append({
+        "symbol": sym,
+        "dex": f"{dex_price:.6f}" if dex_price else "—",
+        "mexc": f"{mex_price:.6f}" if mex_price else "—",
+        "bin": f"{bin_price:.6f}" if bin_price else "—",
+        "spread": f"{spread:+.2f}%"
+    })
+
+# --- Формуємо текст для Telegram ---
+if not rows:
+    text = (
+        "📡 *Live MEXC Futures ↔ Binance Futures ↔ DEX Monitor*\n"
+        f"_Updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}_\n\n"
+        "Немає активних спредів > 3%.\n\n"
+        "/status  /live on|off  /alert X"
+    )
+else:
+    header = "SYMBOL     DEX(USD)     MEXC(FUT)     BIN(FUT)     Δ%\n" + "-" * 60
+    lines = [header]
+    for r in rows[:15]:
+        lines.append(f"{r['symbol']:<8} {r['dex']:<12} {r['mexc']:<12} {r['bin']:<12} {r['spread']}")
+    text = (
+        "📡 *Live MEXC Futures ↔ Binance Futures ↔ DEX Monitor*\n"
+        f"_Updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}_\n\n"
+        + "\n".join(lines)
+        + "\n\n/status  /live on|off  /alert X"
+    )
+
+await self._send_or_edit_live_message(text)
 
         # 1️⃣ Отримуємо ціни з бірж (ccxt)
         mexc_tickers = {}
