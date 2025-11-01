@@ -62,6 +62,7 @@ binance_symbols: List[str] = []
 dex_prices: Dict[str, float] = {}    # latest DEX price per SYMBOL (symbol key normalized)
 mexc_prices: Dict[str, float] = {}   # latest MEXC price
 binance_prices: Dict[str, float] = {}# latest Binance price
+last_update: Dict[str, float] = {}  # symbol -> timestamp of last update
 
 # price history for computing 1h change (we use MEXC prices as canonical for 1h change)
 price_history: Dict[str, List[Tuple[float, float]]] = {}  # symbol -> list of (ts, price)
