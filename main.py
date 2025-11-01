@@ -630,4 +630,7 @@ if __name__ == "__main__":
 
     orchestrator.start()
     # run flask socketio app (threading mode)
-    socketio.run(app, host="0.0.0.0", port=PORT)
+    socketio.run(app,
+                 host="0.0.0.0",
+                 port=PORT,
+                 allow_unsafe_werkzeug=True)
