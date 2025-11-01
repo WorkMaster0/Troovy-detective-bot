@@ -661,38 +661,94 @@ class Orchestrator:
         Poll CEX tickers (MEXC + BIN), poll DEX prices for top candidates,
         build top-N list by 1h change, broadcast to UI and optionally Telegram.
         """
-       # --- Безпечний розрахунок реального спреду між DEX / MEXC / BINANCE ---
-for sym in common_symbols:
+               # --- Fetch current prices ---
+        rows = []
 
-    dex_price = dex_prices.get(sym)
-    mexc_price = mexc_prices.get(f"{sym}/USDT") or mexc_prices.get(f"{sym}/USDC")
-    bin_price = bin_prices.get(f"{sym}/USDT") or bin_prices.get(f"{sym}/USDC")
+        # 1️⃣ Отримуємо ціни з бірж (ccxt)
+        mexc_tickers = {}
+        bin_tickers = {}
+        if self.mexc_client:
+            mexc_tickers = await asyncio.get_event_loop().run_in_executor(None, fetch_cex_tickers_sync, self.mexc_client)
+        if self.binance_client:
+            bin_tickers = await asyncio.get_event_loop().run_in_executor(None, fetch_cex_tickers_sync, self.binance_client)
 
-    # Пропускаємо токени без цін або з нульовими значеннями
-    if not mexc_price or mexc_price <= 0:
-        continue
+        # 2️⃣ Зберігаємо ціни
+        for k, v in mexc_tickers.items():
+            price = v.get("last") or v.get("close") or 0
+            if is_valid_price(price):
+                base = v.get("symbol").split("/")[0] if "/" in v.get("symbol") else v.get("symbol").replace("USDT", "")
+                mexc_prices[base.upper()] = price
+                push_price_history(base.upper(), price)
 
-    # Визначаємо джерело з найвищою та найнижчою ціною для точного спреду
-    valid_prices = [p for p in [dex_price, bin_price, mexc_price] if p and p > 0]
-    if len(valid_prices) < 2:
-        continue
+        for k, v in bin_tickers.items():
+            price = v.get("last") or v.get("close") or 0
+            if is_valid_price(price):
+                base = v.get("symbol").split("/")[0] if "/" in v.get("symbol") else v.get("symbol").replace("USDT", "")
+                binance_prices[base.upper()] = price
 
-    high = max(valid_prices)
-    low = min(valid_prices)
-    spread_percent = (high - low) / low * 100
+        # 3️⃣ Формуємо список токенів (автоматично з MEXC)
+        symbols_to_check = set(mexc_prices.keys())
 
-    # Фільтрація дрібних коливань (< 3%)
-    if spread_percent < 3:
-        continue
+        # 4️⃣ Отримуємо ціни з DEX для цих токенів
+        for sym in list(symbols_to_check)[:100]:  # обмежимо для швидкодії
+            dex_p = await asyncio.get_event_loop().run_in_executor(None, fetch_price_from_dex, sym)
+            if dex_p and is_valid_price(dex_p):
+                dex_prices[sym] = dex_p
+                last_update[sym] = now_ts()
 
-    # Формуємо запис у таблиці
-    rows.append({
-        "symbol": sym,
-        "dex": f"{dex_price:.8f}" if dex_price else "—",
-        "mexc": f"{mexc_price:.8f}" if mexc_price else "—",
-        "bin": f"{bin_price:.8f}" if bin_price else "—",
-        "spread": f"{spread_percent:+.2f}%"
-    })
+        # 5️⃣ Розрахунок спредів
+        for sym in symbols_to_check:
+            dex_price = dex_prices.get(sym)
+            mexc_price = mexc_prices.get(sym)
+            bin_price = binance_prices.get(sym)
+
+            if not mexc_price or mexc_price <= 0:
+                continue
+
+            valid_prices = [p for p in [dex_price, mexc_price, bin_price] if is_valid_price(p)]
+            if len(valid_prices) < 2:
+                continue
+
+            high = max(valid_prices)
+            low = min(valid_prices)
+            spread_percent = (high - low) / low * 100
+
+            if spread_percent < ALERT_THRESHOLD_PCT:
+                continue
+
+            price_1h_ago = get_price_1h_ago(sym)
+            change_1h = pct_change(price_1h_ago, mexc_price) if price_1h_ago else 0
+
+            rows.append({
+                "symbol": sym,
+                "dex": dex_price,
+                "mexc": mexc_price,
+                "bin": bin_price,
+                "1h_change": change_1h,
+                "spread_pct": spread_percent,
+                "last": last_update.get(sym, now_ts())
+            })
+
+            check_and_alert(sym, dex_price, mexc_price, bin_price)
+
+        # 6️⃣ Сортування за 1h зміною
+        rows.sort(key=lambda r: abs(r["1h_change"]), reverse=True)
+        rows = rows[:TOP_N]
+
+        # 7️⃣ Оновлення UI
+        socketio.emit("live.update", {"rows": rows})
+
+        # 8️⃣ Якщо включено /live on — оновлюємо Telegram
+        if state.get("live_to_telegram"):
+            txt = build_live_text(rows)
+            msg_id = state.get("msg_id")
+            if msg_id:
+                tg_edit(msg_id, txt)
+            else:
+                sent = tg_send(txt)
+                if sent and "result" in sent:
+                    state["msg_id"] = sent["result"]["message_id"]
+                    save_state()
 
 # ---------------- BOOT ----------------
 orchestrator = Orchestrator()
