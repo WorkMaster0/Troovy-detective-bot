@@ -299,10 +299,17 @@ def api_history():
         return jsonify({"symbol": symbol, "history": hist})
 
 # ---------------- BOOT ----------------
-if __name__ == "__main__":
-    # start monitor thread
+
+def start_background_monitor():
+    """Ensure background thread starts even under Gunicorn."""
     t = threading.Thread(target=monitor_loop, daemon=True)
     t.start()
-    # run flask (debug False)
-    print(f"Starting Flask on 0.0.0.0:{HTTP_PORT} (Python {'.'.join(map(str,__import__('sys').version_info[:3]))})")
+    print("[INIT] Background monitor thread started.")
+
+# start monitor on import (Gunicorn will call this file as module)
+start_background_monitor()
+
+# For local dev run
+if __name__ == "__main__":
+    print(f"Starting Flask on 0.0.0.0:{HTTP_PORT}")
     app.run(host="0.0.0.0", port=HTTP_PORT, threaded=True)
