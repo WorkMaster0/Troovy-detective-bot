@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""
-main.py - Live DEX <-> CEX monitor (Binance/Bybit/MEXC) + Telegram webhook + web UI
-Safe demo: reads public data only; no trading; no API keys required.
-
-How to run (Render):
- - requirements.txt must include: flask, ccxt, requests, gunicorn
- - Start command (Render): gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
- - Set environment variables: TELEGRAM_TOKEN (required), WEBHOOK_URL (optional, e.g. https://your-app.onrender.com)
-"""
+# main.py - Integrated monitor: DEX (GMGN/Dexscreener) + CEX (Binance/Bybit/MEXC) + CoinGecko fallback
+# + Telegram webhook + web UI. Reads TELEGRAM_TOKEN from environment.
 
 import os
 import time
@@ -19,47 +12,50 @@ from datetime import datetime
 from typing import Dict, List, Any, Optional
 from flask import Flask, request, render_template_string, jsonify
 
-import ccxt  # synchronous; used inside background thread (run blocking safely)
+import ccxt
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # optional, e.g. https://app.onrender.com
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()  # optional
 PORT = int(os.getenv("PORT", "10000"))
 
 STATE_FILE = "state.json"
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "11.0"))   # seconds between polls
-AUTO_POST_INTERVAL = int(os.getenv("AUTO_POST_INTERVAL", "600"))  # seconds: auto post to telegram when live enabled
-ALERT_THRESHOLD_PCT = float(os.getenv("ALERT_THRESHOLD_PCT", "3.0"))  # default open threshold
-CLOSE_THRESHOLD_PCT = float(os.getenv("CLOSE_THRESHOLD_PCT", "0.5"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "3.0"))   # seconds between price polls (user asked 3s)
+TOP10_REFRESH = int(os.getenv("TOP10_REFRESH", "300"))    # 5 minutes
+AUTO_POST_INTERVAL = int(os.getenv("AUTO_POST_INTERVAL", "600"))  # auto post interval when live
+ALERT_OPEN_PCT = float(os.getenv("ALERT_OPEN_PCT", "2.0"))  # open threshold
+ALERT_CLOSE_PCT = float(os.getenv("ALERT_CLOSE_PCT", "0.5"))  # close threshold
 MAX_SYMBOLS = int(os.getenv("MAX_SYMBOLS", "80"))
 
-CEX_IDS = ["binance", "bybit", "mexc"]  # cctx ids order matters for priority display
+CEX_IDS = ["binance", "bybit", "mexc"]
 
 DEXSCREENER_SEARCH = "https://api.dexscreener.com/latest/dex/search/?q={q}"
 GMGN_API = "https://gmgn.ai/defi/quotation/v1/tokens/search?keyword={q}"
+COINGECKO_SEARCH = "https://api.coingecko.com/api/v3/search?query={q}"
+COINGECKO_PRICE = "https://api.coingecko.com/api/v3/simple/price"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger("arb-monitor")
+logger = logging.getLogger("monitor")
 
 # ---------------- STATE ----------------
 state: Dict[str, Any] = {
-    "symbols": [],  # list like ["JELLY","AIA","BTC"]
+    "symbols": [],        # e.g. ["PEPE","BTC","AIA"]
     "chat_id": None,
     "msg_id": None,
     "live_to_telegram": False,
-    "alert_threshold_pct": ALERT_THRESHOLD_PCT,
-    "close_threshold_pct": CLOSE_THRESHOLD_PCT
+    "alert_open_pct": ALERT_OPEN_PCT,
+    "alert_close_pct": ALERT_CLOSE_PCT
 }
 
-dex_prices: Dict[str, float] = {}         # symbol -> price
-cex_prices: Dict[str, Dict[str, float]] = {}  # sym -> {exid: price}
-last_update: Dict[str, float] = {}        # sym -> ts
-price_history: Dict[str, List[tuple]] = {}  # sym -> list of (ts, price) for 1h change
-active_spreads: Dict[str, Dict[str, Any]] = {}  # sym -> open info
-last_alert_time: Dict[str, float] = {}    # cooldown
+dex_prices: Dict[str, float] = {}
+cex_prices: Dict[str, Dict[str, float]] = {}  # symbol -> {exid: price}
+last_update: Dict[str, float] = {}
+price_history: Dict[str, List[tuple]] = {}  # symbol -> [(ts, price_for_history)]
+active_spreads: Dict[str, Dict[str, Any]] = {}
+last_alert_time: Dict[str, float] = {}
 
 _lock = threading.Lock()
 
@@ -71,9 +67,9 @@ def load_state():
             with open(STATE_FILE, "r") as f:
                 s = json.load(f)
                 state.update(s)
-                logger.info("Loaded state.json, symbols=%d", len(state.get("symbols", [])))
-    except Exception as e:
-        logger.exception("load_state error: %s", e)
+                logger.info("Loaded state.json: symbols=%d", len(state.get("symbols", [])))
+    except Exception:
+        logger.exception("load_state failed")
 
 def save_state():
     try:
@@ -81,8 +77,8 @@ def save_state():
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
         os.replace(tmp, STATE_FILE)
-    except Exception as e:
-        logger.exception("save_state error: %s", e)
+    except Exception:
+        logger.exception("save_state failed")
 
 # ---------------- UTIL ----------------
 def now_ts() -> float:
@@ -92,14 +88,6 @@ def pretty_ts(ts: Optional[float]) -> str:
     if not ts:
         return "—"
     return datetime.utcfromtimestamp(ts).strftime("%H:%M:%S")
-
-def pct_change(old: float, new: float) -> float:
-    try:
-        if old == 0:
-            return 0.0
-        return (new - old) / old * 100.0
-    except Exception:
-        return 0.0
 
 def is_valid_price(p) -> bool:
     try:
@@ -112,98 +100,20 @@ def is_valid_price(p) -> bool:
     except Exception:
         return False
 
-# ---------------- TELEGRAM HELPERS ----------------
-def tg_send_text(text: str) -> Optional[dict]:
-    if not TELEGRAM_TOKEN or not state.get("chat_id"):
-        logger.debug("tg_send skipped (no token/chat_id)")
-        return None
+def pct_change(old: float, new: float) -> float:
     try:
-        payload = {"chat_id": state["chat_id"], "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
-        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=8)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.exception("tg_send_text error: %s", e)
-        return None
+        if old == 0:
+            return 0.0
+        return (new - old) / old * 100.0
+    except Exception:
+        return 0.0
 
-def tg_edit_text(message_id: int, text: str):
-    if not TELEGRAM_TOKEN or not state.get("chat_id"):
-        return None
-    try:
-        payload = {"chat_id": state["chat_id"], "message_id": message_id, "text": text, "parse_mode": "Markdown"}
-        r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=8)
-        if r.status_code != 200:
-            logger.warning("tg_edit failed: %s %s", r.status_code, r.text)
-        return r.json()
-    except Exception as e:
-        logger.exception("tg_edit error: %s", e)
-        return None
-
-# ---------------- DEX FETCHERS (blocking; run in bg thread) ----------------
-def fetch_from_gmgn(symbol: str) -> Optional[float]:
-    try:
-        q = symbol.upper()
-        url = GMGN_API.format(q=q)
-        r = requests.get(url, timeout=6)
-        r.raise_for_status()
-        data = r.json()
-        items = data.get("data") or []
-        for it in items:
-            price = it.get("price_usd") or it.get("priceUsd") or it.get("price")
-            if price:
-                return float(price)
-    except Exception as e:
-        logger.debug("gmgn err %s: %s", symbol, e)
-    return None
-
-def fetch_from_dexscreener(symbol: str) -> Optional[float]:
-    try:
-        q = symbol.upper()
-        url = DEXSCREENER_SEARCH.format(q=q)
-        r = requests.get(url, timeout=6)
-        r.raise_for_status()
-        data = r.json()
-        pairs = data.get("pairs") or []
-        if pairs:
-            # choose first available price
-            for p in pairs:
-                price = p.get("priceUsd") or p.get("price")
-                if price:
-                    return float(price)
-        tokens = data.get("tokens") or []
-        for t in tokens:
-            for p in t.get("pairs", []):
-                price = p.get("priceUsd") or p.get("price")
-                if price:
-                    return float(price)
-    except Exception as e:
-        logger.debug("dexscreener err %s: %s", symbol, e)
-    return None
-
-def fetch_price_from_dex(symbol: str) -> Optional[float]:
-    v = fetch_from_gmgn(symbol)
-    if v is not None:
-        return v
-    return fetch_from_dexscreener(symbol)
-
-# ---------------- CEX FETCH (ccxt sync clients used in bg thread) ----------------
-def init_cex_clients():
-    clients = {}
-    for exid in CEX_IDS:
-        try:
-            clients[exid] = getattr(ccxt, exid)({"enableRateLimit": True})
-        except Exception as e:
-            logger.exception("init_ccxt %s err: %s", exid, e)
-    return clients
-
-# ---------------- PRICE HISTORY ----------------
 def push_price_history(sym: str, price: float):
     if not is_valid_price(price):
         return
     lst = price_history.setdefault(sym, [])
     ts = now_ts()
     lst.append((ts, price))
-    # keep roughly 1h of history depending on poll interval (margin)
     max_points = int(3600 / max(1, POLL_INTERVAL)) + 20
     if len(lst) > max_points:
         del lst[:len(lst) - max_points]
@@ -221,16 +131,135 @@ def get_price_1h_ago(sym: str) -> Optional[float]:
             break
     if best:
         return best
-    # no 1h old value, return earliest
     return lst[0][1] if lst else None
 
-# ---------------- ALERT LOGIC ----------------
-def try_open_or_close(sym: str):
+# ---------------- TELEGRAM HELPERS ----------------
+def tg_send(text: str) -> Optional[dict]:
+    if not TELEGRAM_TOKEN or not state.get("chat_id"):
+        logger.debug("tg_send skipped")
+        return None
+    try:
+        payload = {"chat_id": state["chat_id"], "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True}
+        r = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=8)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        logger.exception("tg_send failed")
+        return None
+
+def tg_edit(mid: int, text: str):
+    if not TELEGRAM_TOKEN or not state.get("chat_id"):
+        return None
+    try:
+        payload = {"chat_id": state["chat_id"], "message_id": mid, "text": text, "parse_mode": "Markdown"}
+        r = requests.post(f"{TELEGRAM_API}/editMessageText", json=payload, timeout=8)
+        if r.status_code != 200:
+            logger.warning("tg_edit failed: %s", r.text)
+        return r.json()
+    except Exception:
+        logger.exception("tg_edit failed")
+        return None
+
+# ---------------- DEX fetchers ----------------
+HEADERS = {"User-Agent": "arb-monitor/1.0 (+https://example.com)"}
+
+def fetch_from_gmgn(symbol: str) -> Optional[float]:
+    try:
+        q = symbol.upper()
+        url = GMGN_API.format(q=q)
+        r = requests.get(url, timeout=6, headers=HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("data") or []
+        for it in items:
+            price = it.get("price_usd") or it.get("priceUsd") or it.get("price")
+            if price:
+                return float(price)
+    except Exception:
+        logger.debug("gmgn no data for %s", symbol)
+    return None
+
+def fetch_from_dexscreener(symbol: str) -> Optional[float]:
+    try:
+        q = symbol.upper()
+        url = DEXSCREENER_SEARCH.format(q=q)
+        r = requests.get(url, timeout=6, headers=HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if pairs:
+            # pick first pair that has priceUsd
+            for p in pairs:
+                price = p.get("priceUsd") or p.get("price")
+                if price:
+                    return float(price)
+        tokens = data.get("tokens") or []
+        for t in tokens:
+            for p in t.get("pairs", []):
+                price = p.get("priceUsd") or p.get("price")
+                if price:
+                    return float(price)
+    except Exception:
+        logger.debug("dexscreener no data for %s", symbol)
+    return None
+
+# CoinGecko fallback: search symbol -> id -> simple/price
+def coingecko_price(symbol: str) -> Optional[float]:
+    try:
+        s = symbol.lower()
+        url = COINGECKO_SEARCH.format(q=s)
+        r = requests.get(url, timeout=6, headers=HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        coins = data.get("coins", [])
+        if not coins:
+            return None
+        # prefer exact symbol match
+        cg_id = None
+        for c in coins:
+            if c.get("symbol", "").lower() == s:
+                cg_id = c.get("id")
+                break
+        if not cg_id:
+            cg_id = coins[0].get("id")
+        if not cg_id:
+            return None
+        pr = requests.get(COINGECKO_PRICE, params={"ids": cg_id, "vs_currencies": "usd"}, timeout=6, headers=HEADERS)
+        pr.raise_for_status()
+        j = pr.json()
+        v = j.get(cg_id, {}).get("usd")
+        if v:
+            return float(v)
+    except Exception:
+        logger.debug("coingecko fallback failed for %s", symbol)
+    return None
+
+def fetch_price_from_dex_with_fallback(symbol: str) -> Optional[float]:
+    v = fetch_from_gmgn(symbol)
+    if v is not None:
+        return v
+    v = fetch_from_dexscreener(symbol)
+    if v is not None:
+        return v
+    # fallback to coingecko
+    v = coingecko_price(symbol)
+    return v
+
+# ---------------- CEX clients ----------------
+def init_ccxt_clients():
+    clients = {}
+    for exid in CEX_IDS:
+        try:
+            clients[exid] = getattr(ccxt, exid)({"enableRateLimit": True})
+        except Exception:
+            logger.exception("init client %s failed", exid)
+    return clients
+
+# ---------------- ALERT logic ----------------
+def process_alerts_for(sym: str):
     dex = dex_prices.get(sym)
     cex_map = cex_prices.get(sym, {})
-    if dex is None:
-        return
-    # choose best cex (max) to compare
+    # pick best CEX (max) as before
     best_p = None
     best_ex = None
     for exid in CEX_IDS:
@@ -239,13 +268,12 @@ def try_open_or_close(sym: str):
             if best_p is None or p > best_p:
                 best_p = p
                 best_ex = exid
-    if best_p is None or dex == 0:
+    if not is_valid_price(dex) or not is_valid_price(best_p):
         return
     pct = (best_p - dex) / dex * 100.0
     now = now_ts()
-    open_thresh = float(state.get("alert_threshold_pct", ALERT_THRESHOLD_PCT))
-    close_thresh = float(state.get("close_threshold_pct", CLOSE_THRESHOLD_PCT))
-
+    open_thresh = float(state.get("alert_open_pct", ALERT_OPEN_PCT))
+    close_thresh = float(state.get("alert_close_pct", ALERT_CLOSE_PCT))
     # open
     if sym not in active_spreads and pct >= open_thresh:
         active_spreads[sym] = {"opened_pct": pct, "open_ts": now, "dex_price": dex, "cex_price": best_p, "cex_ex": best_ex}
@@ -258,62 +286,60 @@ def try_open_or_close(sym: str):
             f"Spread: *{pct:.2f}%*\n"
             f"Time: {datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S UTC')}"
         )
-        logger.info("ALERT OPEN %s %.2f%%", sym, pct)
-        tg_send_text(msg)
+        logger.info("OPEN ALERT %s %.2f%%", sym, pct)
+        tg_send(msg)
         return
-
     # close
     if sym in active_spreads:
         opened = active_spreads[sym]
-        # close when pct <= close_thresh OR when spread significantly reduced compared to opened_pct
         if pct <= close_thresh or pct <= opened.get("opened_pct", 0) * 0.5:
-            duration = int(now - opened.get("open_ts", now))
+            dur = int(now - opened.get("open_ts", now))
             msg = (
                 "✅ *Spread CLOSED*\n"
                 f"Symbol: `{sym}`\n"
                 f"Now: DEX `{dex:.8f}` | CEX `{best_p:.8f}` ({best_ex})\n"
                 f"Current spread: *{pct:.2f}%*\n"
-                f"Opened: *{opened.get('opened_pct'):.2f}%*, duration: {duration}s\n"
+                f"Opened: *{opened.get('opened_pct'):.2f}%*, duration: {dur}s\n"
                 f"Time: {datetime.utcfromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S UTC')}"
             )
-            logger.info("ALERT CLOSE %s %.2f%%", sym, pct)
-            tg_send_text(msg)
+            logger.info("CLOSE ALERT %s %.2f%%", sym, pct)
+            tg_send(msg)
             active_spreads.pop(sym, None)
             last_alert_time[sym] = now
             return
 
-# ---------------- BUILD TELEGRAM/WEB TEXT ----------------
-def build_live_text_rows() -> List[Dict[str, Any]]:
+# ---------------- BUILD ROWS / MD ----------------
+def build_rows() -> List[Dict[str, Any]]:
     rows = []
     syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
     for s in syms:
         dex = dex_prices.get(s)
-        cex_map = cex_prices.get(s, {})
-        best_p = None
+        c_map = cex_prices.get(s, {})
+        best = None
         best_ex = None
         for exid in CEX_IDS:
-            p = cex_map.get(exid)
+            p = c_map.get(exid)
             if is_valid_price(p):
-                if best_p is None or p > best_p:
-                    best_p = p
+                if best is None or p > best:
+                    best = p
                     best_ex = exid
-        pct = None
-        if is_valid_price(dex) and is_valid_price(best_p):
-            pct = (best_p - dex) / dex * 100.0
-        price_1h = get_price_1h_ago(s)
-        change_1h = pct_change(price_1h, best_p) if price_1h and is_valid_price(best_p) else 0.0
+        spread = None
+        if is_valid_price(dex) and is_valid_price(best):
+            spread = (best - dex) / dex * 100.0
+        p1h = get_price_1h_ago(s)
+        ch1h = pct_change(p1h, best) if p1h and is_valid_price(best) else 0.0
         rows.append({
             "symbol": s,
             "dex": round(dex, 8) if is_valid_price(dex) else None,
-            "best_cex": round(best_p, 8) if is_valid_price(best_p) else None,
+            "best_cex": round(best, 8) if is_valid_price(best) else None,
             "best_ex": best_ex,
-            "spread_pct": round(pct, 4) if pct is not None else None,
-            "1h_change_pct": round(change_1h, 4),
+            "spread_pct": round(spread, 4) if spread is not None else None,
+            "1h_change_pct": round(ch1h, 4),
             "last": last_update.get(s)
         })
     return rows
 
-def build_live_markdown_text(rows: List[Dict[str, Any]]) -> str:
+def build_markdown(rows: List[Dict[str, Any]]) -> str:
     lines = []
     lines.append("📡 *Live DEX ↔ CEX Monitor*")
     lines.append(f"_Updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}_\n")
@@ -327,16 +353,40 @@ def build_live_markdown_text(rows: List[Dict[str, Any]]) -> str:
         sp = f"{r['spread_pct']:+6.2f}%" if r["spread_pct"] is not None else "—"
         lu = pretty_ts(r["last"])
         lines.append(f"`{s:<7}` {ch:>7}  {dex:>12}  {cex:>14}  {sp:>7}  {lu}")
-    lines.append("\n`/add SYMBOL  /remove SYMBOL  /list  /alert <pct>  /live on|off`")
+    lines.append("\n`/add SYMBOL  /remove SYMBOL  /list  /alert <pct>  /live on|off  /top10  /alerts`")
     return "\n".join(lines)
 
-# ---------------- BACKGROUND MONITOR THREAD ----------------
-class MonitorThread(threading.Thread):
+# ---------------- TOP10 (CoinGecko primary) ----------------
+def fetch_top10_coingecko() -> List[str]:
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets"
+        params = {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": 1, "price_change_percentage": "1h"}
+        r = requests.get(url, params=params, timeout=8, headers=HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        # filter by price_change_percentage_1h_in_currency
+        arr = []
+        for c in data:
+            pct1h = c.get("price_change_percentage_1h_in_currency")
+            symbol = c.get("symbol", "").upper()
+            if symbol and isinstance(pct1h, (int, float)):
+                arr.append((symbol, pct1h))
+        arr.sort(key=lambda x: x[1], reverse=True)
+        top = [s for s, _ in arr[:10]]
+        # ensure we return token symbols (not include stablecoins)
+        return top
+    except Exception:
+        logger.exception("coingecko top10 failed")
+    return []
+
+# ---------------- BACKGROUND THREAD ----------------
+class Monitor(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self._stop = threading.Event()
-        self.cex_clients = init_cex_clients()
-        logger.info("MonitorThread initialized")
+        self.ccxt_clients = init_ccxt_clients()
+        self.next_top10 = 0
+        self.next_auto = now_ts() + AUTO_POST_INTERVAL
 
     def stop(self):
         self._stop.set()
@@ -345,117 +395,138 @@ class MonitorThread(threading.Thread):
         return self._stop.is_set()
 
     def run(self):
-        logger.info("MonitorThread started")
-        next_auto = now_ts() + AUTO_POST_INTERVAL
+        logger.info("Background monitor started")
         while not self.stopped():
-            syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
-            if syms:
-                # 1) fetch DEX prices (blocking but per-symbol)
-                for s in syms:
-                    try:
-                        v = fetch_price_from_dex(s)
-                        if is_valid_price(v):
-                            with _lock:
-                                dex_prices[s] = float(v)
-                                last_update[s] = now_ts()
-                                push_price_history(s, float(v))
-                    except Exception as e:
-                        logger.debug("dex fetch err %s: %s", s, e)
-                # 2) fetch CEX prices via ccxt clients
-                for exid, client in list(self.cex_clients.items()):
+            now = now_ts()
+            try:
+                # refresh top10 periodically and set state.symbols automatically
+                if now >= self.next_top10:
+                    top = fetch_top10_coingecko()
+                    if top:
+                        with _lock:
+                            # Replace monitored symbols with top list (user added symbols still preserved? We'll prioritize top list)
+                            # We'll set state["symbols"] = unique(top + previous user symbols)
+                            prev = state.get("symbols", [])
+                            # keep user custom symbols that are not in top
+                            combined = []
+                            for s in top:
+                                if s not in combined:
+                                    combined.append(s)
+                            for s in prev:
+                                if s not in combined:
+                                    combined.append(s)
+                            state["symbols"] = combined[:MAX_SYMBOLS]
+                            save_state()
+                    self.next_top10 = now + TOP10_REFRESH
+
+                syms = list(state.get("symbols", []))[:MAX_SYMBOLS]
+                if syms:
+                    # 1) DEX prices (blocking per-symbol)
                     for s in syms:
-                        # try several variants
-                        found = False
-                        variants = [f"{s}/USDT", f"{s}USDT", f"{s}/USD"]
-                        for v in variants:
-                            try:
-                                tk = client.fetch_ticker(v)
-                                last = tk.get("last") or tk.get("close") or tk.get("price")
-                                if is_valid_price(last):
-                                    with _lock:
-                                        cex_prices.setdefault(s, {})[exid] = float(last)
-                                        last_update[s] = now_ts()
-                                    found = True
-                                    break
-                            except Exception:
-                                continue
-                        # if not found via fetch_ticker variants, try scanning tickers (less efficient)
-                        if not found:
-                            try:
-                                all_t = client.fetch_tickers()
-                                for pair, tk in all_t.items():
-                                    try:
+                        try:
+                            v = fetch_price_from_dex_with_fallback(s)
+                            if is_valid_price(v):
+                                with _lock:
+                                    dex_prices[s] = float(v)
+                                    last_update[s] = now_ts()
+                                    push_price_history(s, float(v))
+                        except Exception:
+                            logger.debug("dex fetch exception for %s", s)
+                    # 2) CEX via ccxt (synchronous calls inside thread)
+                    for exid, client in list(self.ccxt_clients.items()):
+                        for s in syms:
+                            # try variants
+                            found = False
+                            variants = [f"{s}/USDT", f"{s}USDT", f"{s}/USD"]
+                            for v in variants:
+                                try:
+                                    tk = client.fetch_ticker(v)
+                                    last = tk.get("last") or tk.get("close") or tk.get("price")
+                                    if is_valid_price(last):
+                                        with _lock:
+                                            cex_prices.setdefault(s, {})[exid] = float(last)
+                                            last_update[s] = now_ts()
+                                        found = True
+                                        break
+                                except Exception:
+                                    continue
+                            if not found:
+                                # try scanning tickers once (may be heavy)
+                                try:
+                                    all_t = client.fetch_tickers()
+                                    for pair, tk in all_t.items():
                                         if s.upper() in pair.upper() and ("USDT" in pair.upper() or "USD" in pair.upper()):
                                             last = tk.get("last") or tk.get("close") or tk.get("price")
                                             if is_valid_price(last):
                                                 with _lock:
                                                     cex_prices.setdefault(s, {})[exid] = float(last)
                                                     last_update[s] = now_ts()
-                                                found = True
                                                 break
-                                    except Exception:
-                                        continue
-                            except Exception:
-                                # fetch_tickers sometimes fails; ignore
-                                pass
-                # 3) process spreads & alerts
-                for s in syms:
-                    try:
-                        try_open_or_close(s)
-                    except Exception:
-                        logger.exception("try_open_or_close error for %s", s)
-            # auto-post live-to-telegram if enabled and interval passed
-            try:
-                if state.get("live_to_telegram") and state.get("chat_id"):
-                    now = now_ts()
-                    if now >= next_auto:
-                        rows = build_live_text_rows()
-                        txt = build_live_markdown_text(rows)
-                        res = tg_send_text(txt)
-                        # store message id to edit later
-                        if res and isinstance(res, dict):
-                            mid = res.get("result", {}).get("message_id")
-                            if mid:
-                                state["msg_id"] = int(mid)
-                                save_state()
-                        next_auto = now + AUTO_POST_INTERVAL
+                                except Exception:
+                                    pass
+                    # 3) process alerts for symbols
+                    for s in syms:
+                        try:
+                            process_alerts_for(s)
+                        except Exception:
+                            logger.exception("alerts error %s", s)
+                # auto-post if enabled
+                try:
+                    if state.get("live_to_telegram") and state.get("chat_id"):
+                        if now >= self.next_auto:
+                            rows = build_rows()
+                            md = build_markdown(rows)
+                            res = tg_send(md)
+                            if res and isinstance(res, dict):
+                                mid = res.get("result", {}).get("message_id")
+                                if mid:
+                                    state["msg_id"] = int(mid)
+                                    save_state()
+                            self.next_auto = now + AUTO_POST_INTERVAL
+                except Exception:
+                    logger.exception("auto post failed")
             except Exception:
-                logger.exception("auto post error")
-            # sleep
-            time.sleep(max(1.0, POLL_INTERVAL))
-        logger.info("MonitorThread stopped")
+                logger.exception("monitor loop top exception")
+            time.sleep(max(0.5, POLL_INTERVAL))
+        logger.info("Background monitor stopped")
 
-# ---------------- FLASK APP ----------------
+def init_ccxt_clients():
+    clients = {}
+    for exid in CEX_IDS:
+        try:
+            clients[exid] = getattr(ccxt, exid)({"enableRateLimit": True})
+        except Exception:
+            logger.exception("init ccxt client failed: %s", exid)
+    return clients
+
+# ---------------- FLASK UI + API + WEBHOOK ----------------
 app = Flask(__name__)
 
 INDEX_HTML = """
 <!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8">
-    <title>Live DEX ↔ CEX Monitor</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      body { font-family: Arial, sans-serif; max-width:1000px; margin:16px auto; background:#0b1220; color:#e6eef8; }
-      table { width:100%; border-collapse:collapse; margin-top:8px; }
-      th, td { padding:8px 6px; border-bottom:1px solid #213040; text-align:left; }
-      th { color:#9fb4d9; }
-      tr:hover { background:#08202f; }
-      .small { color:#9fb4d9; font-size:0.9em; }
-      .badge { background:#1f6feb; padding:4px 8px; border-radius:6px; color:white; font-size:0.9em; }
-    </style>
-  </head>
-  <body>
-    <h2>Live DEX ↔ CEX Monitor</h2>
-    <div class="small">Last update: <span id="last">—</span> UTC • Auto refresh: 15s</div>
-    <div style="margin-top:10px;">
-      <table>
-        <thead><tr><th>Symbol</th><th>1h Δ%</th><th>DEX</th><th>Best CEX (ex)</th><th>Spread%</th><th>Last</th></tr></thead>
-        <tbody id="tbody"></tbody>
-      </table>
-    </div>
-    <div style="margin-top:8px;" class="small">Commands via Telegram: /add /remove /list /clear /alert &lt;pct&gt; /live on|off /status /help</div>
-
+<head>
+  <meta charset="utf-8">
+  <title>Live Monitor</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Arial,Helvetica,sans-serif;background:#0b1220;color:#e6eef8;max-width:1000px;margin:18px auto;padding:10px}
+    table{width:100%;border-collapse:collapse;margin-top:8px}
+    th,td{padding:8px 6px;border-bottom:1px solid #213040;text-align:left}
+    th{color:#9fb4d9}
+    tr:hover{background:#08202f}
+    .small{color:#9fb4d9;font-size:0.9em}
+    .badge{background:#1f6feb;padding:4px 8px;border-radius:6px;color:white;font-size:0.85em}
+  </style>
+</head>
+<body>
+  <h2>Live DEX ↔ CEX Monitor</h2>
+  <div class="small">Last update: <span id="last">—</span> UTC • Refresh: 15s</div>
+  <div style="margin-top:10px">
+    <table><thead><tr><th>Symbol</th><th>1h Δ%</th><th>DEX</th><th>Best CEX (ex)</th><th>Spread%</th><th>Last</th></tr></thead>
+    <tbody id="tbody"></tbody></table>
+  </div>
+  <div class="small" style="margin-top:8px">Commands via Telegram: /add /remove /list /clear /alert &lt;pct&gt; /live on|off /top10 /alerts</div>
 <script>
 async function fetchLatest(){
   try{
@@ -465,23 +536,23 @@ async function fetchLatest(){
     const tbody = document.getElementById('tbody');
     tbody.innerHTML = '';
     (j.rows || []).forEach(r=>{
-      const tr=document.createElement('tr');
-      const ch = (r["1h_change_pct"]||0).toFixed(2)+'%';
-      const dex = r.dex!=null? r.dex.toFixed(8): '—';
-      const cex = r.best_cex!=null? r.best_cex.toFixed(8)+' ('+ (r.best_ex||'') +')' : '—';
-      const sp = r.spread_pct!=null? r.spread_pct.toFixed(2)+'%':'—';
-      const last = r.last? new Date(r.last*1000).toISOString().substr(11,8):'—';
+      const tr = document.createElement('tr');
+      const ch = (r['1h_change_pct']||0).toFixed(2)+'%';
+      const dex = r.dex!=null? r.dex.toFixed(8) : '—';
+      const cex = r.best_cex!=null ? r.best_cex.toFixed(8)+' ('+ (r.best_ex||'') +')' : '—';
+      const sp = r.spread_pct!=null ? r.spread_pct.toFixed(2)+'%' : '—';
+      const last = r.last? new Date(r.last*1000).toISOString().substr(11,8) : '—';
       tr.innerHTML = `<td><strong>${r.symbol}</strong></td><td>${ch}</td><td>${dex}</td><td>${cex}</td><td>${sp}</td><td>${last}</td>`;
       tbody.appendChild(tr);
     });
   }catch(e){
-    console.error('fetchLatest', e);
+    console.error(e);
   }
 }
 fetchLatest();
 setInterval(fetchLatest, 15000);
 </script>
-  </body>
+</body>
 </html>
 """
 
@@ -491,10 +562,9 @@ def index():
 
 @app.route("/api/latest", methods=["GET"])
 def api_latest():
-    rows = build_live_text_rows()
+    rows = build_rows()
     return jsonify({"time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), "rows": rows})
 
-# ---------------- TELEGRAM webhook ----------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -503,7 +573,6 @@ def webhook():
         return jsonify({"ok": False}), 400
     if not data:
         return jsonify({"ok": True})
-    # message can be in 'message' or 'edited_message'
     msg = data.get("message") or data.get("edited_message")
     if not msg:
         return jsonify({"ok": True})
@@ -520,86 +589,91 @@ def webhook():
     cmd = parts[0].lower()
     try:
         if cmd == "/start":
-            tg_send_text("🤖 Live monitor online. Use /add SYMBOL")
+            tg_send("🤖 Monitor online. Use /add SYMBOL")
         elif cmd == "/help":
-            tg_send_text("Commands:\n/add SYMBOL\n/remove SYMBOL\n/list\n/clear\n/alert <pct>\n/live on|off\n/status\n/help")
+            tg_send("Commands: /add /remove /list /clear /alert <pct> /live on|off /top10 /alerts /status /help")
         elif cmd == "/add":
             if len(parts) >= 2:
                 sym = parts[1].upper()
                 if sym not in state["symbols"]:
                     state["symbols"].append(sym)
                     save_state()
-                    tg_send_text(f"✅ Added {sym}")
+                    tg_send(f"✅ Added {sym}")
                 else:
-                    tg_send_text(f"⚠️ {sym} already monitored")
+                    tg_send(f"⚠️ {sym} already monitored")
         elif cmd == "/remove":
             if len(parts) >= 2:
                 sym = parts[1].upper()
                 if sym in state["symbols"]:
                     state["symbols"].remove(sym)
                     save_state()
-                    tg_send_text(f"🗑 Removed {sym}")
+                    tg_send(f"🗑 Removed {sym}")
                 else:
-                    tg_send_text(f"⚠️ {sym} not monitored")
+                    tg_send(f"⚠️ {sym} not monitored")
         elif cmd == "/list":
-            syms = state.get("symbols", [])
-            tg_send_text("Monitored: " + (", ".join(syms) if syms else "—"))
+            tg_send("Monitored: " + (", ".join(state["symbols"]) if state["symbols"] else "—"))
         elif cmd == "/clear":
             state["symbols"] = []
             save_state()
-            tg_send_text("🧹 Cleared all symbols")
+            tg_send("🧹 Cleared all symbols")
         elif cmd == "/alert":
             if len(parts) >= 2:
                 try:
                     pct = float(parts[1])
-                    state["alert_threshold_pct"] = pct
+                    state["alert_open_pct"] = pct
                     save_state()
-                    tg_send_text(f"✅ Alert threshold set to {pct:.2f}%")
+                    tg_send(f"✅ Alert threshold set to {pct:.2f}%")
                 except Exception:
-                    tg_send_text("Usage: /alert <pct> (numeric)")
+                    tg_send("Usage: /alert <pct> (numeric)")
             else:
-                tg_send_text(f"Current alert threshold: {state.get('alert_threshold_pct'):.2f}%")
+                tg_send(f"Current alert threshold: {state.get('alert_open_pct'):.2f}%")
         elif cmd == "/live":
-            if len(parts) >= 2 and parts[1].lower() in ("on", "off"):
+            if len(parts) >= 2 and parts[1].lower() in ("on","off"):
                 state["live_to_telegram"] = (parts[1].lower()=="on")
                 save_state()
-                tg_send_text(f"Live-to-Telegram set to {state['live_to_telegram']}")
+                tg_send(f"Live-to-Telegram set to {state['live_to_telegram']}")
             else:
-                tg_send_text("Usage: /live on|off")
+                tg_send("Usage: /live on|off")
         elif cmd == "/status":
             syms = state.get("symbols", [])
-            txt = f"Symbols: {', '.join(syms) if syms else '—'}\nAlert threshold: {state.get('alert_threshold_pct'):.2f}%\nLive->Telegram: {state.get('live_to_telegram')}\nActive spreads: {len(active_spreads)}"
-            tg_send_text(txt)
+            txt = f"Symbols: {', '.join(syms) if syms else '—'}\nAlert open: {state.get('alert_open_pct'):.2f}%\nLive->Telegram: {state.get('live_to_telegram')}\nActive spreads: {len(active_spreads)}"
+            tg_send(txt)
         elif cmd == "/top10":
-            # compute top10 by 1h change using cex prices (best_cex)
-            rows = build_live_text_rows()
+            rows = build_rows()
             sorted_rows = sorted(rows, key=lambda r: r.get("1h_change_pct",0), reverse=True)[:10]
             lines = ["Symbol   1hΔ%"]
             for r in sorted_rows:
                 lines.append(f"{r['symbol']:<7} {r['1h_change_pct']:+6.2f}%")
-            tg_send_text("📈 *Top 10 (1h)*\n```\n" + "\n".join(lines) + "\n```")
+            tg_send("📈 *Top 10 (1h)*\n```\n" + "\n".join(lines) + "\n```")
+        elif cmd == "/alerts":
+            if not active_spreads:
+                tg_send("No active spreads.")
+            else:
+                lines = []
+                for s, info in active_spreads.items():
+                    lines.append(f"{s}: opened {info.get('opened_pct'):.2f}% at {pretty_ts(info.get('open_ts'))}")
+                tg_send("Active spreads:\n```\n" + "\n".join(lines) + "\n```")
         else:
-            tg_send_text("❓ Unknown command. /help")
-    except Exception as e:
-        logger.exception("webhook cmd error: %s", e)
-        tg_send_text("⚠️ Error processing command.")
+            tg_send("❓ Unknown command. /help")
+    except Exception:
+        logger.exception("webhook cmd error")
+        tg_send("⚠️ Error processing command.")
     return jsonify({"ok": True})
 
 # ---------------- BOOT ----------------
-# Start background monitor thread at import time so Gunicorn workers run it
-_monitor_thread = MonitorThread()
-_monitor_thread.start()
+load_state()
+_monitor = Monitor()
+_monitor.start()
 
-# try set webhook automatically if TELEGRAM_TOKEN and WEBHOOK_URL provided
+# Try set webhook if provided
 if TELEGRAM_TOKEN and WEBHOOK_URL:
     try:
         url = WEBHOOK_URL.rstrip("/") + "/webhook"
         r = requests.get(f"{TELEGRAM_API}/setWebhook?url={url}", timeout=8)
-        logger.info("Set webhook result: %s", r.text[:200])
-    except Exception as e:
-        logger.warning("Failed to set webhook: %s", e)
+        logger.info("setWebhook result: %s", r.text[:200])
+    except Exception:
+        logger.exception("setWebhook call failed")
 
 if __name__ == "__main__":
-    load_state()
-    logger.info("Starting Flask dev server")
+    logger.info("Starting dev server")
     app.run(host="0.0.0.0", port=PORT, threaded=True)
